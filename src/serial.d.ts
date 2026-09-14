@@ -11,6 +11,9 @@ interface Serial {
 
 interface Navigator {
   serial: Serial
+}
+
+interface Window {
   showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>
 }
 

@@ -102,9 +102,9 @@ function App() {
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${sessionName || 'cvt-dyno-session'}.csv`; anchor.click(); URL.revokeObjectURL(url); setNotice(`Downloaded ${samples.length.toLocaleString()} samples`)
   }
   async function chooseDirectory(): Promise<FileSystemDirectoryHandle | null> {
-    if (!navigator.showDirectoryPicker) { setNotice('Chrome folder access is unavailable in this browser; CSV download remains available'); return null }
+    if (!window.showDirectoryPicker) { setNotice('Chrome folder access is unavailable in this browser; CSV download remains available'); return null }
     try {
-      directoryHandle.current = await navigator.showDirectoryPicker()
+      directoryHandle.current = await window.showDirectoryPicker()
       setDirectoryName(directoryHandle.current.name)
       setNotice(`Folder access granted: ${directoryHandle.current.name}`)
       return directoryHandle.current
