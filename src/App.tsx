@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, Cable, CircleHelp, Download, Gauge, GripVertical, SlidersHorizontal, Square, Trash2, Usb, Wifi, X, RotateCcw } from 'lucide-react'
+import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Send, SlidersHorizontal, Square, Terminal, Trash2, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from 'recharts'
 import { channelNames, csvHeader, deriveSample, encodeCommand, sampleToCsvRow, samplesToCsv, type ChannelId, type TelemetrySample } from './protocol'
 import { SerialTransport } from './serialTransport'
@@ -18,6 +18,13 @@ const defaultCharts: ChartConfig[] = [
 ]
 
 const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
+const SENSOR_RETENTION_MS = 30_000
+const MAX_CONSOLE_MESSAGES = 500
+
+function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
+  const cutoff = next.time - SENSOR_RETENTION_MS
+  return [...history.filter((sample) => sample.time >= cutoff), next]
+}
 
 function makeDemoSample(index: number, torqueScale: number, torqueOffset: number): TelemetrySample {
   const phase = index / 10
@@ -28,15 +35,20 @@ function formatNumber(value: number, decimals = 0) { return value.toLocaleString
 
 function App() {
   const [connected, setConnected] = useState(false)
-  const [demoMode, setDemoMode] = useState(true)
+  const [demoMode, setDemoMode] = useState(false)
   const [firmwareDemoMode, setFirmwareDemoMode] = useState(false)
+  const [consoleOpen, setConsoleOpen] = useState(false)
+  const [consoleLines, setConsoleLines] = useState<string[]>([])
+  const [showSensorConsole, setShowSensorConsole] = useState(true)
+  const [autoScrollConsole, setAutoScrollConsole] = useState(true)
+  const [customCommand, setCustomCommand] = useState('03 00 00 00')
   const [logging, setLogging] = useState(false)
   const [sessionName, setSessionName] = useState('baseline-pull')
   const [torqueScale, setTorqueScale] = useState(0.01)
   const [torqueOffset, setTorqueOffset] = useState(0)
   const [channels, setChannels] = useState([true, true, true, true, true])
   const [frequencies, setFrequencies] = useState([20, 20, 10, 50, 50])
-  const [samples, setSamples] = useState<TelemetrySample[]>(() => Array.from({ length: 80 }, (_, index) => makeDemoSample(index, 0.01, 0)))
+  const [samples, setSamples] = useState<TelemetrySample[]>([])
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
   const [charts, setCharts] = useState<ChartConfig[]>(() => { try { return JSON.parse(localStorage.getItem('cvt-dyno-layout') ?? 'null') ?? defaultCharts } catch { return defaultCharts } })
   const [dragged, setDragged] = useState<ChartId | null>(null)
@@ -48,8 +60,9 @@ function App() {
   const logCommitTimer = useRef<number | undefined>(undefined)
   const logCommitInProgress = useRef(false)
   const pendingLogRows = useRef('')
-  const loggedSampleCount = useRef(0)
+  const lastLoggedSampleTime = useRef<number | null>(null)
   const logFileName = useRef('')
+  const consoleOutputRef = useRef<HTMLDivElement | null>(null)
   const demoTimer = useRef<number | undefined>(undefined)
   const telemetryTimer = useRef<number | undefined>(undefined)
   const pendingRaw = useRef<RawValues>(emptyRaw)
@@ -59,27 +72,66 @@ function App() {
 
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
   useEffect(() => {
-    if (!logging || !logWriter.current || samples.length <= loggedSampleCount.current) return
-    const rows = samples.slice(loggedSampleCount.current).map(sampleToCsvRow).join('\n') + '\n'
-    loggedSampleCount.current = samples.length
+    if (!logging || !logWriter.current) return
+    const newSamples = samples.filter((sample) => lastLoggedSampleTime.current === null || sample.time > lastLoggedSampleTime.current)
+    if (!newSamples.length) return
+    const rows = newSamples.map(sampleToCsvRow).join('\n') + '\n'
+    lastLoggedSampleTime.current = newSamples[newSamples.length - 1].time
     pendingLogRows.current += rows
     if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
   }, [logging, samples])
   useEffect(() => {
+    if (autoScrollConsole && consoleOutputRef.current) consoleOutputRef.current.scrollTop = 0
+  }, [autoScrollConsole, consoleLines])
+  useEffect(() => {
     if (!demoMode || connected) return
     let index = 80
-    demoTimer.current = window.setInterval(() => { const next = makeDemoSample(index++, torqueScale, torqueOffset); setSamples((history) => [...history.slice(-499), next]) }, 100)
+    demoTimer.current = window.setInterval(() => { const next = makeDemoSample(index++, torqueScale, torqueOffset); setSamples((history) => retainRecentSamples(history, next)) }, 100)
     return () => window.clearInterval(demoTimer.current)
   }, [demoMode, connected, torqueScale, torqueOffset])
   useEffect(() => () => { window.clearTimeout(telemetryTimer.current); window.clearTimeout(logCommitTimer.current); void commitLog(false); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
-      const next = new SerialTransport({ onValue: handleValue, onText: setNotice })
-      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setNotice('Connected at 115200 baud')
+      const next = new SerialTransport({ onValue: handleValue, onPacket: handleSerialPacket, onText: handleSerialText })
+      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); pendingRaw.current = emptyRaw; setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to serial device') }
   }
   async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setNotice('Device disconnected') }
+  function consoleTimestamp() {
+    const now = new Date()
+    return `${now.toLocaleTimeString([], { hour12: false })}.${String(now.getMilliseconds()).padStart(3, '0')}`
+  }
+  function appendConsoleLines(linesToAdd: string[]) { setConsoleLines((lines) => [...lines, ...linesToAdd.map((line) => `${consoleTimestamp()} ${line}`)].slice(-MAX_CONSOLE_MESSAGES)) }
+  function handleSerialText(text: string) {
+    appendConsoleLines([`[RAW TEXT] ${text}`])
+    const configMatch = text.match(/^Channel \[(\d)\].*:\s(ENABLED|DISABLED)\s+\|\s+Target Tx Freq:\s+(\d+)\s+Hz$/i)
+    if (configMatch) {
+      const channel = Number(configMatch[1])
+      const enabled = configMatch[2].toUpperCase() === 'ENABLED'
+      const frequency = Number(configMatch[3])
+      setChannels((values) => values.map((value, index) => index === channel ? enabled : value))
+      setFrequencies((values) => values.map((value, index) => index === channel ? frequency : value))
+      setNotice(`Dyno configuration received: ${channelNames[channel]}`)
+      return
+    }
+    setNotice(text)
+  }
+  function handleSerialPacket(rawPacket: Uint8Array, channel: ChannelId, value: number) {
+    appendConsoleLines([`[RAW SENSOR] ${bytesToHex(rawPacket)} | [DECODED] ${channelNames[channel]} = ${value}`])
+  }
+  function bytesToHex(bytes: Uint8Array) { return [...bytes].map((byte) => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ') }
+  async function sendRawCommand(bytes: Uint8Array, description = 'Custom command') {
+    if (!transport.current) { setNotice('Connect the firmware before sending commands'); return }
+    await transport.current.send(bytes)
+    appendConsoleLines([`[TX] ${bytesToHex(bytes)} ${description}`])
+  }
+  async function sendCustomCommand() {
+    const tokens = customCommand.trim().split(/[\s,]+/).filter(Boolean)
+    const values = tokens.map((token) => Number.parseInt(token.replace(/^0x/i, ''), 16))
+    if (!tokens.length || values.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) { setNotice('Enter hexadecimal bytes, for example: 03 00 00 00'); return }
+    try { await sendRawCommand(new Uint8Array(values)); setNotice('Custom command sent') } catch { setNotice('Could not send custom command') }
+  }
   async function toggleFirmwareDemo() {
     if (!transport.current) { setNotice('Connect the firmware before enabling bench mode'); return }
     const enabled = !firmwareDemoMode
@@ -95,7 +147,7 @@ function App() {
       telemetryTimer.current = undefined
       const next = pendingRaw.current
       setRaw(next)
-      setSamples((history) => [...history.slice(-499), deriveSample({ time: performance.timeOrigin + performance.now(), ...next }, torqueScale, torqueOffset)])
+      setSamples((history) => retainRecentSamples(history, deriveSample({ time: performance.timeOrigin + performance.now(), ...next }, torqueScale, torqueOffset)))
     }, 50)
   }
   async function sendConfig(channel: number, enabled: boolean, frequency: number) { if (transport.current) { await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0)); await transport.current.send(encodeCommand(2, channel, frequency)) } }
@@ -162,7 +214,7 @@ function App() {
       await writer.close()
       logWriter.current = writer
       logFileName.current = name
-      loggedSampleCount.current = samples.length
+      lastLoggedSampleTime.current = samples[samples.length - 1]?.time ?? null
       await openLogWriter(directory, name)
       setLogging(true)
       setNotice(`Writing ${name}`)
@@ -180,9 +232,12 @@ function App() {
     }
   }
   function reorder(target: ChartId) { if (!dragged || dragged === target) return; const from = charts.findIndex((chart) => chart.id === dragged); const to = charts.findIndex((chart) => chart.id === target); const next = [...charts]; const [item] = next.splice(from, 1); next.splice(to, 0, item); setCharts(next); setDragged(null) }
+    const visibleConsoleLines = showSensorConsole ? consoleLines : consoleLines.filter((line) => !line.includes('[RAW SENSOR]'))
 
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'Serial link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'Serial link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
+    {consoleOpen && <section className="serial-console"><div className="console-toolbar"><div><span className="section-kicker">SERIAL CONSOLE / 115200 BAUD</span><h2>Command link</h2></div><div className="console-toolbar-actions"><button className={`button ${showSensorConsole ? 'button-accent' : 'button-quiet'}`} onClick={() => setShowSensorConsole((value) => !value)}>{showSensorConsole ? 'Hide sensor data' : 'Show sensor data'}</button><button className={`button ${autoScrollConsole ? 'button-accent' : 'button-quiet'}`} onClick={() => setAutoScrollConsole((value) => !value)}>{autoScrollConsole ? 'Auto-scroll on' : 'Auto-scroll off'}</button><button className="button button-quiet" onClick={() => setConsoleLines([])}><Trash2 size={14} />Clear</button></div></div><div className="console-grid"><div className="console-output" ref={consoleOutputRef}>{consoleLines.length ? [...consoleLines].reverse().map((line, index) => <div key={`${line}-${index}`}>{line}</div>) : <span className="console-empty">No serial messages yet. Connect the firmware or send a command.</span>}</div><div className="console-controls"><span className="console-label">Firmware commands</span><button className="console-command" onClick={() => void sendRawCommand(encodeCommand(3), 'Read configuration')}><span>Read configuration</span><code>03 00 00 00</code></button><button className="console-command" onClick={() => void sendRawCommand(encodeCommand(4, 0, 1), 'Enable bench mode')}><span>Enable bench mode</span><code>04 00 00 01</code></button><button className="console-command" onClick={() => void sendRawCommand(encodeCommand(4, 0, 0), 'Disable bench mode')}><span>Use real sensors</span><code>04 00 00 00</code></button><label className="console-label" htmlFor="custom-command">Custom hex bytes</label><div className="custom-command"><input id="custom-command" value={customCommand} onChange={(event) => setCustomCommand(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void sendCustomCommand() }} /><button className="icon-button" title="Send custom bytes" onClick={() => void sendCustomCommand()}><Send size={16} /></button></div></div></div></section>}
+      {consoleOpen && <section className="serial-console"><div className="console-toolbar"><div><span className="section-kicker">SERIAL CONSOLE / 115200 BAUD</span><h2>Command link</h2></div><div className="console-toolbar-actions"><button className={`button ${showSensorConsole ? 'button-accent' : 'button-quiet'}`} onClick={() => setShowSensorConsole((value) => !value)}>{showSensorConsole ? 'Hide sensor data' : 'Show sensor data'}</button><button className={`button ${autoScrollConsole ? 'button-accent' : 'button-quiet'}`} onClick={() => setAutoScrollConsole((value) => !value)}>{autoScrollConsole ? 'Auto-scroll on' : 'Auto-scroll off'}</button><button className="button button-quiet" onClick={() => setConsoleLines([])}><Trash2 size={14} />Clear</button></div></div><div className="console-grid"><div className="console-output" ref={consoleOutputRef}>{visibleConsoleLines.length ? [...visibleConsoleLines].reverse().map((line, index) => <div key={`${line}-${index}`}>{line}</div>) : <span className="console-empty">No serial messages yet. Connect the firmware or send a command.</span>}</div><div className="console-controls"><span className="console-label">Firmware commands</span><button className="console-command" onClick={() => void sendRawCommand(encodeCommand(3), 'Read configuration')}><span>Read configuration</span><code>03 00 00 00</code></button><button className="console-command" onClick={() => void sendRawCommand(encodeCommand(4, 0, 1), 'Enable bench mode')}><span>Enable bench mode</span><code>04 00 00 01</code></button><button className="console-command" onClick={() => void sendRawCommand(encodeCommand(4, 0, 0), 'Disable bench mode')}><span>Use real sensors</span><code>04 00 00 00</code></button><label className="console-label" htmlFor="custom-command">Custom hex bytes</label><div className="custom-command"><input id="custom-command" value={customCommand} onChange={(event) => setCustomCommand(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void sendCustomCommand() }} /><button className="icon-button" title="Send custom bytes" onClick={() => void sendCustomCommand()}><Send size={16} /></button></div></div></div></section>}
     <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div><div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${logFileName.current}` : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
     <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span><select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select></div>)}</section>
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>

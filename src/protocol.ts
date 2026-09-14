@@ -15,7 +15,7 @@ export type TelemetrySample = {
 export const channelNames = ['Primary RPM', 'Secondary RPM', 'Shift position', 'Primary torque', 'Secondary torque'] as const
 
 export function decodePacket(packet: Uint8Array): { channel: ChannelId; value: number } | null {
-  if (packet.length !== 8 || packet[0] !== 0xaa || packet[1] !== 0xbb || packet[2] > 4) return null
+  if (packet.length !== 8 || !((packet[0] === 0xaa && packet[1] === 0xbb) || (packet[0] === 0xbb && packet[1] === 0xaa)) || packet[2] > 4) return null
   const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength)
   return { channel: packet[2] as ChannelId, value: view.getInt32(4, true) }
 }

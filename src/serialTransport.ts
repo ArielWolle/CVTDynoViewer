@@ -2,6 +2,7 @@ import { decodePacket, type ChannelId } from './protocol'
 
 export type SerialHandlers = {
   onValue: (channel: ChannelId, value: number) => void
+  onPacket?: (raw: Uint8Array, channel: ChannelId, value: number) => void
   onText: (text: string) => void
 }
 
@@ -10,6 +11,7 @@ export class SerialTransport {
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null
   private buffer = new Uint8Array()
+  private readonly textDecoder = new TextDecoder()
 
   constructor(private readonly handlers: SerialHandlers) {}
 
@@ -57,14 +59,43 @@ export class SerialTransport {
     combined.set(this.buffer)
     combined.set(chunk, this.buffer.length)
     this.buffer = combined
-    while (this.buffer.length >= 8) {
-      const header = this.buffer.findIndex((byte) => byte === 0xaa)
-      if (header < 0) { this.buffer = new Uint8Array(); return }
-      if (header > 0) this.buffer = this.buffer.slice(header)
+    while (this.buffer.length > 0) {
+      const header = this.findPacketHeader()
+      if (header < 0) {
+        const newline = this.buffer.lastIndexOf(0x0a)
+        if (newline < 0) return
+        this.emitText(this.buffer.slice(0, newline + 1))
+        this.buffer = this.buffer.slice(newline + 1)
+        continue
+      }
+      if (header > 0) {
+        this.emitText(this.buffer.slice(0, header))
+        this.buffer = this.buffer.slice(header)
+      }
       if (this.buffer.length < 8) return
       const packet = decodePacket(this.buffer.slice(0, 8))
-      if (packet) this.handlers.onValue(packet.channel, packet.value)
-      this.buffer = this.buffer.slice(8)
+      if (packet) {
+        this.handlers.onPacket?.(this.buffer.slice(0, 8), packet.channel, packet.value)
+        this.handlers.onValue(packet.channel, packet.value)
+        this.buffer = this.buffer.slice(8)
+      } else {
+        this.emitText(this.buffer.slice(0, 1))
+        this.buffer = this.buffer.slice(1)
+      }
+    }
+  }
+
+  private findPacketHeader() {
+    for (let index = 0; index < this.buffer.length - 1; index += 1) {
+      if ((this.buffer[index] === 0xbb && this.buffer[index + 1] === 0xaa) || (this.buffer[index] === 0xaa && this.buffer[index + 1] === 0xbb)) return index
+    }
+    return -1
+  }
+
+  private emitText(bytes: Uint8Array) {
+    const text = this.textDecoder.decode(bytes)
+    for (const line of text.split(/\r?\n/)) {
+      if (line.trim()) this.handlers.onText(line.trim())
     }
   }
 }

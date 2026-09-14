@@ -4,6 +4,7 @@ import { csvEscape, decodePacket, deriveSample, encodeCommand, samplesToCsv } fr
 describe('firmware protocol', () => {
   it('decodes little-endian telemetry packets', () => {
     expect(decodePacket(new Uint8Array([0xaa, 0xbb, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678 })
+    expect(decodePacket(new Uint8Array([0xbb, 0xaa, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678 })
   })
 
   it('encodes big-endian configuration commands', () => {
