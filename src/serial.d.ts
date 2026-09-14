@@ -23,10 +23,12 @@ interface FileSystemDirectoryHandle {
 }
 
 interface FileSystemFileHandle {
-  createWritable(): Promise<FileSystemWritableFileStream>
+  getFile(): Promise<File>
+  createWritable(options?: { keepExistingData?: boolean }): Promise<FileSystemWritableFileStream>
 }
 
 interface FileSystemWritableFileStream {
   write(data: string): Promise<void>
+  seek(position: number): Promise<void>
   close(): Promise<void>
 }

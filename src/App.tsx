@@ -44,7 +44,9 @@ function App() {
   const transport = useRef<SerialTransport | null>(null)
   const directoryHandle = useRef<FileSystemDirectoryHandle | null>(null)
   const logWriter = useRef<FileSystemWritableFileStream | null>(null)
-  const logWriteQueue = useRef(Promise.resolve())
+  const logCommitTimer = useRef<number | undefined>(undefined)
+  const logCommitInProgress = useRef(false)
+  const pendingLogRows = useRef('')
   const loggedSampleCount = useRef(0)
   const logFileName = useRef('')
   const demoTimer = useRef<number | undefined>(undefined)
@@ -59,8 +61,8 @@ function App() {
     if (!logging || !logWriter.current || samples.length <= loggedSampleCount.current) return
     const rows = samples.slice(loggedSampleCount.current).map(sampleToCsvRow).join('\n') + '\n'
     loggedSampleCount.current = samples.length
-    const writer = logWriter.current
-    logWriteQueue.current = logWriteQueue.current.then(() => writer.write(rows)).catch(() => setNotice('Could not write to the log file'))
+    pendingLogRows.current += rows
+    if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
   }, [logging, samples])
   useEffect(() => {
     if (!demoMode || connected) return
@@ -68,7 +70,7 @@ function App() {
     demoTimer.current = window.setInterval(() => { const next = makeDemoSample(index++, torqueScale, torqueOffset); setSamples((history) => [...history.slice(-499), next]) }, 100)
     return () => window.clearInterval(demoTimer.current)
   }, [demoMode, connected, torqueScale, torqueOffset])
-  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); void logWriter.current?.close(); void transport.current?.disconnect() }, [])
+  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); window.clearTimeout(logCommitTimer.current); void commitLog(false); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
@@ -118,6 +120,29 @@ function App() {
     }
     throw new Error('Could not find an available log filename')
   }
+  async function openLogWriter(directory: FileSystemDirectoryHandle, name: string) {
+    const file = await directory.getFileHandle(name, { create: true })
+    const writer = await file.createWritable({ keepExistingData: true })
+    await writer.seek((await file.getFile()).size)
+    logWriter.current = writer
+  }
+  async function commitLog(reopen: boolean) {
+    if (logCommitInProgress.current || !logWriter.current || !pendingLogRows.current) return
+    logCommitInProgress.current = true
+    const rows = pendingLogRows.current
+    pendingLogRows.current = ''
+    const writer = logWriter.current
+    try {
+      await writer.write(rows)
+      await writer.close()
+      logWriter.current = null
+      if (reopen && directoryHandle.current) await openLogWriter(directoryHandle.current, logFileName.current)
+    } catch { setNotice('Could not commit the log file') }
+    finally {
+      logCommitInProgress.current = false
+      if (reopen && pendingLogRows.current && logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
+    }
+  }
   async function startLogging() {
     const directory = directoryHandle.current ?? await chooseDirectory()
     if (!directory) return
@@ -126,20 +151,23 @@ function App() {
       const file = await directory.getFileHandle(name, { create: true })
       const writer = await file.createWritable()
       await writer.write(`${csvHeader}\n`)
+      await writer.close()
       logWriter.current = writer
       logFileName.current = name
       loggedSampleCount.current = samples.length
+      await openLogWriter(directory, name)
       setLogging(true)
       setNotice(`Writing ${name}`)
     } catch { setNotice('Could not open a log file in that folder') }
   }
   async function stopLogging() {
     setLogging(false)
-    const writer = logWriter.current
-    logWriter.current = null
-    if (writer) {
-      await logWriteQueue.current
-      await writer.close().catch(() => undefined)
+    window.clearTimeout(logCommitTimer.current)
+    logCommitTimer.current = undefined
+    if (logWriter.current) {
+      await commitLog(false)
+      await logWriter.current?.close().catch(() => undefined)
+      logWriter.current = null
       setNotice(`Closed ${logFileName.current}`)
     }
   }
