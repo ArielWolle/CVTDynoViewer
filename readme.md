@@ -1,6 +1,6 @@
 # CVT Dyno Viewer
 
-Browser-based live viewer for the CVT dyno firmware. The app uses React, TypeScript, Vite, and Recharts, and deploys to GitLab Pages.
+Browser-based live viewer for the CVT dyno firmware. The app uses React, TypeScript, Vite, and Recharts, and deploys to GitHub Pages.
 
 ## Run locally
 
@@ -31,6 +31,6 @@ Commands are 4 bytes: command id, channel id, and a big-endian 16-bit value. Com
 
 Choose a directory in Chromium to save CSV files directly through the File System Access API. Browsers without that API use a normal CSV download. Torque scale and zero are editable because the firmware exposes torque counts rather than a documented physical unit.
 
-## GitLab Pages
+## GitHub Pages
 
-`.gitlab-ci.yml` installs dependencies, builds the Vite output, and publishes `dist/` as the Pages artifact on the default branch. The Vite base path is relative so the bundle works under a GitLab project-page URL.
+`.github/workflows/deploy-pages.yml` installs dependencies, runs checks, builds the Vite output, and publishes `dist/` through the GitHub Pages environment on the `main` branch. Enable GitHub Pages with the **GitHub Actions** source in the repository settings. The Vite base path is relative so the bundle works under a project-page URL.
