@@ -44,9 +44,11 @@ function App() {
   const transport = useRef<SerialTransport | null>(null)
   const directoryHandle = useRef<FileSystemDirectoryHandle | null>(null)
   const demoTimer = useRef<number | undefined>(undefined)
+  const telemetryTimer = useRef<number | undefined>(undefined)
+  const pendingRaw = useRef<RawValues>(emptyRaw)
 
   const current = samples[samples.length - 1] ?? deriveSample({ time: 0, ...raw }, torqueScale, torqueOffset)
-  const chartData = useMemo(() => samples.slice(-120).map((sample) => ({ ...sample, seconds: sample.time / 1000 })), [samples])
+  const chartData = useMemo(() => samples.slice(-72).map((sample) => ({ ...sample, seconds: sample.time / 1000 })), [samples])
 
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
   useEffect(() => {
@@ -55,7 +57,7 @@ function App() {
     demoTimer.current = window.setInterval(() => { const next = makeDemoSample(index++, torqueScale, torqueOffset); setSamples((history) => [...history.slice(-499), next]) }, 100)
     return () => window.clearInterval(demoTimer.current)
   }, [demoMode, connected, torqueScale, torqueOffset])
-  useEffect(() => () => { void transport.current?.disconnect() }, [])
+  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
@@ -65,7 +67,15 @@ function App() {
   }
   async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setNotice('Device disconnected') }
   function handleValue(channel: ChannelId, value: number) {
-    setRaw((previous) => { const key = (['rpm1', 'rpm2', 'shift', 'torq1', 'torq2'] as const)[channel]; const next = { ...previous, [key]: value }; setSamples((history) => [...history.slice(-499), deriveSample({ time: performance.timeOrigin + performance.now(), ...next }, torqueScale, torqueOffset)]); return next })
+    const key = (['rpm1', 'rpm2', 'shift', 'torq1', 'torq2'] as const)[channel]
+    pendingRaw.current = { ...pendingRaw.current, [key]: value }
+    if (telemetryTimer.current !== undefined) return
+    telemetryTimer.current = window.setTimeout(() => {
+      telemetryTimer.current = undefined
+      const next = pendingRaw.current
+      setRaw(next)
+      setSamples((history) => [...history.slice(-499), deriveSample({ time: performance.timeOrigin + performance.now(), ...next }, torqueScale, torqueOffset)])
+    }, 50)
   }
   async function sendConfig(channel: number, enabled: boolean, frequency: number) { if (transport.current) { await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0)); await transport.current.send(encodeCommand(2, channel, frequency)) } }
   function updateChannel(channel: number, enabled: boolean) { setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value)); void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration')) }
@@ -97,7 +107,8 @@ function App() {
 function ChartCard({ config, data, onDragStart, onDrop, onHide }: { config: ChartConfig; data: (TelemetrySample & { seconds: number })[]; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
   const common = { data, margin: { top: 8, right: 14, left: -18, bottom: 0 } }
   const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={42} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
-  const chart = config.id === 'scatter' ? <ResponsiveContainer width="100%" height="100%"><ScatterChart margin={common.margin}><CartesianGrid stroke="#e4dfd5" /><XAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} /><YAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} /><Tooltip cursor={{ strokeDasharray: '3 3' }} /><Scatter data={data} fill={config.color} /></ScatterChart></ResponsiveContainer> : <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{axis}{config.id === 'rpm1' && <Line type="monotone" dataKey="rpm1" stroke={config.color} dot={false} strokeWidth={2} />}{config.id === 'rpm2' && <Line type="monotone" dataKey="rpm2" stroke={config.color} dot={false} strokeWidth={2} />}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} dot={false} strokeWidth={2} />}{config.id === 'power' && <><Line type="monotone" dataKey="power1" stroke="#f05d3b" dot={false} strokeWidth={2} /><Line type="monotone" dataKey="power2" stroke="#3c8f88" dot={false} strokeWidth={2} /></>}{config.id === 'efficiency' && <Line type="monotone" dataKey="efficiency" stroke={config.color} dot={false} strokeWidth={2} />}</LineChart></ResponsiveContainer>
+  const lineProps = { isAnimationActive: false, animationDuration: 0, dot: { r: 2, strokeWidth: 0 }, activeDot: { r: 3 } }
+  const chart = config.id === 'scatter' ? <ResponsiveContainer width="100%" height="100%"><ScatterChart margin={common.margin}><CartesianGrid stroke="#e4dfd5" /><XAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} /><YAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} /><Tooltip cursor={{ strokeDasharray: '3 3' }} /><Scatter data={data} fill={config.color} isAnimationActive={false} /></ScatterChart></ResponsiveContainer> : <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{axis}{config.id === 'rpm1' && <Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'rpm2' && <Line type="monotone" dataKey="rpm2" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <><Line type="monotone" dataKey="power1" stroke="#f05d3b" strokeWidth={2} {...lineProps} /><Line type="monotone" dataKey="power2" stroke="#3c8f88" strokeWidth={2} {...lineProps} /></>}{config.id === 'efficiency' && <Line type="monotone" dataKey="efficiency" stroke={config.color} strokeWidth={2} {...lineProps} />}</LineChart></ResponsiveContainer>
   return <article className={`chart-card ${config.id === 'scatter' ? 'chart-wide' : ''}`} draggable onDragStart={onDragStart} onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder"><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div><button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span><span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : 'Time window: 12.0 s'}</span></div></article>
 }
 
