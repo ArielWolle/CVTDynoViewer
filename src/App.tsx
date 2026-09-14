@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, Cable, CircleHelp, Download, Gauge, GripVertical, SlidersHorizontal, Square, Trash2, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from 'recharts'
-import { channelNames, deriveSample, encodeCommand, samplesToCsv, type ChannelId, type TelemetrySample } from './protocol'
+import { channelNames, csvHeader, deriveSample, encodeCommand, sampleToCsvRow, samplesToCsv, type ChannelId, type TelemetrySample } from './protocol'
 import { SerialTransport } from './serialTransport'
 
 type ChartId = 'scatter' | 'rpm1' | 'rpm2' | 'shift' | 'power' | 'efficiency'
@@ -43,6 +43,10 @@ function App() {
   const [directoryName, setDirectoryName] = useState('Browser download')
   const transport = useRef<SerialTransport | null>(null)
   const directoryHandle = useRef<FileSystemDirectoryHandle | null>(null)
+  const logWriter = useRef<FileSystemWritableFileStream | null>(null)
+  const logWriteQueue = useRef(Promise.resolve())
+  const loggedSampleCount = useRef(0)
+  const logFileName = useRef('')
   const demoTimer = useRef<number | undefined>(undefined)
   const telemetryTimer = useRef<number | undefined>(undefined)
   const pendingRaw = useRef<RawValues>(emptyRaw)
@@ -52,12 +56,19 @@ function App() {
 
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
   useEffect(() => {
+    if (!logging || !logWriter.current || samples.length <= loggedSampleCount.current) return
+    const rows = samples.slice(loggedSampleCount.current).map(sampleToCsvRow).join('\n') + '\n'
+    loggedSampleCount.current = samples.length
+    const writer = logWriter.current
+    logWriteQueue.current = logWriteQueue.current.then(() => writer.write(rows)).catch(() => setNotice('Could not write to the log file'))
+  }, [logging, samples])
+  useEffect(() => {
     if (!demoMode || connected) return
     let index = 80
     demoTimer.current = window.setInterval(() => { const next = makeDemoSample(index++, torqueScale, torqueOffset); setSamples((history) => [...history.slice(-499), next]) }, 100)
     return () => window.clearInterval(demoTimer.current)
   }, [demoMode, connected, torqueScale, torqueOffset])
-  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); void transport.current?.disconnect() }, [])
+  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); void logWriter.current?.close(); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
@@ -90,12 +101,53 @@ function App() {
     }
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${sessionName || 'cvt-dyno-session'}.csv`; anchor.click(); URL.revokeObjectURL(url); setNotice(`Downloaded ${samples.length.toLocaleString()} samples`)
   }
-  async function chooseDirectory() { if (!navigator.showDirectoryPicker) { setNotice('Folder access is unavailable; CSV download remains available'); return } try { directoryHandle.current = await navigator.showDirectoryPicker(); setDirectoryName(directoryHandle.current.name); setNotice(`Logging folder: ${directoryHandle.current.name}`) } catch { setNotice('Folder selection cancelled') } }
+  async function chooseDirectory(): Promise<FileSystemDirectoryHandle | null> {
+    if (!navigator.showDirectoryPicker) { setNotice('Chrome folder access is unavailable in this browser; CSV download remains available'); return null }
+    try {
+      directoryHandle.current = await navigator.showDirectoryPicker()
+      setDirectoryName(directoryHandle.current.name)
+      setNotice(`Folder access granted: ${directoryHandle.current.name}`)
+      return directoryHandle.current
+    } catch { setNotice('Folder selection cancelled'); return null }
+  }
+  async function nextLogFileName(directory: FileSystemDirectoryHandle): Promise<string> {
+    const base = (sessionName.trim() || 'cvt-dyno-session').replace(/[<>:"/\\|?*]/g, '-')
+    for (let index = 1; index < 10000; index += 1) {
+      const name = index === 1 ? `${base}.csv` : `${base}-${index}.csv`
+      try { await directory.getFileHandle(name); } catch { return name }
+    }
+    throw new Error('Could not find an available log filename')
+  }
+  async function startLogging() {
+    const directory = directoryHandle.current ?? await chooseDirectory()
+    if (!directory) return
+    try {
+      const name = await nextLogFileName(directory)
+      const file = await directory.getFileHandle(name, { create: true })
+      const writer = await file.createWritable()
+      await writer.write(`${csvHeader}\n`)
+      logWriter.current = writer
+      logFileName.current = name
+      loggedSampleCount.current = samples.length
+      setLogging(true)
+      setNotice(`Writing ${name}`)
+    } catch { setNotice('Could not open a log file in that folder') }
+  }
+  async function stopLogging() {
+    setLogging(false)
+    const writer = logWriter.current
+    logWriter.current = null
+    if (writer) {
+      await logWriteQueue.current
+      await writer.close().catch(() => undefined)
+      setNotice(`Closed ${logFileName.current}`)
+    }
+  }
   function reorder(target: ChartId) { if (!dragged || dragged === target) return; const from = charts.findIndex((chart) => chart.id === dragged); const to = charts.findIndex((chart) => chart.id === target); const next = [...charts]; const [item] = next.splice(from, 1); next.splice(to, 0, item); setCharts(next); setDragged(null) }
 
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? 'Serial link active' : demoMode ? 'Demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle demo telemetry"><Gauge size={16} />{demoMode ? 'Demo on' : 'Demo off'}</button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
-    <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div><div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => setLogging((value) => !value)}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? 'Logging' : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Choose a folder for browser file access">{directoryName === 'Browser download' ? 'Choose folder' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
+    <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div><div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${logFileName.current}` : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
     <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span><select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select></div>)}</section>
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
     <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{samples.length.toLocaleString()} samples buffered</span><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>

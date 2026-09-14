@@ -35,8 +35,12 @@ export function csvEscape(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
 }
 
+export const csvHeader = 'timestamp_ms,primary_rpm,secondary_rpm,shift_position,primary_torque,secondary_torque,primary_power_kw,secondary_power_kw,efficiency_percent'
+
+export function sampleToCsvRow(sample: TelemetrySample): string {
+  return [sample.time, sample.rpm1, sample.rpm2, sample.shift, sample.torq1, sample.torq2, sample.power1.toFixed(3), sample.power2.toFixed(3), sample.efficiency.toFixed(2)].map(csvEscape).join(',')
+}
+
 export function samplesToCsv(samples: TelemetrySample[]): string {
-  const header = 'timestamp_ms,primary_rpm,secondary_rpm,shift_position,primary_torque,secondary_torque,primary_power_kw,secondary_power_kw,efficiency_percent'
-  const rows = samples.map((sample) => [sample.time, sample.rpm1, sample.rpm2, sample.shift, sample.torq1, sample.torq2, sample.power1.toFixed(3), sample.power2.toFixed(3), sample.efficiency.toFixed(2)].map(csvEscape).join(','))
-  return [header, ...rows].join('\n')
+  return [csvHeader, ...samples.map(sampleToCsvRow)].join('\n')
 }
