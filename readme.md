@@ -27,6 +27,8 @@ Telemetry packets are 8 bytes: little-endian header `0xAABB`, channel id, paddin
 
 Commands are 4 bytes: command id, channel id, and a big-endian 16-bit value. Command `0x01` toggles a channel, `0x02` sets its frequency, and `0x03` requests the text configuration report.
 
+Command `0x04` controls firmware bench mode. Send `[0x04, 0x00, 0x00, 0x01]` to generate synthetic RPM, shift, and torque values on the firmware without reading attached sensors. Send `[0x04, 0x00, 0x00, 0x00]` to restore the real sensor path. The website's **Bench mode** button sends these packets after a serial connection is established.
+
 ## Logging
 
 Choose a directory in Chromium to save CSV files directly through the File System Access API. Browsers without that API use a normal CSV download. Torque scale and zero are editable because the firmware exposes torque counts rather than a documented physical unit.
