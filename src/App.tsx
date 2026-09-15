@@ -7,7 +7,7 @@ import { SerialTransport } from './serialTransport'
 type ChartId = 'scatter' | 'rpm1' | 'rpm2' | 'shift' | 'power' | 'efficiency'
 type ChartConfig = { id: ChartId; title: string; subtitle: string; color: string; visible: boolean }
 type RawValues = Pick<TelemetrySample, 'rpm1' | 'rpm2' | 'shift' | 'torq1' | 'torq2'>
-type ConsoleType = 'RPM1' | 'RPM2' | 'SHIFT' | 'TORQ1' | 'TORQ2' | 'READ CONFIG' | 'RPM TEST' | 'TEXT' | 'TX'
+type ConsoleType = 'RPM1' | 'RPM2' | 'SHIFT' | 'TORQ1' | 'TORQ2' | 'READ CONFIG' | 'RPM TEST' | 'RPM COUNT TEST' | 'TEXT' | 'TX'
 type ConsoleMessage = { id: number; time: string; type: ConsoleType; data: string }
 type ConsoleSort = 'time' | 'type' | 'data'
 
@@ -42,7 +42,9 @@ function App() {
   const [firmwareDemoMode, setFirmwareDemoMode] = useState(false)
   const [rpmPinTest, setRpmPinTest] = useState(false)
   const [rpmInterruptTest, setRpmInterruptTest] = useState(false)
+  const [rpmCountTest, setRpmCountTest] = useState(false)
   const [rpmPinStates, setRpmPinStates] = useState<[boolean | null, boolean | null]>([null, null])
+  const [rpmCountStates, setRpmCountStates] = useState<[number | null, number | null]>([null, null])
   const [consoleOpen, setConsoleOpen] = useState(false)
   const [consoleLines, setConsoleLines] = useState<string[]>([])
   const [consoleMessages, setConsoleMessages] = useState<ConsoleMessage[]>([])
@@ -120,6 +122,7 @@ function App() {
       if (data.includes('Primary torque')) return 'TORQ1'
       return 'TORQ2'
     }
+    if (data.includes('RPM COUNT TEST')) return 'RPM COUNT TEST'
     if (data.includes('RPM TEST')) return 'RPM TEST'
     if (data.includes('Read configuration') || data.includes('CURRENT CONFIGURATION') || data.includes('Bench mode:') || data.includes('Channel [')) return 'READ CONFIG'
     if (data.startsWith('[TX]')) return 'TX'
@@ -159,6 +162,13 @@ function App() {
       setNotice(`RPM interrupt test: ${enabled ? 'enabled' : 'disabled'}`)
       return
     }
+    const rpmCountTestModeMatch = text.match(/^RPM count test:\s*(ENABLED|DISABLED)$/i)
+    if (rpmCountTestModeMatch) {
+      const enabled = rpmCountTestModeMatch[1].toUpperCase() === 'ENABLED'
+      setRpmCountTest(enabled)
+      setNotice(`RPM count test: ${enabled ? 'enabled' : 'disabled'}`)
+      return
+    }
     const spokesMatch = text.match(/^RPM Spokes - PRIMARY:\s*(\d+)\s*\|\s*SECONDARY:\s*(\d+)$/i)
     if (spokesMatch) {
       const primary = Number(spokesMatch[1])
@@ -166,6 +176,14 @@ function App() {
       setPrimarySpokes(primary)
       setSecondarySpokes(secondary)
       setNotice(`RPM spokes: Primary=${primary}, Secondary=${secondary}`)
+      return
+    }
+    const rpmCountMatch = text.match(/^RPM COUNT TEST \| RPM1 count=(\d+) \| RPM2 count=(\d+)$/i)
+    if (rpmCountMatch) {
+      const rpm1Count = Number(rpmCountMatch[1])
+      const rpm2Count = Number(rpmCountMatch[2])
+      setRpmCountStates([rpm1Count, rpm2Count])
+      setNotice(`RPM counts: RPM1=${rpm1Count}, RPM2=${rpm2Count}`)
       return
     }
     const configMatch = text.match(/^Channel \[(\d)\].*:\s(ENABLED|DISABLED)\s+\|\s+Target Tx Freq:\s+(\d+)\s+Hz$/i)
@@ -220,7 +238,20 @@ function App() {
       setNotice(enabled ? 'RPM interrupt test enabled' : 'RPM interrupt test disabled')
     } catch { setNotice('Could not change RPM interrupt test mode') }
   }
+  async function toggleRpmCountTest() {
+    if (!transport.current) { setNotice('Connect the firmware before starting the RPM count test'); return }
+    const enabled = !rpmCountTest
+    try {
+      await sendRawCommand(encodeCommand(8, 0, enabled ? 1 : 0), enabled ? 'Enable RPM count test' : 'Disable RPM count test')
+      setRpmCountTest(enabled)
+      setNotice(enabled ? 'RPM count test enabled' : 'RPM count test disabled')
+    } catch { setNotice('Could not change RPM count test mode') }
+  }
   function handleValue(channel: ChannelId, value: number) {
+    if ((channel === 0 || channel === 1) && (value < 0 || value > 30000)) {
+      appendConsoleLines([`[RAW TEXT] Ignored out-of-range RPM payload on channel ${channel}: ${value}`])
+      return
+    }
     const key = (['rpm1', 'rpm2', 'shift', 'torq1', 'torq2'] as const)[channel]
     pendingRaw.current = { ...pendingRaw.current, [key]: value }
     if (telemetryTimer.current !== undefined) return
@@ -324,7 +355,7 @@ function App() {
 
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'Serial link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
-    {consoleOpen && <SerialConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmPinStates={rpmPinStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} />}
+    {consoleOpen && <SerialConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
     <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div><div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${logFileName.current}` : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
     <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span><select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select></div>)}</section>
     <section className="channel-strip"><div className="strip-label"><Gauge size={17} /><span>RPM wheel teeth / spokes</span></div><div className="channel-control"><span>Primary wheel teeth</span><input type="number" min="1" max="999" value={primarySpokes} onChange={(event) => updateSpokes(0, Number(event.target.value))} /></div><div className="channel-control"><span>Secondary wheel teeth</span><input type="number" min="1" max="999" value={secondarySpokes} onChange={(event) => updateSpokes(1, Number(event.target.value))} /></div></section>
@@ -343,7 +374,7 @@ function ChartCard({ config, data, onDragStart, onDrop, onHide }: { config: Char
   return <article className={`chart-card ${config.id === 'scatter' ? 'chart-wide' : ''}`} draggable onDragStart={onDragStart} onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder"><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div><button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span><span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : 'Time window: 12.0 s'}</span></div></article>
 }
 
-function SerialConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmPinStates, onToggleRpmPinTest, onToggleRpmInterruptTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmPinStates: [boolean | null, boolean | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void> }) {
+function SerialConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {
   const [sortBy, setSortBy] = useState<ConsoleSort>('time')
   const [sortAscending, setSortAscending] = useState(false)
   const [globalStackByType, setGlobalStackByType] = useState(false)
@@ -359,7 +390,7 @@ function SerialConsolePanel({ messages, showSensorData, autoScroll, customComman
     const comparison = sortBy === 'time' ? left.id - right.id : sortBy === 'type' ? left.type.localeCompare(right.type) : left.data.localeCompare(right.data)
     return (sortAscending ? 1 : -1) * comparison
   })
-  const types: ConsoleType[] = ['RPM1', 'RPM2', 'SHIFT', 'TORQ1', 'TORQ2', 'READ CONFIG', 'RPM TEST', 'TEXT', 'TX']
+  const types: ConsoleType[] = ['RPM1', 'RPM2', 'SHIFT', 'TORQ1', 'TORQ2', 'READ CONFIG', 'RPM TEST', 'RPM COUNT TEST', 'TEXT', 'TX']
   function changeSort(next: ConsoleSort) { if (sortBy === next) setSortAscending((value) => !value); else { setSortBy(next); setSortAscending(next !== 'time') } }
   function toggleGlobalStackByType() {
     setGlobalStackByType((current) => !current)
@@ -371,7 +402,7 @@ function SerialConsolePanel({ messages, showSensorData, autoScroll, customComman
       setStackedTypes({})
     }
   }
-  return <section className="serial-console serial-console-structured"><div className="console-toolbar"><div><span className="section-kicker">SERIAL CONSOLE / 115200 BAUD</span><h2>Command link</h2></div><div className="console-toolbar-actions"><button className={`button ${showSensorData ? 'button-accent' : 'button-quiet'}`} onClick={onToggleSensorData}>{showSensorData ? 'Hide sensor data' : 'Show sensor data'}</button><button className={`button ${autoScroll ? 'button-accent' : 'button-quiet'}`} onClick={onToggleAutoScroll}>{autoScroll ? 'Auto-scroll on' : 'Auto-scroll off'}</button><button className="button button-quiet" onClick={onClear}><Trash2 size={14} />Clear</button></div></div><div className="console-stack-controls"><button className={`button ${globalStackByType ? 'button-accent' : 'button-quiet'}`} onClick={toggleGlobalStackByType}>Stack latest by type</button></div><div className="console-grid"><div className="console-table-wrap"><table className="console-table"><thead><tr><th><button onClick={() => changeSort('time')}>Time {sortBy === 'time' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('type')}>Type {sortBy === 'type' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('data')}>Data {sortBy === 'data' && (sortAscending ? '↑' : '↓')}</button></th></tr></thead><tbody>{sortedMessages.length ? sortedMessages.map((message) => <tr key={message.id}><td>{message.time}</td><td><span className={`console-type-pill type-${message.type.toLowerCase().replaceAll(' ', '-')}`}>{message.type}</span></td><td>{message.data}</td></tr>) : <tr><td colSpan={3} className="console-empty">No serial messages yet. Connect the firmware or send a command.</td></tr>}</tbody></table></div><div className="console-controls"><span className="console-label">Firmware commands</span><div className="rpm-pin-status"><div className={`rpm-pin-card ${rpmPinStates[0] === null ? 'unknown' : rpmPinStates[0] ? 'is-high' : 'is-low'}`}><span>RPM1 / PIN 1</span><strong>{rpmPinStates[0] === null ? 'WAITING' : rpmPinStates[0] ? 'HIGH' : 'LOW'}</strong></div><div className={`rpm-pin-card ${rpmPinStates[1] === null ? 'unknown' : rpmPinStates[1] ? 'is-high' : 'is-low'}`}><span>RPM2 / PIN 3</span><strong>{rpmPinStates[1] === null ? 'WAITING' : rpmPinStates[1] ? 'HIGH' : 'LOW'}</strong></div></div><button className="console-command" onClick={() => void onSendCommand(encodeCommand(3), 'Read configuration')}><span>Read configuration</span><code>03 00 00 00</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 1), 'Enable bench mode')}><span>Enable bench mode</span><code>04 00 00 01</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 0), 'Disable bench mode')}><span>Use real sensors</span><code>04 00 00 00</code></button><button className={`console-command ${rpmPinTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmPinTest()}><span>{rpmPinTest ? 'Stop RPM pin test' : 'Start RPM pin test'}</span><code>05 00 00 0{rpmPinTest ? '0' : '1'}</code></button><button className={`console-command ${rpmInterruptTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmInterruptTest()}><span>{rpmInterruptTest ? 'Stop interrupt test' : 'Start interrupt test'}</span><code>07 00 00 0{rpmInterruptTest ? '0' : '1'}</code></button><label className="console-label" htmlFor="custom-command">Custom hex bytes</label><div className="custom-command"><input id="custom-command" value={customCommand} onChange={(event) => setCustomCommand(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void onSendCustom() }} /><button className="icon-button" title="Send custom bytes" onClick={() => void onSendCustom()}><Send size={16} /></button></div></div></div></section>
+  return <section className="serial-console serial-console-structured"><div className="console-toolbar"><div><span className="section-kicker">SERIAL CONSOLE / 115200 BAUD</span><h2>Command link</h2></div><div className="console-toolbar-actions"><button className={`button ${showSensorData ? 'button-accent' : 'button-quiet'}`} onClick={onToggleSensorData}>{showSensorData ? 'Hide sensor data' : 'Show sensor data'}</button><button className={`button ${autoScroll ? 'button-accent' : 'button-quiet'}`} onClick={onToggleAutoScroll}>{autoScroll ? 'Auto-scroll on' : 'Auto-scroll off'}</button><button className="button button-quiet" onClick={onClear}><Trash2 size={14} />Clear</button></div></div><div className="console-stack-controls"><button className={`button ${globalStackByType ? 'button-accent' : 'button-quiet'}`} onClick={toggleGlobalStackByType}>Stack latest by type</button></div><div className="console-grid"><div className="console-table-wrap"><table className="console-table"><thead><tr><th><button onClick={() => changeSort('time')}>Time {sortBy === 'time' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('type')}>Type {sortBy === 'type' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('data')}>Data {sortBy === 'data' && (sortAscending ? '↑' : '↓')}</button></th></tr></thead><tbody>{sortedMessages.length ? sortedMessages.map((message) => <tr key={message.id}><td>{message.time}</td><td><span className={`console-type-pill type-${message.type.toLowerCase().replaceAll(' ', '-')}`}>{message.type}</span></td><td>{message.data}</td></tr>) : <tr><td colSpan={3} className="console-empty">No serial messages yet. Connect the firmware or send a command.</td></tr>}</tbody></table></div><div className="console-controls"><span className="console-label">Firmware commands</span><div className="rpm-pin-status"><div className={`rpm-pin-card ${rpmPinStates[0] === null ? 'unknown' : rpmPinStates[0] ? 'is-high' : 'is-low'}`}><span>RPM1 / PIN 1</span><strong>{rpmPinStates[0] === null ? 'WAITING' : rpmPinStates[0] ? 'HIGH' : 'LOW'}</strong></div><div className={`rpm-pin-card ${rpmPinStates[1] === null ? 'unknown' : rpmPinStates[1] ? 'is-high' : 'is-low'}`}><span>RPM2 / PIN 3</span><strong>{rpmPinStates[1] === null ? 'WAITING' : rpmPinStates[1] ? 'HIGH' : 'LOW'}</strong></div></div><div className="rpm-pin-status"><div className={`rpm-pin-card ${rpmCountStates[0] === null ? 'unknown' : 'is-high'}`}><span>RPM1 count</span><strong>{rpmCountStates[0] === null ? 'WAITING' : rpmCountStates[0]}</strong></div><div className={`rpm-pin-card ${rpmCountStates[1] === null ? 'unknown' : 'is-high'}`}><span>RPM2 count</span><strong>{rpmCountStates[1] === null ? 'WAITING' : rpmCountStates[1]}</strong></div></div><button className="console-command" onClick={() => void onSendCommand(encodeCommand(3), 'Read configuration')}><span>Read configuration</span><code>03 00 00 00</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 1), 'Enable bench mode')}><span>Enable bench mode</span><code>04 00 00 01</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 0), 'Disable bench mode')}><span>Use real sensors</span><code>04 00 00 00</code></button><button className={`console-command ${rpmPinTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmPinTest()}><span>{rpmPinTest ? 'Stop RPM pin test' : 'Start RPM pin test'}</span><code>05 00 00 0{rpmPinTest ? '0' : '1'}</code></button><button className={`console-command ${rpmInterruptTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmInterruptTest()}><span>{rpmInterruptTest ? 'Stop interrupt test' : 'Start interrupt test'}</span><code>07 00 00 0{rpmInterruptTest ? '0' : '1'}</code></button><button className={`console-command ${rpmCountTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmCountTest()}><span>{rpmCountTest ? 'Stop RPM count test' : 'Start RPM count test'}</span><code>08 00 00 0{rpmCountTest ? '0' : '1'}</code></button><label className="console-label" htmlFor="custom-command">Custom hex bytes</label><div className="custom-command"><input id="custom-command" value={customCommand} onChange={(event) => setCustomCommand(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void onSendCustom() }} /><button className="icon-button" title="Send custom bytes" onClick={() => void onSendCustom()}><Send size={16} /></button></div></div></div></section>
 }
 
 export default App

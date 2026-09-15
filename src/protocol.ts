@@ -20,7 +20,7 @@ export function decodePacket(packet: Uint8Array): { channel: ChannelId; value: n
   return { channel: packet[2] as ChannelId, value: view.getInt32(4, true) }
 }
 
-export function encodeCommand(command: 1 | 2 | 3 | 4 | 5 | 6 | 7, channel = 0, value = 0): Uint8Array {
+export function encodeCommand(command: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8, channel = 0, value = 0): Uint8Array {
   return new Uint8Array([command, channel, (value >> 8) & 0xff, value & 0xff])
 }
 
