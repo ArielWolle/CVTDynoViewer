@@ -21,4 +21,11 @@ describe('firmware protocol', () => {
     expect(csvEscape('pull, A')).toBe('"pull, A"')
     expect(samplesToCsv([]).split('\n')[0]).toContain('primary_rpm')
   })
+
+  it('derives inertia-mode power from shaft acceleration and an engine torque curve', () => {
+    const sample = deriveSample({ time: 1000, rpm1: 1800, rpm2: 1800, shift: 0, torq1: 0, torq2: 0 }, 1, 0, 'inertia', { time: 0, rpm1: 1000, rpm2: 0 })
+    expect(sample.power1).toBeGreaterThan(4)
+    expect(sample.power2).toBeGreaterThan(0)
+    expect(sample.efficiency).toBeGreaterThan(0)
+  })
 })
