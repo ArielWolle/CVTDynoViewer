@@ -21,7 +21,14 @@ const defaultCharts: ChartConfig[] = [
 ]
 
 const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
-const SENSOR_RETENTION_MS = 30_000
+const SENSOR_RETENTION_MS = 300_000
+const DEFAULT_CHART_WINDOW_MS = 240_000
+const CHART_WINDOW_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 60_000, label: '1 min' },
+  { value: 120_000, label: '2 min' },
+  { value: 240_000, label: '4 min' },
+  { value: 300_000, label: '5 min' },
+]
 const MAX_CONSOLE_MESSAGES = 500
 
 function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
@@ -61,6 +68,7 @@ function App() {
   const [secondarySpokes, setSecondarySpokes] = useState(12)
   const [samples, setSamples] = useState<TelemetrySample[]>([])
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
+  const [chartWindowMs, setChartWindowMs] = useState(DEFAULT_CHART_WINDOW_MS)
   const [charts, setCharts] = useState<ChartConfig[]>(() => { try { return JSON.parse(localStorage.getItem('cvt-dyno-layout') ?? 'null') ?? defaultCharts } catch { return defaultCharts } })
   const [dragged, setDragged] = useState<ChartId | null>(null)
   const [notice, setNotice] = useState('Demo telemetry is flowing')
@@ -80,7 +88,16 @@ function App() {
   const pendingRaw = useRef<RawValues>(emptyRaw)
 
   const current = samples[samples.length - 1] ?? deriveSample({ time: 0, ...raw }, torqueScale, torqueOffset)
-  const chartData = useMemo(() => samples.slice(-72).map((sample) => ({ ...sample, seconds: sample.time / 1000 })), [samples])
+  const chartData = useMemo(() => {
+    if (!samples.length) return []
+    const cutoff = samples[samples.length - 1].time - chartWindowMs
+    return samples.filter((sample) => sample.time >= cutoff).map((sample) => ({ ...sample, seconds: sample.time / 1000 }))
+  }, [samples, chartWindowMs])
+  const scatterChartData = useMemo(() => {
+    if (!samples.length) return []
+    const cutoff = samples[samples.length - 1].time - chartWindowMs
+    return samples.filter((sample) => sample.time >= cutoff).map((sample) => ({ ...sample, seconds: sample.time / 1000 }))
+  }, [samples, chartWindowMs])
 
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
   useEffect(() => {
@@ -248,10 +265,6 @@ function App() {
     } catch { setNotice('Could not change RPM count test mode') }
   }
   function handleValue(channel: ChannelId, value: number) {
-    if ((channel === 0 || channel === 1) && (value < 0 || value > 30000)) {
-      appendConsoleLines([`[RAW TEXT] Ignored out-of-range RPM payload on channel ${channel}: ${value}`])
-      return
-    }
     const key = (['rpm1', 'rpm2', 'shift', 'torq1', 'torq2'] as const)[channel]
     pendingRaw.current = { ...pendingRaw.current, [key]: value }
     if (telemetryTimer.current !== undefined) return
@@ -361,17 +374,17 @@ function App() {
     <section className="channel-strip"><div className="strip-label"><Gauge size={17} /><span>RPM wheel teeth / spokes</span></div><div className="channel-control"><span>Primary wheel teeth</span><input type="number" min="1" max="999" value={primarySpokes} onChange={(event) => updateSpokes(0, Number(event.target.value))} /></div><div className="channel-control"><span>Secondary wheel teeth</span><input type="number" min="1" max="999" value={secondarySpokes} onChange={(event) => updateSpokes(1, Number(event.target.value))} /></div></section>
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
     <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{samples.length.toLocaleString()} samples buffered</span><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
-    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
+    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} scatterData={scatterChartData} chartWindowMs={chartWindowMs} onChartWindowChange={setChartWindowMs} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
     <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
 }
 
-function ChartCard({ config, data, onDragStart, onDrop, onHide }: { config: ChartConfig; data: (TelemetrySample & { seconds: number })[]; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
+function ChartCard({ config, data, scatterData, chartWindowMs, onChartWindowChange, onDragStart, onDrop, onHide }: { config: ChartConfig; data: (TelemetrySample & { seconds: number })[]; scatterData: (TelemetrySample & { seconds: number })[]; chartWindowMs: number; onChartWindowChange: (value: number) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
   const common = { data, margin: { top: 8, right: 14, left: -18, bottom: 0 } }
   const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={42} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
   const lineProps = { isAnimationActive: false, animationDuration: 0, dot: { r: 2, strokeWidth: 0 }, activeDot: { r: 3 } }
-  const chart = config.id === 'scatter' ? <ResponsiveContainer width="100%" height="100%"><ScatterChart margin={common.margin}><CartesianGrid stroke="#e4dfd5" /><XAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} /><YAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} /><Tooltip cursor={{ strokeDasharray: '3 3' }} /><Scatter data={data} fill={config.color} isAnimationActive={false} /></ScatterChart></ResponsiveContainer> : <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{axis}{config.id === 'rpm1' && <Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'rpm2' && <Line type="monotone" dataKey="rpm2" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <><Line type="monotone" dataKey="power1" stroke="#f05d3b" strokeWidth={2} {...lineProps} /><Line type="monotone" dataKey="power2" stroke="#3c8f88" strokeWidth={2} {...lineProps} /></>}{config.id === 'efficiency' && <Line type="monotone" dataKey="efficiency" stroke={config.color} strokeWidth={2} {...lineProps} />}</LineChart></ResponsiveContainer>
-  return <article className={`chart-card ${config.id === 'scatter' ? 'chart-wide' : ''}`} draggable onDragStart={onDragStart} onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder"><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div><button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span><span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : 'Time window: 12.0 s'}</span></div></article>
+  const chart = config.id === 'scatter' ? <ResponsiveContainer width="100%" height="100%"><ScatterChart margin={common.margin}><CartesianGrid stroke="#e4dfd5" /><XAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} /><YAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} /><Tooltip cursor={{ strokeDasharray: '3 3' }} /><Scatter data={scatterData} fill={config.color} isAnimationActive={false} /></ScatterChart></ResponsiveContainer> : <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{axis}{config.id === 'rpm1' && <Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'rpm2' && <Line type="monotone" dataKey="rpm2" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <><Line type="monotone" dataKey="power1" stroke="#f05d3b" strokeWidth={2} {...lineProps} /><Line type="monotone" dataKey="power2" stroke="#3c8f88" strokeWidth={2} {...lineProps} /></>}{config.id === 'efficiency' && <Line type="monotone" dataKey="efficiency" stroke={config.color} strokeWidth={2} {...lineProps} />}</LineChart></ResponsiveContainer>
+  return <article className={`chart-card ${config.id === 'scatter' ? 'chart-wide' : ''}`} draggable onDragStart={onDragStart} onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder"><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div><select aria-label="Chart time window" value={chartWindowMs} onChange={(event) => onChartWindowChange(Number(event.target.value))}>{CHART_WINDOW_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span><span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : 'Time window: 12.0 s'}</span></div></article>
 }
 
 function SerialConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {
