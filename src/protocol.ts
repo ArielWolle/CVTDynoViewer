@@ -77,9 +77,9 @@ export function encodeCommand(command: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8, channel = 
   return new Uint8Array([command, channel, (value >> 8) & 0xff, value & 0xff])
 }
 
-export function deriveSample(values: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2' | 'shift' | 'torq1' | 'torq2'>, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2'>): TelemetrySample {
+export function deriveSample(values: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2' | 'shift' | 'torq1' | 'torq2'>, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2'>, inertiaKgM2 = 0.3): TelemetrySample {
   const power1 = powerMode === 'inertia' ? estimatePrimaryPowerFromCurve(values.rpm1) : Math.max(0, ((values.torq1 - torqueOffset) * torqueScale * values.rpm1) / 9549)
-  const power2 = powerMode === 'inertia' ? estimateSecondaryPowerFromInertia(values.rpm2, previous?.rpm2 ?? values.rpm2, values.time, previous?.time ?? values.time) : Math.max(0, ((values.torq2 - torqueOffset) * torqueScale * values.rpm2) / 9549)
+  const power2 = powerMode === 'inertia' ? estimateSecondaryPowerFromInertia(values.rpm2, previous?.rpm2 ?? values.rpm2, values.time, previous?.time ?? values.time, inertiaKgM2) : Math.max(0, ((values.torq2 - torqueOffset) * torqueScale * values.rpm2) / 9549)
   return { ...values, power1, power2, efficiency: power1 > 0 ? Math.min(150, (power2 / power1) * 100) : 0 }
 }
 
