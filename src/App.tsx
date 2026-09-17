@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
 import { channelNames, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type PowerMode, type TelemetrySample } from './protocol'
@@ -47,6 +47,20 @@ function makeDemoSample(index: number, torqueScale: number, torqueOffset: number
 }
 
 function formatNumber(value: number, decimals = 0) { return value.toLocaleString(undefined, { maximumFractionDigits: decimals, minimumFractionDigits: decimals }) }
+
+/** Binary search for the data point whose `seconds` is closest to `target` (data sorted ascending). */
+function findNearestBySeconds(data: ChartPoint[], target: number): ChartPoint | undefined {
+  if (!data.length) return undefined
+  let low = 0
+  let high = data.length - 1
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (data[mid].seconds < target) low = mid + 1
+    else high = mid
+  }
+  if (low > 0 && Math.abs(data[low - 1].seconds - target) <= Math.abs(data[low].seconds - target)) return data[low - 1]
+  return data[low]
+}
 
 function App() {
   const [connected, setConnected] = useState(false)
@@ -683,17 +697,30 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   onHoverRef.current = onHover
   const dotRendererCache = useRef(new Map<string, (props: { cx?: number; cy?: number; payload?: ChartPoint }) => ReactElement>())
   const hoverCursorProps = { stroke: '#67655e', strokeDasharray: '4 4', strokeWidth: 1 }
-  function handleChartHover(state: unknown) {
-    // Recharts v3's mouse-move state has no `activePayload`; the active point is looked up by
-    // `activeIndex`, a stringified array index into this chart's data (see
-    // node_modules/recharts/types/synchronisation/types.d.ts -> MouseHandlerDataParam).
-    const raw = (state as { activeIndex?: string | number | null; activeTooltipIndex?: string | number | null } | null)
-    const indexValue = raw?.activeIndex ?? raw?.activeTooltipIndex
-    const index = indexValue === null || indexValue === undefined ? NaN : Number(indexValue)
-    const point = Number.isInteger(index) ? data[index] : undefined
-    if (point && typeof point.time === 'number') onHover(point.time)
+  const isRelationshipChart = config.id === 'scatter' || config.id === 'shiftEfficiency'
+  // Time-series hover bypasses Recharts' own mouse tracking entirely: attaching Recharts'
+  // onMouseMove and rendering its <ReferenceLine> for the crosshair meant every one of the eight
+  // charts fully re-rendered its SVG tree on every hover tick, which is what made hovering feel
+  // slow and, under fast mouse movement, made the crosshair visibly lag behind the cursor. Instead
+  // the nearest point is found with plain DOM math (cheap, synchronous, no chart re-render), and
+  // the crosshair below is a plain CSS-positioned line, not an SVG element inside the chart.
+  const plotLeftPx = config.id === 'power' ? 44 : 50
+  const plotRightPx = config.id === 'power' ? 44 : 14
+  function handlePlotMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
+    if (isRelationshipChart || !data.length) return
+    const rect = event.currentTarget.getBoundingClientRect()
+    const usableWidth = rect.width - plotLeftPx - plotRightPx
+    if (usableWidth <= 0) return
+    const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left - plotLeftPx) / usableWidth))
+    const domainStart = data[0].seconds
+    const domainEnd = data[data.length - 1].seconds
+    const nearest = findNearestBySeconds(data, domainStart + fraction * (domainEnd - domainStart))
+    if (nearest) onHoverRef.current(nearest.time)
   }
-  function handleChartLeave() { onHover(null) }
+  function handlePlotMouseLeave() { onHoverRef.current(null) }
+  const crosshairFraction = !isRelationshipChart && hoveredPoint && data.length > 1
+    ? Math.min(1, Math.max(0, (hoveredPoint.seconds - data[0].seconds) / ((data[data.length - 1].seconds - data[0].seconds) || 1)))
+    : undefined
   function renderHoverDot(color: string) {
     const cached = dotRendererCache.current.get(color)
     if (cached) return cached
@@ -705,9 +732,9 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     dotRendererCache.current.set(color, renderer)
     return renderer
   }
-  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{hoveredPoint && <ReferenceLine x={hoveredPoint.seconds} {...hoverCursorProps} />}</>
+  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
   const powerMaxKw = Math.max(1, ...data.map((sample) => sample.power1), ...data.map((sample) => sample.power2)) * 1.1
-  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} />{hoveredPoint && <ReferenceLine yAxisId="kw" x={hoveredPoint.seconds} {...hoverCursorProps} />}</>
+  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /></>
   const lineProps = { isAnimationActive: false, animationDuration: 0, dot: false, activeDot: false, connectNulls: false }
   // Moving averages propagate downstream (RPM -> power -> efficiency, RPM -> shift ratio). When an
   // upstream field is being averaged, a chart's own raw trace is redundant -- only the resulting
@@ -728,7 +755,6 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     if (maEnabled[field]) return <><Line type="monotone" dataKey={dataKey} name={label} stroke={color} {...rawLineProps} {...extra} /><Line type="monotone" dataKey={avgDataKey} name={`${label} (avg)`} stroke={color} {...avgLineProps} {...extra} /></>
     return <Line type="monotone" dataKey={dataKey} name={label} stroke={color} {...avgLineProps} {...extra} />
   }
-  const isRelationshipChart = config.id === 'scatter' || config.id === 'shiftEfficiency'
   const relationshipX = config.id === 'scatter' ? hoveredPoint?.rpm2 : hoveredPoint?.[shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio']
   const relationshipY = config.id === 'scatter' ? hoveredPoint?.rpm1 : hoveredPoint?.[efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency']
   const relationshipCrosshair = <>{typeof relationshipX === 'number' && <ReferenceLine x={relationshipX} {...hoverCursorProps} />}{typeof relationshipY === 'number' && <ReferenceLine y={relationshipY} {...hoverCursorProps} />}</>
@@ -766,7 +792,12 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   const relationshipAxis = config.id === 'scatter'
     ? <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey="rpm2" name="Secondary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}</>
     : <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}</>
-  const chart = <ResponsiveContainer width="100%" height="100%"><LineChart {...common} onMouseMove={isRelationshipChart ? undefined : handleChartHover} onMouseLeave={handleChartLeave}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{config.id === 'scatter' && <><Line data={lowRatioLine} name="Low ratio" type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line data={highRatioLine} name="High ratio" type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} /></>}{config.id === 'shiftEfficiency' && <Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} />}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" name="Shift position" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>
+  // Memoized so time-series charts (which no longer depend on hoveredPoint at all -- their
+  // crosshair is the plain CSS overlay above, not an SVG element in here) skip Recharts'
+  // reconciliation entirely while only the hover position changes. The two relationship charts
+  // still depend on relationshipX/relationshipY (their crosshair is a real <ReferenceLine>, kept
+  // for pixel-perfect placement on their non-time axes), so only those two still recompute here.
+  const chart = useMemo(() => <ResponsiveContainer width="100%" height="100%"><LineChart {...common} onMouseLeave={isRelationshipChart ? () => onHoverRef.current(null) : undefined}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{config.id === 'scatter' && <><Line data={lowRatioLine} name="Low ratio" type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line data={highRatioLine} name="High ratio" type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} /></>}{config.id === 'shiftEfficiency' && <Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} />}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" name="Shift position" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>, [config, data, maEnabled, lowRatio, highRatio, isRelationshipChart ? relationshipX : null, isRelationshipChart ? relationshipY : null])
   const singleMaField: MaField | null = config.id === 'rpm1' || config.id === 'rpm2' || config.id === 'efficiency' || config.id === 'shiftRatio' ? config.id : null
   const maToggles = config.id === 'power'
     ? <div className="chart-ma-toggles"><label className="ma-toggle" style={{ color: '#f05d3b' }}><input type="checkbox" checked={maEnabled.power1} onChange={() => onToggleMa('power1')} />Primary MA</label><label className="ma-toggle" style={{ color: '#3c8f88' }}><input type="checkbox" checked={maEnabled.power2} onChange={() => onToggleMa('power2')} />Secondary MA</label></div>
@@ -784,7 +815,7 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
         </label>
       </div>
     : null
-  return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
+  return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body" onMouseMove={handlePlotMouseMove} onMouseLeave={handlePlotMouseLeave}>{chart}{typeof crosshairFraction === 'number' && <div className="chart-crosshair-line" style={{ left: `calc(${plotLeftPx}px + ${crosshairFraction} * (100% - ${plotLeftPx + plotRightPx}px))` }} />}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
 }
 
 function SerialConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {
