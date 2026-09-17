@@ -33,6 +33,8 @@ const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
 const SENSOR_RETENTION_MS = 300_000
 const MAX_CONSOLE_MESSAGES = 500
 const KW_TO_HP = 1.341022
+// Matches `.chart-body { padding: 0 10px; }` in styles.css -- see the note in handlePlotMouseMove.
+const CHART_BODY_PADDING_PX = 10
 
 
 function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
@@ -709,9 +711,17 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   function handlePlotMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
     if (isRelationshipChart || !data.length) return
     const rect = event.currentTarget.getBoundingClientRect()
-    const usableWidth = rect.width - plotLeftPx - plotRightPx
+    // .chart-body has 10px of CSS padding on each side (see styles.css). getBoundingClientRect()
+    // measures the border box (outside that padding), but the crosshair's `left: calc(...)` is a
+    // percentage of the *content* box (CSS resolves percentages for absolutely positioned children
+    // against the padding edge). Left uncorrected here, every computed point was ~10px "ahead" of
+    // the real cursor position -- visually small, but enough to consistently resolve to the wrong
+    // sample once mapped through the time domain.
+    const contentLeft = rect.left + CHART_BODY_PADDING_PX
+    const contentWidth = rect.width - CHART_BODY_PADDING_PX * 2
+    const usableWidth = contentWidth - plotLeftPx - plotRightPx
     if (usableWidth <= 0) return
-    const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left - plotLeftPx) / usableWidth))
+    const fraction = Math.min(1, Math.max(0, (event.clientX - contentLeft - plotLeftPx) / usableWidth))
     const domainStart = data[0].seconds
     const domainEnd = data[data.length - 1].seconds
     const nearest = findNearestBySeconds(data, domainStart + fraction * (domainEnd - domainStart))
