@@ -706,22 +706,21 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   // slow and, under fast mouse movement, made the crosshair visibly lag behind the cursor. Instead
   // the nearest point is found with plain DOM math (cheap, synchronous, no chart re-render), and
   // the crosshair below is a plain CSS-positioned line, not an SVG element inside the chart.
-  const plotLeftPx = config.id === 'power' ? 44 : 50
-  const plotRightPx = config.id === 'power' ? 44 : 14
+  // CSS containing-block rules for an absolutely positioned element (like the crosshair below)
+  // resolve percentages against the ancestor's *padding* box, which includes the ancestor's own
+  // padding -- so the crosshair's 0%-100% range spans the exact same box as
+  // getBoundingClientRect() on .chart-body, padding included. These constants (and the plain
+  // mouse math below) intentionally work in that same raw, padding-inclusive frame so the two
+  // stay in agreement: margin.left/right from `common`, the reserved Y-axis width, plus
+  // .chart-body's own 10px padding (see styles.css).
+  const plotLeftPx = (config.id === 'power' ? 40 : 46) + 4 + CHART_BODY_PADDING_PX
+  const plotRightPx = (config.id === 'power' ? 40 : 14) + (config.id === 'power' ? 4 : 0) + CHART_BODY_PADDING_PX
   function handlePlotMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
     if (isRelationshipChart || !data.length) return
     const rect = event.currentTarget.getBoundingClientRect()
-    // .chart-body has 10px of CSS padding on each side (see styles.css). getBoundingClientRect()
-    // measures the border box (outside that padding), but the crosshair's `left: calc(...)` is a
-    // percentage of the *content* box (CSS resolves percentages for absolutely positioned children
-    // against the padding edge). Left uncorrected here, every computed point was ~10px "ahead" of
-    // the real cursor position -- visually small, but enough to consistently resolve to the wrong
-    // sample once mapped through the time domain.
-    const contentLeft = rect.left + CHART_BODY_PADDING_PX
-    const contentWidth = rect.width - CHART_BODY_PADDING_PX * 2
-    const usableWidth = contentWidth - plotLeftPx - plotRightPx
+    const usableWidth = rect.width - plotLeftPx - plotRightPx
     if (usableWidth <= 0) return
-    const fraction = Math.min(1, Math.max(0, (event.clientX - contentLeft - plotLeftPx) / usableWidth))
+    const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left - plotLeftPx) / usableWidth))
     const domainStart = data[0].seconds
     const domainEnd = data[data.length - 1].seconds
     const nearest = findNearestBySeconds(data, domainStart + fraction * (domainEnd - domainStart))
