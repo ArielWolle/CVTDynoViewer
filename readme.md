@@ -33,6 +33,25 @@ Command `0x04` controls firmware bench mode. Send `[0x04, 0x00, 0x00, 0x01]` to 
 
 Choose a directory in Chromium to save CSV files directly through the File System Access API. Browsers without that API use a normal CSV download. Torque scale and zero are editable because the firmware exposes torque counts rather than a documented physical unit.
 
+## Inertia mode
+
+Power mode defaults to **Inertia mode**, which estimates primary power from an editable RPM-vs-torque engine curve and secondary power from shaft acceleration. Use the **Inertia settings** dropdown in the control room to:
+
+- Edit the secondary shaft inertia (kg·m²) used for the acceleration-based power estimate.
+- Reshape the primary engine torque curve by dragging its points on the spline graph. Double-click empty space to add a point, double-click a point to remove it. The curve persists in local storage and can be restored with **Reset curve**.
+
+## CSV playback
+
+Use **Load CSV** to replay a previously logged CSV file (or any file matching the export header) as if it were live telemetry. Playback controls include play/pause, a speed selector (0.25×–4×), and a scrub bar. Loading a file pauses demo/live telemetry until playback is cleared or a device is connected.
+
+## Moving averages
+
+Each RPM, power, efficiency, and shift-ratio chart has a **Moving avg** checkbox in its header (the power chart has separate Primary/Secondary checkboxes) that overlays a dashed trailing moving-average trace. Primary RPM and secondary power are on by default; the rest are off. The **MA points** field next to **Reset layout** sets how many trailing samples are averaged (default 5) and applies to every enabled trace.
+
+## Chart workspace controls
+
+Instead of a per-chart time window, the workspace has a single **Pause** button (next to **Reset layout**) that freezes all charts for inspection, and a dual-handle time range slider beneath the workspace header. Drag the two handles to select the start and end time shown across every chart; drag both to the edges (or use **Full range**) to see the whole buffered session.
+
 ## GitHub Pages
 
 `.github/workflows/deploy-pages.yml` installs dependencies, runs checks, builds the Vite output, and publishes `dist/` through the GitHub Pages environment on the `main` branch. Enable GitHub Pages with the **GitHub Actions** source in the repository settings. The Vite base path is relative so the bundle works under a project-page URL.

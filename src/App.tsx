@@ -1,11 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Send, SlidersHorizontal, Square, Terminal, Trash2, Usb, Wifi, X, RotateCcw } from 'lucide-react'
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from 'recharts'
-import { channelNames, csvHeader, deriveSample, encodeCommand, sampleToCsvRow, samplesToCsv, type ChannelId, type PowerMode, type TelemetrySample } from './protocol'
+import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
+import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from 'recharts'
+import { channelNames, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type PowerMode, type TelemetrySample } from './protocol'
 import { SerialTransport } from './serialTransport'
+import { TorqueCurveEditor } from './TorqueCurveEditor'
+import { TimeRangeSlider } from './TimeRangeSlider'
 
-type ChartId = 'scatter' | 'rpm1' | 'rpm2' | 'shift' | 'power' | 'efficiency'
+type ChartId = 'scatter' | 'rpm1' | 'rpm2' | 'shift' | 'power' | 'efficiency' | 'shiftRatio' | 'shiftEfficiency'
 type ChartConfig = { id: ChartId; title: string; subtitle: string; color: string; visible: boolean }
+type MaField = 'rpm1' | 'rpm2' | 'power1' | 'power2' | 'efficiency' | 'shiftRatio'
+type MaEnabled = Record<MaField, boolean>
+const defaultMaEnabled: MaEnabled = { rpm1: true, rpm2: false, power1: false, power2: true, efficiency: false, shiftRatio: false }
+type ChartPoint = TelemetrySample & { seconds: number; shiftRatio: number } & Record<`${MaField}Avg`, number>
 type RawValues = Pick<TelemetrySample, 'rpm1' | 'rpm2' | 'shift' | 'torq1' | 'torq2'>
 type ConsoleType = 'RPM1' | 'RPM2' | 'SHIFT' | 'TORQ1' | 'TORQ2' | 'READ CONFIG' | 'RPM TEST' | 'RPM COUNT TEST' | 'TEXT' | 'TX'
 type ConsoleMessage = { id: number; time: string; type: ConsoleType; data: string }
@@ -18,22 +24,25 @@ const defaultCharts: ChartConfig[] = [
   { id: 'shift', title: 'Shift position', subtitle: 'Actuator travel / time', color: '#b86b3a', visible: true },
   { id: 'power', title: 'Power output', subtitle: 'Primary and secondary / time', color: '#f05d3b', visible: true },
   { id: 'efficiency', title: 'Efficiency', subtitle: 'Secondary power / primary power', color: '#668b48', visible: true },
+  { id: 'shiftRatio', title: 'Shift ratio', subtitle: 'Primary RPM / secondary RPM', color: '#7d5ba6', visible: true },
+  { id: 'shiftEfficiency', title: 'Ratio vs. efficiency', subtitle: 'Shift ratio / efficiency relationship', color: '#2f6f9e', visible: true },
 ]
 
 const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
 const SENSOR_RETENTION_MS = 300_000
-const DEFAULT_CHART_WINDOW_MS = 240_000
 const MAX_CONSOLE_MESSAGES = 500
+const KW_TO_HP = 1.341022
+const CHART_SYNC_ID = 'cvt-dyno-charts'
 
 function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
   const cutoff = next.time - SENSOR_RETENTION_MS
   return [...history.filter((sample) => sample.time >= cutoff), next]
 }
 
-function makeDemoSample(index: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: TelemetrySample, inertiaKgM2 = 0.3): TelemetrySample {
+function makeDemoSample(index: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: TelemetrySample, inertiaKgM2 = 0.3, torqueCurve: EngineTorquePoint[] = defaultEngineTorqueCurve as EngineTorquePoint[]): TelemetrySample {
   const phase = index / 10
   const values = { time: index * 100, rpm1: Math.round(3200 + Math.sin(phase) * 720 + index * 3), rpm2: Math.round(2200 + Math.sin(phase - 0.5) * 500 + index * 2), shift: Math.round(35 + Math.sin(phase * 0.45) * 20), torq1: Math.round(380 + Math.sin(phase * 0.8) * 90), torq2: Math.round(305 + Math.sin(phase * 0.8 - 0.3) * 76) }
-  return deriveSample(values, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2)
+  return deriveSample(values, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
 }
 
 function formatNumber(value: number, decimals = 0) { return value.toLocaleString(undefined, { maximumFractionDigits: decimals, minimumFractionDigits: decimals }) }
@@ -42,8 +51,15 @@ function App() {
   const [connected, setConnected] = useState(false)
   const [demoMode, setDemoMode] = useState(false)
   const [firmwareDemoMode, setFirmwareDemoMode] = useState(false)
-  const [powerMode, setPowerMode] = useState<PowerMode>('torque')
+  const [powerMode, setPowerMode] = useState<PowerMode>('inertia')
   const [inertiaKgM2, setInertiaKgM2] = useState(0.3)
+  const [torqueCurve, setTorqueCurve] = useState<EngineTorquePoint[]>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('cvt-dyno-torque-curve') ?? 'null')
+      return Array.isArray(stored) && stored.length >= 2 ? [...stored].sort((a, b) => a.rpm - b.rpm) : [...defaultEngineTorqueCurve]
+    } catch { return [...defaultEngineTorqueCurve] }
+  })
+  const [inertiaSettingsOpen, setInertiaSettingsOpen] = useState(false)
   const [rpmPinTest, setRpmPinTest] = useState(false)
   const [rpmInterruptTest, setRpmInterruptTest] = useState(false)
   const [rpmCountTest, setRpmCountTest] = useState(false)
@@ -63,10 +79,38 @@ function App() {
   const [frequencies, setFrequencies] = useState([20, 20, 10, 50, 50])
   const [primarySpokes, setPrimarySpokes] = useState(16)
   const [secondarySpokes, setSecondarySpokes] = useState(12)
+  const [playbackSamples, setPlaybackSamples] = useState<TelemetrySample[]>([])
+  const [playbackFileName, setPlaybackFileName] = useState('')
+  const [playbackElapsedMs, setPlaybackElapsedMs] = useState(0)
+  const [playbackPlaying, setPlaybackPlaying] = useState(false)
+  const [playbackSpeed, setPlaybackSpeed] = useState(1)
+  const [playbackRangeStart, setPlaybackRangeStart] = useState(0)
+  const [playbackRangeEnd, setPlaybackRangeEnd] = useState(1)
   const [samples, setSamples] = useState<TelemetrySample[]>([])
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
-  const [chartWindowMs, setChartWindowMs] = useState(DEFAULT_CHART_WINDOW_MS)
-  const [charts, setCharts] = useState<ChartConfig[]>(() => { try { return JSON.parse(localStorage.getItem('cvt-dyno-layout') ?? 'null') ?? defaultCharts } catch { return defaultCharts } })
+  const [chartPlaying, setChartPlaying] = useState(true)
+  const [frozenDomainEnd, setFrozenDomainEnd] = useState<number | null>(null)
+  const [rangeStart, setRangeStart] = useState(0)
+  const [rangeEnd, setRangeEnd] = useState(1)
+  const [maEnabled, setMaEnabled] = useState<MaEnabled>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('cvt-dyno-ma-enabled') ?? 'null')
+      return stored && typeof stored === 'object' ? { ...defaultMaEnabled, ...stored } : defaultMaEnabled
+    } catch { return defaultMaEnabled }
+  })
+  const [maWindow, setMaWindow] = useState(() => {
+    const stored = Number(localStorage.getItem('cvt-dyno-ma-window'))
+    return Number.isFinite(stored) && stored >= 2 ? stored : 5
+  })
+  const [charts, setCharts] = useState<ChartConfig[]>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem('cvt-dyno-layout') ?? 'null') as ChartConfig[] | null
+      if (!Array.isArray(stored)) return defaultCharts
+      const storedIds = new Set(stored.map((chart) => chart.id))
+      // Merge in any newly added chart types so returning users see them without losing their saved order/visibility.
+      return [...stored, ...defaultCharts.filter((chart) => !storedIds.has(chart.id))]
+    } catch { return defaultCharts }
+  })
   const [dragged, setDragged] = useState<ChartId | null>(null)
   const [notice, setNotice] = useState('Demo telemetry is flowing')
   const [directoryName, setDirectoryName] = useState('Browser download')
@@ -83,20 +127,120 @@ function App() {
   const demoTimer = useRef<number | undefined>(undefined)
   const telemetryTimer = useRef<number | undefined>(undefined)
   const pendingRaw = useRef<RawValues>(emptyRaw)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  const current = samples[samples.length - 1] ?? deriveSample({ time: 0, ...raw }, torqueScale, torqueOffset, powerMode, undefined, inertiaKgM2)
+  const current = samples[samples.length - 1] ?? deriveSample({ time: 0, ...raw }, torqueScale, torqueOffset, powerMode, undefined, inertiaKgM2, torqueCurve)
+  const isPlaybackActive = playbackSamples.length > 0
+  // Recompute power/efficiency from the CSV's raw RPM/torque columns using the current power
+  // mode, torque conversion, inertia value, and torque curve, so playback reflects live edits
+  // to those settings instead of only replaying whatever was recorded at log time.
+  const derivedPlaybackSamples = useMemo(() => {
+    if (!playbackSamples.length) return []
+    let previous: TelemetrySample | undefined
+    return playbackSamples.map((sample) => {
+      const derived = deriveSample(sample, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
+      previous = derived
+      return derived
+    })
+  }, [playbackSamples, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve])
+  const playbackDurationMs = playbackSamples.length ? playbackSamples[playbackSamples.length - 1].time - playbackSamples[0].time : 0
+  const playbackStartBoundMs = playbackRangeStart * playbackDurationMs
+  const playbackEndBoundMs = playbackRangeEnd * playbackDurationMs
+  const displaySamples = useMemo(() => {
+    if (chartPlaying || frozenDomainEnd === null) return samples
+    return samples.filter((sample) => sample.time <= frozenDomainEnd)
+  }, [samples, chartPlaying, frozenDomainEnd])
+  const domainStart = displaySamples[0]?.time ?? 0
+  const domainEnd = displaySamples[displaySamples.length - 1]?.time ?? domainStart
+  const domainSpan = Math.max(0, domainEnd - domainStart)
+  const windowStartMs = domainStart + rangeStart * domainSpan
+  const windowEndMs = domainStart + rangeEnd * domainSpan
   const chartData = useMemo(() => {
-    if (!samples.length) return []
-    const cutoff = samples[samples.length - 1].time - chartWindowMs
-    return samples.filter((sample) => sample.time >= cutoff).map((sample) => ({ ...sample, seconds: sample.time / 1000 }))
-  }, [samples, chartWindowMs])
-  const scatterChartData = useMemo(() => {
-    if (!samples.length) return []
-    const cutoff = samples[samples.length - 1].time - chartWindowMs
-    return samples.filter((sample) => sample.time >= cutoff).map((sample) => ({ ...sample, seconds: sample.time / 1000 }))
-  }, [samples, chartWindowMs])
+    if (!displaySamples.length) return []
+    const windowed = displaySamples.filter((sample) => sample.time >= windowStartMs && sample.time <= windowEndMs)
+    if (!windowed.length) return []
+    const windowSize = Math.max(1, Math.round(maWindow))
+
+    // O(n) trailing moving average via a sliding-window sum.
+    function trailingAverage(values: number[]): number[] {
+      const result = new Array<number>(values.length)
+      let sum = 0
+      for (let index = 0; index < values.length; index += 1) {
+        sum += values[index]
+        if (index >= windowSize) sum -= values[index - windowSize]
+        result[index] = sum / Math.min(windowSize, index + 1)
+      }
+      return result
+    }
+
+    // Moving averages propagate into calculated series: enabling primary RPM's average feeds the
+    // smoothed RPM into the power and shift-ratio calculations, enabling power's average feeds the
+    // smoothed power into efficiency, and so on -- matching how the raw values are actually derived.
+    const rpm1Raw = windowed.map((sample) => sample.rpm1)
+    const rpm2Raw = windowed.map((sample) => sample.rpm2)
+    const rpm1AvgArr = trailingAverage(rpm1Raw)
+    const rpm2AvgArr = trailingAverage(rpm2Raw)
+    const rpm1Eff = maEnabled.rpm1 ? rpm1AvgArr : rpm1Raw
+    const rpm2Eff = maEnabled.rpm2 ? rpm2AvgArr : rpm2Raw
+
+    let previousCascaded: { time: number; rpm1: number; rpm2: number } | undefined
+    const power1Cascaded: number[] = []
+    const power2Cascaded: number[] = []
+    windowed.forEach((sample, index) => {
+      const derived = deriveSample(
+        { time: sample.time, rpm1: rpm1Eff[index], rpm2: rpm2Eff[index], shift: sample.shift, torq1: sample.torq1, torq2: sample.torq2 },
+        torqueScale, torqueOffset, powerMode, previousCascaded, inertiaKgM2, torqueCurve,
+      )
+      power1Cascaded.push(derived.power1)
+      power2Cascaded.push(derived.power2)
+      previousCascaded = { time: sample.time, rpm1: rpm1Eff[index], rpm2: rpm2Eff[index] }
+    })
+    const power1AvgArr = trailingAverage(power1Cascaded)
+    const power2AvgArr = trailingAverage(power2Cascaded)
+    const power1Eff = maEnabled.power1 ? power1AvgArr : windowed.map((sample) => sample.power1)
+    const power2Eff = maEnabled.power2 ? power2AvgArr : windowed.map((sample) => sample.power2)
+
+    const shiftRatioRaw = windowed.map((sample) => (sample.rpm2 !== 0 ? sample.rpm1 / sample.rpm2 : 0))
+    const shiftRatioCascaded = windowed.map((_sample, index) => (rpm2Eff[index] !== 0 ? rpm1Eff[index] / rpm2Eff[index] : 0))
+    const shiftRatioAvgArr = trailingAverage(shiftRatioCascaded)
+
+    const efficiencyCascaded = windowed.map((_sample, index) => (power1Eff[index] > 0 ? Math.min(150, (power2Eff[index] / power1Eff[index]) * 100) : 0))
+    const efficiencyAvgArr = trailingAverage(efficiencyCascaded)
+
+    return windowed.map((sample, index) => ({
+      ...sample,
+      seconds: (sample.time - domainStart) / 1000,
+      shiftRatio: shiftRatioRaw[index],
+      rpm1Avg: rpm1AvgArr[index],
+      rpm2Avg: rpm2AvgArr[index],
+      power1Avg: power1AvgArr[index],
+      power2Avg: power2AvgArr[index],
+      efficiencyAvg: efficiencyAvgArr[index],
+      shiftRatioAvg: shiftRatioAvgArr[index],
+    }))
+  }, [displaySamples, windowStartMs, windowEndMs, domainStart, maWindow, maEnabled, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve])
+  const scatterChartData = chartData
 
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
+  useEffect(() => { localStorage.setItem('cvt-dyno-torque-curve', JSON.stringify(torqueCurve)) }, [torqueCurve])
+  useEffect(() => { localStorage.setItem('cvt-dyno-ma-enabled', JSON.stringify(maEnabled)) }, [maEnabled])
+  useEffect(() => { localStorage.setItem('cvt-dyno-ma-window', String(maWindow)) }, [maWindow])
+  useEffect(() => {
+    if (!playbackPlaying || !playbackSamples.length) return
+    const timer = window.setInterval(() => { setPlaybackElapsedMs((elapsed) => Math.min(playbackEndBoundMs, elapsed + 100 * playbackSpeed)) }, 100)
+    return () => window.clearInterval(timer)
+  }, [playbackPlaying, playbackSpeed, playbackSamples, playbackEndBoundMs])
+  useEffect(() => {
+    if (!derivedPlaybackSamples.length) return
+    const start = derivedPlaybackSamples[0].time
+    const cutoff = start + playbackElapsedMs
+    let index = derivedPlaybackSamples.length - 1
+    for (let sampleIndex = 0; sampleIndex < derivedPlaybackSamples.length; sampleIndex += 1) {
+      if (derivedPlaybackSamples[sampleIndex].time > cutoff) { index = Math.max(0, sampleIndex - 1); break }
+    }
+    setSamples(derivedPlaybackSamples.slice(0, index + 1))
+    if (playbackPlaying && playbackElapsedMs >= playbackEndBoundMs) setPlaybackPlaying(false)
+  }, [derivedPlaybackSamples, playbackElapsedMs, playbackPlaying, playbackEndBoundMs])
   useEffect(() => {
     if (!logging || !logWriter.current) return
     const newSamples = samples.filter((sample) => lastLoggedSampleTime.current === null || sample.time > lastLoggedSampleTime.current)
@@ -110,23 +254,23 @@ function App() {
     if (autoScrollConsole && consoleOutputRef.current) consoleOutputRef.current.scrollTop = 0
   }, [autoScrollConsole, consoleLines])
   useEffect(() => {
-    if (!demoMode || connected) return
+    if (!demoMode || connected || isPlaybackActive) return
     let index = 80
     demoTimer.current = window.setInterval(() => {
       setSamples((history) => {
         const previous = history[history.length - 1] ?? undefined
-        const next = makeDemoSample(index++, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2)
+        const next = makeDemoSample(index++, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
         return retainRecentSamples(history, next)
       })
     }, 100)
     return () => window.clearInterval(demoTimer.current)
-  }, [demoMode, connected, torqueScale, torqueOffset, powerMode, inertiaKgM2])
+  }, [demoMode, connected, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve, isPlaybackActive])
   useEffect(() => () => { window.clearTimeout(telemetryTimer.current); window.clearTimeout(logCommitTimer.current); void commitLog(false); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
       const next = new SerialTransport({ onValue: handleValue, onPacket: handleSerialPacket, onText: handleSerialText })
-      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); pendingRaw.current = emptyRaw; setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
+      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); pendingRaw.current = emptyRaw; setPlaybackSamples([]); setPlaybackPlaying(false); setPlaybackFileName(''); setPlaybackElapsedMs(0); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to serial device') }
   }
   async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setNotice('Device disconnected') }
@@ -268,6 +412,7 @@ function App() {
     } catch { setNotice('Could not change RPM count test mode') }
   }
   function handleValue(channel: ChannelId, value: number) {
+    if (isPlaybackActive) return
     const key = (['rpm1', 'rpm2', 'shift', 'torq1', 'torq2'] as const)[channel]
     pendingRaw.current = { ...pendingRaw.current, [key]: value }
     if (telemetryTimer.current !== undefined) return
@@ -276,7 +421,7 @@ function App() {
       const next = pendingRaw.current
       setSamples((history) => {
         const previous = history[history.length - 1] ?? undefined
-        const sample = deriveSample({ time: performance.timeOrigin + performance.now(), ...next }, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2)
+        const sample = deriveSample({ time: performance.timeOrigin + performance.now(), ...next }, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
         return retainRecentSamples(history, sample)
       })
       setRaw(next)
@@ -293,15 +438,20 @@ function App() {
     }
     void (async () => { if (transport.current) { await transport.current.send(encodeCommand(6, channel, spokes)) } })().catch(() => setNotice('Could not send spoke configuration'))
   }
-  async function downloadCsv() {
-    const csv = samplesToCsv(samples)
+  async function downloadCsv(sourceSamples: TelemetrySample[] = samples, baseName: string = sessionName || 'cvt-dyno-session') {
+    const csv = samplesToCsv(sourceSamples)
     if (directoryHandle.current) {
-      const file = await directoryHandle.current.getFileHandle(`${sessionName || 'cvt-dyno-session'}.csv`, { create: true })
+      const file = await directoryHandle.current.getFileHandle(`${baseName}.csv`, { create: true })
       const writable = await file.createWritable(); await writable.write(csv); await writable.close()
-      setNotice(`Saved ${samples.length.toLocaleString()} samples to ${directoryHandle.current.name}`)
+      setNotice(`Saved ${sourceSamples.length.toLocaleString()} samples to ${directoryHandle.current.name}`)
       return
     }
-    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${sessionName || 'cvt-dyno-session'}.csv`; anchor.click(); URL.revokeObjectURL(url); setNotice(`Downloaded ${samples.length.toLocaleString()} samples`)
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${baseName}.csv`; anchor.click(); URL.revokeObjectURL(url); setNotice(`Downloaded ${sourceSamples.length.toLocaleString()} samples`)
+  }
+  async function saveRecalculatedCsv() {
+    if (!derivedPlaybackSamples.length) { setNotice('Load a CSV before saving recalculated values'); return }
+    const baseName = `${(playbackFileName || 'cvt-dyno-session').replace(/\.csv$/i, '')}-recalculated`
+    await downloadCsv(derivedPlaybackSamples, baseName)
   }
   async function chooseDirectory(): Promise<FileSystemDirectoryHandle | null> {
     if (!window.showDirectoryPicker) { setNotice('Chrome folder access is unavailable in this browser; CSV download remains available'); return null }
@@ -372,27 +522,116 @@ function App() {
     }
   }
   function reorder(target: ChartId) { if (!dragged || dragged === target) return; const from = charts.findIndex((chart) => chart.id === dragged); const to = charts.findIndex((chart) => chart.id === target); const next = [...charts]; const [item] = next.splice(from, 1); next.splice(to, 0, item); setCharts(next); setDragged(null) }
+  async function loadPlaybackFile(file: File) {
+    try {
+      const text = await file.text()
+      const parsed = parseSamplesCsv(text)
+      if (!parsed.length) { setNotice('No samples found in that CSV file'); return }
+      window.clearInterval(demoTimer.current)
+      setDemoMode(false)
+      setPlaybackSamples(parsed)
+      setPlaybackFileName(file.name)
+      setPlaybackElapsedMs(parsed[parsed.length - 1].time - parsed[0].time)
+      setPlaybackPlaying(false)
+      setPlaybackRangeStart(0)
+      setPlaybackRangeEnd(1)
+      setChartPlaying(true)
+      setFrozenDomainEnd(null)
+      setRangeStart(0)
+      setRangeEnd(1)
+      setNotice(`Loaded ${parsed.length.toLocaleString()} samples from ${file.name}`)
+    } catch { setNotice('Could not read that CSV file') }
+  }
+  function togglePlaybackPlaying() {
+    setPlaybackPlaying((playing) => {
+      if (!playing) setPlaybackElapsedMs((elapsed) => (elapsed < playbackStartBoundMs || elapsed >= playbackEndBoundMs ? playbackStartBoundMs : elapsed))
+      return !playing
+    })
+  }
+  function handlePlaybackRangeChange(next: { start: number; end: number }) {
+    const startMoved = next.start !== playbackRangeStart
+    setPlaybackRangeStart(next.start)
+    setPlaybackRangeEnd(next.end)
+    if (!playbackDurationMs) return
+    seekPlayback((startMoved ? next.start : next.end) * playbackDurationMs)
+  }
+  function stopPlayback() {
+    setPlaybackPlaying(false)
+    setPlaybackSamples([])
+    setPlaybackFileName('')
+    setPlaybackElapsedMs(0)
+    setPlaybackRangeStart(0)
+    setPlaybackRangeEnd(1)
+    setSamples([])
+    setNotice('Playback cleared; live and demo telemetry are available again')
+  }
+  function seekPlayback(ms: number) {
+    if (!playbackSamples.length) return
+    const start = playbackSamples[0].time
+    const duration = playbackSamples[playbackSamples.length - 1].time - start
+    setPlaybackElapsedMs(Math.min(duration, Math.max(0, ms)))
+  }
+  function toggleChartPlaying() {
+    setChartPlaying((playing) => {
+      setFrozenDomainEnd(playing ? (samples[samples.length - 1]?.time ?? null) : null)
+      return !playing
+    })
+  }
+  function toggleMa(field: MaField) { setMaEnabled((previous) => ({ ...previous, [field]: !previous[field] })) }
 
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'Serial link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
     {consoleOpen && <SerialConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
-    <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia">Shaft inertia</label><div className="input-with-unit"><input id="inertia" type="number" step="0.01" value={inertiaKgM2} onChange={(event) => setInertiaKgM2(Number(event.target.value))} /><span>kg·m²</span></div></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
+    <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 2)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
         <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${logFileName.current}` : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
+    {powerMode === 'inertia' && inertiaSettingsOpen && <section className="inertia-settings"><div className="inertia-settings-header"><span className="section-kicker">INERTIA MODE SETTINGS</span><h3>Shaft inertia and engine curve</h3><button className="icon-button" title="Close" onClick={() => setInertiaSettingsOpen(false)}><X size={15} /></button></div><div className="inertia-settings-body"><div className="control-group compact inertia-input"><label htmlFor="inertia-value">Secondary inertia</label><div className="input-with-unit"><input id="inertia-value" type="number" step="0.01" min="0" value={inertiaKgM2} onChange={(event) => setInertiaKgM2(Number(event.target.value))} /><span>kg·m²</span></div></div><div className="torque-curve-wrap"><div className="torque-curve-heading"><span>Primary RPM vs. torque curve</span><button className="button button-quiet" onClick={() => setTorqueCurve([...defaultEngineTorqueCurve])}><RotateCcw size={13} />Reset curve</button></div><TorqueCurveEditor points={torqueCurve} onChange={setTorqueCurve} /></div></div></section>}
     <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span><select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select></div>)}</section>
     <section className="channel-strip"><div className="strip-label"><Gauge size={17} /><span>RPM wheel teeth / spokes</span></div><div className="channel-control"><span>Primary wheel teeth</span><input type="number" min="1" max="999" value={primarySpokes} onChange={(event) => updateSpokes(0, Number(event.target.value))} /></div><div className="channel-control"><span>Secondary wheel teeth</span><input type="number" min="1" max="999" value={secondarySpokes} onChange={(event) => updateSpokes(1, Number(event.target.value))} /></div></section>
+    <section className="playback-bar"><div className="strip-label"><Upload size={17} /><span>CSV playback</span></div><input ref={fileInputRef} type="file" accept=".csv,text/csv" className="visually-hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadPlaybackFile(file); event.target.value = '' }} /><button className="button button-quiet" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load CSV</button>{isPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span><button className="icon-button" title={playbackPlaying ? 'Pause playback' : 'Play playback'} onClick={togglePlaybackPlaying}>{playbackPlaying ? <Pause size={16} /> : <Play size={16} />}</button><TimeRangeSlider startFraction={playbackRangeStart} endFraction={playbackRangeEnd} onChange={handlePlaybackRangeChange} formatValue={(fraction) => `${((fraction * playbackDurationMs) / 1000).toFixed(1)}s`} /><span className="mono">{(playbackElapsedMs / 1000).toFixed(1)}s / {(playbackDurationMs / 1000).toFixed(1)}s</span><select value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))}><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select><button className="icon-button" title="Save recalculated CSV (current power settings applied to every row)" onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear playback" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
-    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{samples.length.toLocaleString()} samples buffered</span><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
-    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} scatterData={scatterChartData} chartWindowMs={chartWindowMs} onChartWindowChange={setChartWindowMs} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
+    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{samples.length.toLocaleString()} samples buffered</span><button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={toggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); setMaWindow(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
+    {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
+    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} scatterData={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={toggleMa} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
     <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
 }
 
-function ChartCard({ config, data, scatterData, chartWindowMs, onChartWindowChange, onDragStart, onDrop, onHide }: { config: ChartConfig; data: (TelemetrySample & { seconds: number })[]; scatterData: (TelemetrySample & { seconds: number })[]; chartWindowMs: number; onChartWindowChange: (value: number) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
-  const common = { data, margin: { top: 8, right: 14, left: -18, bottom: 0 } }
-  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={42} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
+function ChartCard({ config, data, scatterData, windowSeconds, maEnabled, onToggleMa, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; scatterData: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
+  const yUnit = config.id === 'rpm1' || config.id === 'rpm2' ? 'RPM' : config.id === 'shift' || config.id === 'efficiency' ? '%' : config.id === 'shiftRatio' ? 'Ratio' : ''
+  const axisLabelStyle = { fill: '#8b8982', fontSize: 10 }
+  const common = { data, margin: { top: 8, right: config.id === 'power' ? 4 : 14, left: 4, bottom: 14 } }
+  const yDomain = config.id === 'shiftRatio' ? [0, 5] : undefined
+  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
+  const powerMaxKw = Math.max(1, ...data.map((sample) => sample.power1), ...data.map((sample) => sample.power2)) * 1.1
+  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} formatter={((value: number, name: string) => [`${value.toFixed(2)} kW / ${(value * KW_TO_HP).toFixed(2)} hp`, name === 'power1' ? 'Primary' : 'Secondary']) as never} /></>
   const lineProps = { isAnimationActive: false, animationDuration: 0, dot: false, activeDot: false, connectNulls: false }
-  const chart = config.id === 'scatter' ? <ResponsiveContainer width="100%" height="100%"><ScatterChart margin={common.margin}><CartesianGrid stroke="#e4dfd5" /><XAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} /><YAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} /><Tooltip cursor={{ strokeDasharray: '3 3' }} /><Scatter data={scatterData} fill={config.color} isAnimationActive={false} /></ScatterChart></ResponsiveContainer> : <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{axis}{config.id === 'rpm1' && <Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'rpm2' && <Line type="monotone" dataKey="rpm2" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <><Line type="monotone" dataKey="power1" stroke="#f05d3b" strokeWidth={2} {...lineProps} /><Line type="monotone" dataKey="power2" stroke="#3c8f88" strokeWidth={2} {...lineProps} /></>}{config.id === 'efficiency' && <Line type="monotone" dataKey="efficiency" stroke={config.color} strokeWidth={2} {...lineProps} />}</LineChart></ResponsiveContainer>
-  return <article className={`chart-card ${config.id === 'scatter' ? 'chart-wide' : ''}`} draggable onDragStart={onDragStart} onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder"><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div><label className="chart-window-input" aria-label="Chart time window in minutes"><span>min</span><input type="number" min="0.1" max="60" step="0.1" value={chartWindowMs / 60_000} onChange={(event) => { const nextMinutes = Number(event.target.value); if (!Number.isFinite(nextMinutes)) return; onChartWindowChange(Math.max(10_000, Math.min(3_600_000, nextMinutes * 60_000))) }} /></label><button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span><span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : 'Time window: 12.0 s'}</span></div></article>
+  // Moving averages propagate downstream (RPM -> power -> efficiency, RPM -> shift ratio). When an
+  // upstream field is being averaged, a chart's own raw trace is redundant -- only the resulting
+  // (already-cascaded) value is shown, as a single solid line. The "double" raw+average display is
+  // reserved for the chart where the averaging actually originates (its own checkbox is checked and
+  // nothing upstream of it is already averaged).
+  const power1Upstream = maEnabled.rpm1
+  const power2Upstream = maEnabled.rpm2
+  const shiftRatioUpstream = maEnabled.rpm1 || maEnabled.rpm2
+  const efficiencyUpstream = maEnabled.power1 || maEnabled.power2 || maEnabled.rpm1 || maEnabled.rpm2
+  const shiftRatioUsesAvg = shiftRatioUpstream || maEnabled.shiftRatio
+  const efficiencyUsesAvg = efficiencyUpstream || maEnabled.efficiency
+  const rawLineProps = { ...lineProps, strokeWidth: 2, strokeDasharray: '2 3', strokeLinecap: 'round' as const, strokeOpacity: 0.65 }
+  const avgLineProps = { ...lineProps, strokeWidth: 2 }
+  function seriesLines(field: MaField, dataKey: string, avgDataKey: string, color: string, upstreamAveraged: boolean, extra: Record<string, unknown> = {}) {
+    if (upstreamAveraged) return <Line type="monotone" dataKey={avgDataKey} stroke={color} {...avgLineProps} {...extra} />
+    if (maEnabled[field]) return <><Line type="monotone" dataKey={dataKey} stroke={color} {...rawLineProps} {...extra} /><Line type="monotone" dataKey={avgDataKey} stroke={color} {...avgLineProps} {...extra} /></>
+    return <Line type="monotone" dataKey={dataKey} stroke={color} {...avgLineProps} {...extra} />
+  }
+  const isRelationshipChart = config.id === 'scatter' || config.id === 'shiftEfficiency'
+  const chart = isRelationshipChart ? <ResponsiveContainer width="100%" height="100%"><ScatterChart margin={{ top: 8, right: 14, left: 4, bottom: 14 }}><CartesianGrid stroke="#e4dfd5" />{config.id === 'scatter' ? <XAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /> : <XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} />}{config.id === 'scatter' ? <YAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /> : <YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />}<Tooltip cursor={{ strokeDasharray: '3 3' }} /><Scatter data={scatterData} fill={config.color} isAnimationActive={false} /></ScatterChart></ResponsiveContainer> : <ResponsiveContainer width="100%" height="100%"><LineChart {...common} syncId={CHART_SYNC_ID}>{config.id === 'power' ? powerAxis : axis}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>
+  const singleMaField: MaField | null = config.id === 'rpm1' || config.id === 'rpm2' || config.id === 'efficiency' || config.id === 'shiftRatio' ? config.id : null
+  const maToggles = config.id === 'power'
+    ? <div className="chart-ma-toggles"><label className="ma-toggle" style={{ color: '#f05d3b' }}><input type="checkbox" checked={maEnabled.power1} onChange={() => onToggleMa('power1')} />Primary MA</label><label className="ma-toggle" style={{ color: '#3c8f88' }}><input type="checkbox" checked={maEnabled.power2} onChange={() => onToggleMa('power2')} />Secondary MA</label></div>
+    : singleMaField
+    ? <div className="chart-ma-toggles"><label className="ma-toggle"><input type="checkbox" checked={maEnabled[singleMaField]} onChange={() => onToggleMa(singleMaField)} />Moving avg</label></div>
+    : null
+  return <article className={`chart-card ${config.id === 'scatter' ? 'chart-wide' : ''}`} draggable onDragStart={onDragStart} onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder"><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span><span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
 }
 
 function SerialConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {

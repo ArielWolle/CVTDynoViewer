@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { csvEscape, decodePacket, deriveSample, encodeCommand, samplesToCsv } from './protocol'
+import { csvEscape, decodePacket, deriveSample, encodeCommand, parseSamplesCsv, samplesToCsv } from './protocol'
 
 describe('firmware protocol', () => {
   it('decodes little-endian telemetry packets', () => {
@@ -27,5 +27,35 @@ describe('firmware protocol', () => {
     expect(sample.power1).toBeGreaterThan(4)
     expect(sample.power2).toBeGreaterThan(0)
     expect(sample.efficiency).toBeGreaterThan(0)
+  })
+
+  it('honors a custom RPM vs torque curve in inertia mode', () => {
+    const flatCurve = [{ rpm: 0, torque: 0 }, { rpm: 5000, torque: 40 }]
+    const sample = deriveSample({ time: 0, rpm1: 5000, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }, 1, 0, 'inertia', undefined, 0.3, flatCurve)
+    const defaultSample = deriveSample({ time: 0, rpm1: 5000, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }, 1, 0, 'inertia')
+    expect(sample.power1).toBeGreaterThan(defaultSample.power1)
+  })
+
+  it('parses a logged CSV back into telemetry samples for playback', () => {
+    const csv = samplesToCsv([
+      { time: 0, rpm1: 1000, rpm2: 900, shift: 10, torq1: 50, torq2: 40, power1: 5, power2: 4, efficiency: 80 },
+      { time: 100, rpm1: 1100, rpm2: 950, shift: 12, torq1: 55, torq2: 42, power1: 6, power2: 4.5, efficiency: 75 },
+    ])
+    const parsed = parseSamplesCsv(csv)
+    expect(parsed).toHaveLength(2)
+    expect(parsed[0]).toMatchObject({ time: 0, rpm1: 1000, rpm2: 900 })
+    expect(parsed[1]).toMatchObject({ time: 100, rpm1: 1100, rpm2: 950 })
+  })
+
+  it('returns an empty array for CSV text missing required columns', () => {
+    expect(parseSamplesCsv('a,b\n1,2')).toEqual([])
+    expect(parseSamplesCsv('')).toEqual([])
+  })
+
+  it('tolerates a stray character prefixed onto the header row', () => {
+    const csv = 'Ctimestamp_ms,primary_rpm,secondary_rpm,shift_position,primary_torque,secondary_torque,primary_power_kw,secondary_power_kw,efficiency_percent\n1000,2000,1800,10,50,40,5.000,4.000,80.00'
+    const parsed = parseSamplesCsv(csv)
+    expect(parsed).toHaveLength(1)
+    expect(parsed[0]).toMatchObject({ time: 1000, rpm1: 2000, rpm2: 1800 })
   })
 })

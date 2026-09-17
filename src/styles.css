@@ -19,3 +19,31 @@ button { cursor: pointer; }
 @media (max-width: 720px) { .app-shell { width: min(100% - 26px, 600px); padding-top: 16px; }.topbar { flex-wrap: wrap; gap: 14px; }.brand { min-width: 0; flex: 1; }.topbar-status { order: 3; flex-basis: 100%; }.top-actions { margin-left: auto; }.top-actions .button-quiet { font-size: 0; padding: 9px; }.command-deck { grid-template-columns: 1fr 1fr; gap: 18px; }.deck-heading { grid-column: span 2; }.deck-actions { grid-column: span 2; }.channel-strip { align-items: flex-start; }.strip-label { width: 100%; }.channel-control { border: 0; }.metric-grid { grid-template-columns: repeat(2, 1fr); }.workspace-heading { align-items: flex-start; gap: 15px; flex-direction: column; }.workspace-tools { width: 100%; justify-content: space-between; }.chart-grid { grid-template-columns: 1fr; }.chart-card.chart-wide { grid-column: auto; }.footer { flex-direction: column; gap: 8px; } }
 @media (max-width: 720px) { .console-grid { grid-template-columns: 1fr; }.console-output { min-height: 130px; }.console-toolbar, .console-toolbar-actions { align-items: stretch; flex-direction: column; }.top-actions .button-dark { font-size: 0; padding: 9px; } }
 .serial-console-structured:not(:has(.console-command.is-active)) .rpm-pin-status { display: none; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.inertia-settings { margin: 4px 0 14px; padding: 18px 20px; background: var(--paper); border: 1px solid var(--line); }
+.inertia-settings-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.inertia-settings-header h3 { margin: 4px 0 0; font-size: 16px; letter-spacing: -.03em; flex: 1; }
+.inertia-settings-body { display: grid; grid-template-columns: 160px 1fr; gap: 24px; align-items: start; }
+.inertia-input input { border-bottom: 1px solid #a9a49a; }
+.torque-curve-wrap { min-width: 0; }
+.torque-curve-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 12px; font-weight: 600; color: #67655e; }
+.torque-curve-editor { width: 100%; }
+.torque-curve-svg { width: 100%; height: 220px; touch-action: none; background: #fffdf8; border: 1px solid var(--line); }
+.torque-curve-hint { margin: 6px 0 0; color: var(--muted); font-size: 10px; }
+@media (max-width: 720px) { .inertia-settings-body { grid-template-columns: 1fr; } }
+.playback-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; border-bottom: 1px solid var(--line); padding: 13px 0; }
+.playback-filename { color: #67655e; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.chart-range-bar { display: flex; align-items: center; gap: 16px; padding: 4px 0 18px; }
+.chart-range-reset { flex-shrink: 0; }
+.time-range-slider { flex: 1; min-width: 140px; padding: 18px 10px 4px; }
+.time-range-track { position: relative; height: 4px; background: var(--line); border-radius: 2px; }
+.time-range-fill { position: absolute; top: 0; height: 4px; background: var(--accent); border-radius: 2px; }
+.time-range-thumb { position: absolute; top: 50%; width: 16px; height: 16px; margin-left: -8px; transform: translateY(-50%); border-radius: 50%; border: 2px solid var(--accent); background: var(--paper); padding: 0; cursor: grab; touch-action: none; }
+.time-range-thumb:active { cursor: grabbing; }
+.time-range-thumb span { position: absolute; top: -22px; left: 50%; transform: translateX(-50%); white-space: nowrap; font: 10px 'DM Mono', monospace; color: var(--muted); }
+.ma-window-label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.ma-window-label input { width: 48px; border: 1px solid var(--line); border-radius: 2px; padding: 5px 6px; background: var(--paper); color: var(--ink); }
+.chart-ma-toggles { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.ma-toggle { display: flex; align-items: center; gap: 4px; font: 500 9px 'DM Mono', monospace; color: #67655e; white-space: nowrap; cursor: pointer; }
+.ma-toggle input { margin: 0; cursor: pointer; }
