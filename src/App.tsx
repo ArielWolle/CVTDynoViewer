@@ -104,6 +104,12 @@ function App() {
   const [playbackRangeStart, setPlaybackRangeStart] = useState(0)
   const [playbackRangeEnd, setPlaybackRangeEnd] = useState(1)
   const [samples, setSamples] = useState<TelemetrySample[]>([])
+  // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
+  // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
+  // detect gaps with). Surfaced because it's genuinely diagnostic: dropped packets are otherwise
+  // invisible (they were confirmed happening in practice -- periodic host-side read stalls
+  // overflowing the WebSerial receive buffer -- with no symptom other than gaps in the data).
+  const [droppedPackets, setDroppedPackets] = useState(0)
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
   const [chartPlaying, setChartPlaying] = useState(true)
   const [frozenDomainEnd, setFrozenDomainEnd] = useState<number | null>(null)
@@ -348,6 +354,7 @@ function App() {
         pendingConsoleLinesRef.current = []
         appendConsoleLines(consoleLinesToFlush)
       }
+      setDroppedPackets(droppedPacketsRef.current)
     }
     const timer = window.setInterval(flush, 33) // ~30 Hz display refresh
     return () => { window.clearInterval(timer); flush() }
@@ -786,6 +793,7 @@ function App() {
       highRatio={highRatio}
       onLowRatioChange={setLowRatio}
       onHighRatioChange={setHighRatio}
+      droppedPackets={droppedPackets}
     />
     <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
@@ -798,7 +806,7 @@ function App() {
  * hover would re-render the whole app (topbar, console, control deck, playback bar, etc.), not
  * just the charts, which is visibly laggy. Keeping it here means only this subtree re-renders.
  */
-function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void }) {
+function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number }) {
   // The time-range-slider selection lives here (not in App) so dragging it only re-renders this
   // subtree. The expensive per-field moving-average computation already happened in App over the
   // full `data`; windowing it down to the selected range here is a cheap filter, not a recompute.
@@ -839,7 +847,7 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const hoveredPoint = useMemo(() => (hoverTime !== null ? chartData.find((point) => point.time === hoverTime) : undefined), [chartData, hoverTime])
 
   return <>
-    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span><button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
+    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the serial transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>

@@ -177,6 +177,16 @@ export function createLiveDerivationState(): LiveDerivationState {
   return { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0, power1: 0, power2: 0, lastRpm2: 0, lastRpm2TimeMs: 0, hasRpm2Sample: false }
 }
 
+// Guards the inertia dt calculation against pathologically small intervals between "distinct"
+// rpm2 samples. Without a firmware timestamp (older firmware, or any other source of receive-time
+// samples) several genuinely-different rpm2 packets can land in the same browser event-loop burst
+// and get timestamps only a fraction of a millisecond apart -- dividing by that tiny dt produces
+// wildly spiked instantaneous power (observed: multi-megawatt readings from ordinary RPM steps).
+// Below this threshold, the rpm2 *value* still updates (forward-filled normally) but the power
+// differentiation baseline is left alone, so the next accepted update instead measures the
+// correctly-combined elapsed time across the whole burst -- more accurate, not just clamped.
+const MIN_RPM2_SAMPLE_INTERVAL_MS = 2
+
 /**
  * Applies one channel's newly-arrived value to the running live state and returns the merged
  * wide-format sample for that instant (forward-filling every other channel's latest value).
@@ -187,12 +197,16 @@ export function createLiveDerivationState(): LiveDerivationState {
 export function applyChannelUpdate(state: LiveDerivationState, channel: ChannelId, value: number, timeMs: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode, inertiaKgM2 = 0.3134, torqueCurve: ReadonlyArray<EngineTorquePoint> = defaultEngineTorqueCurve): TelemetrySample {
   if (channel === 0) state.rpm1 = value
   else if (channel === 1) {
-    if (powerMode === 'inertia') {
+    const elapsedSinceLastRpm2 = timeMs - state.lastRpm2TimeMs
+    const longEnough = !state.hasRpm2Sample || elapsedSinceLastRpm2 >= MIN_RPM2_SAMPLE_INTERVAL_MS
+    if (powerMode === 'inertia' && longEnough) {
       state.power2 = estimateSecondaryPowerFromInertia(value, state.hasRpm2Sample ? state.lastRpm2 : value, timeMs, state.hasRpm2Sample ? state.lastRpm2TimeMs : timeMs, inertiaKgM2)
     }
-    state.lastRpm2 = value
-    state.lastRpm2TimeMs = timeMs
-    state.hasRpm2Sample = true
+    if (longEnough) {
+      state.lastRpm2 = value
+      state.lastRpm2TimeMs = timeMs
+      state.hasRpm2Sample = true
+    }
     state.rpm2 = value
   } else if (channel === 2) state.shift = value
   else if (channel === 3) state.torq1 = value

@@ -144,6 +144,28 @@ describe('event-driven live capture', () => {
     expect(secondRpm2Update.power2).toBeCloseTo(0, 5)
   })
 
+  it('does not spike secondary power when a burst of rpm2 samples land a fraction of a millisecond apart (no firmware timestamp)', () => {
+    const state = createLiveDerivationState()
+    applyChannelUpdate(state, 1 as ChannelId, 1000, 0, 1, 0, 'inertia', 0.3134)
+    // Three "distinct" rpm2 samples arrive within a sub-millisecond burst, as can happen when a
+    // browser read() call returns several buffered packets that get processed in one synchronous
+    // loop and timestamped with receive time (e.g. older firmware with no capture timestamp).
+    // Differentiating naively against each tiny sub-millisecond gap would produce a
+    // multi-megawatt spike from an ordinary RPM step.
+    const burst1 = applyChannelUpdate(state, 1 as ChannelId, 1010, 0.1, 1, 0, 'inertia', 0.3134)
+    const burst2 = applyChannelUpdate(state, 1 as ChannelId, 1020, 0.15, 1, 0, 'inertia', 0.3134)
+    expect(burst1.power2).toBeLessThan(1) // still ~0: held from the baseline, not recomputed against a ~0ms gap
+    expect(burst2.power2).toBeLessThan(1)
+    expect(burst1.rpm2).toBe(1010) // the *value* still updates/forward-fills normally
+    expect(burst2.rpm2).toBe(1020)
+
+    // The next update after a real interval measures the combined change (1000 -> 1030) over the
+    // combined elapsed time (0 -> 50ms) -- i.e. the burst's skipped baseline updates didn't lose
+    // or corrupt the eventual acceleration measurement.
+    const afterBurst = applyChannelUpdate(state, 1 as ChannelId, 1030, 50, 1, 0, 'inertia', 0.3134)
+    expect(afterBurst.power2).toBeGreaterThan(0)
+  })
+
   it('formats a lossless raw per-channel log row with firmware time, wall time, and sequence', () => {
     const row = rawLogRow(1 as ChannelId, 4200, 123456789, 1500.25, 7)
     expect(row).toBe('123456789,1.500250,1,Secondary RPM,7,4200')
