@@ -80,8 +80,19 @@ export function TorqueCurveEditor({ points, onChange }: Props) {
     }, COMMIT_INTERVAL_MS - elapsed)
   }
 
-  const rpmMax = useMemo(() => Math.max(4500, ...displayPoints.map((point) => point.rpm)) + 500, [displayPoints])
-  const torqueMax = useMemo(() => Math.max(10, ...displayPoints.map((point) => point.torque)) + 5, [displayPoints])
+  // Axis scale is normally derived from the live point values so the plot grows to fit new
+  // extremes. But while actively dragging a point, recomputing it from that same point's live
+  // value creates a feedback loop: each pointer move rescales the axes, so the same data value
+  // lands at a different pixel than the raw cursor position implied -- the marker visibly detaches
+  // from the cursor the further you drag. Freeze the scale at the pre-drag values for the duration
+  // of the drag so pixel movement stays 1:1 with the cursor; re-derive it once the drag ends.
+  const liveRpmMax = Math.max(4500, ...displayPoints.map((point) => point.rpm)) + 500
+  const liveTorqueMax = Math.max(10, ...displayPoints.map((point) => point.torque)) + 5
+  const frozenAxisRef = useRef<{ rpmMax: number; torqueMax: number } | null>(null)
+  if (draggingIndex === null) frozenAxisRef.current = null
+  else if (frozenAxisRef.current === null) frozenAxisRef.current = { rpmMax: liveRpmMax, torqueMax: liveTorqueMax }
+  const rpmMax = frozenAxisRef.current?.rpmMax ?? liveRpmMax
+  const torqueMax = frozenAxisRef.current?.torqueMax ?? liveTorqueMax
 
   function toSvg(point: EngineTorquePoint) {
     return {
