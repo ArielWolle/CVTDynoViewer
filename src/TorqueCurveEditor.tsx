@@ -41,28 +41,43 @@ function niceStep(max: number, targetTicks: number): number {
   return step * magnitude
 }
 
+// Committing on every animation frame (~60/sec) still means ~60 full app recomputes per second
+// in the parent (recalculating power for every logged sample, then every chart's moving averages,
+// then re-rendering all eight charts) while dragging. That work runs on the same main thread as
+// this component's own local drag rendering, so once it takes longer than a frame it blocks the
+// local drag from updating too -- the curve itself looks laggy even though its own state is local
+// and cheap. Throttling the commit by wall-clock time (not just "once per frame") bounds how often
+// the expensive part runs, independent of how fast rAF/pointer events fire.
+const COMMIT_INTERVAL_MS = 100
+
 /** Draggable RPM-vs-torque spline used to shape the inertia-mode engine power curve. */
 export function TorqueCurveEditor({ points, onChange }: Props) {
   const svgRef = useRef<SVGSVGElement | null>(null)
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null)
   // Dragging updates this local, component-only state on every pointer move so the marker and
-  // spline redraw at full frame rate. The (expensive, app-wide) `onChange` commit that recomputes
-  // power for every logged sample is throttled to at most once per animation frame, and finalized
-  // on pointer-up, so a fast mouse doesn't flood the parent with dozens of redundant recomputes.
+  // spline redraw at full frame rate, decoupled from how often the expensive commit below runs.
   const [localPoints, setLocalPoints] = useState<EngineTorquePoint[] | null>(null)
   const pendingCommitRef = useRef<EngineTorquePoint[] | null>(null)
-  const frameRef = useRef<number | null>(null)
+  const timeoutRef = useRef<number | null>(null)
+  const lastCommitAtRef = useRef(0)
   const displayPoints = localPoints ?? points
 
-  useEffect(() => () => { if (frameRef.current !== null) cancelAnimationFrame(frameRef.current) }, [])
+  useEffect(() => () => { if (timeoutRef.current !== null) window.clearTimeout(timeoutRef.current) }, [])
 
   function scheduleCommit(next: EngineTorquePoint[]) {
     pendingCommitRef.current = next
-    if (frameRef.current !== null) return
-    frameRef.current = requestAnimationFrame(() => {
-      frameRef.current = null
+    const elapsed = performance.now() - lastCommitAtRef.current
+    if (elapsed >= COMMIT_INTERVAL_MS) {
+      lastCommitAtRef.current = performance.now()
+      onChange(next)
+      return
+    }
+    if (timeoutRef.current !== null) return
+    timeoutRef.current = window.setTimeout(() => {
+      timeoutRef.current = null
+      lastCommitAtRef.current = performance.now()
       if (pendingCommitRef.current) onChange(pendingCommitRef.current)
-    })
+    }, COMMIT_INTERVAL_MS - elapsed)
   }
 
   const rpmMax = useMemo(() => Math.max(4500, ...displayPoints.map((point) => point.rpm)) + 500, [displayPoints])
@@ -116,7 +131,7 @@ export function TorqueCurveEditor({ points, onChange }: Props) {
   }
   function handlePointerUp() {
     setDraggingIndex(null)
-    if (frameRef.current !== null) { cancelAnimationFrame(frameRef.current); frameRef.current = null }
+    if (timeoutRef.current !== null) { window.clearTimeout(timeoutRef.current); timeoutRef.current = null }
     if (localPoints) { onChange(localPoints); setLocalPoints(null) }
     pendingCommitRef.current = null
   }

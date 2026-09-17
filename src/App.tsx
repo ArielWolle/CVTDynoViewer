@@ -107,8 +107,10 @@ function App() {
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
   const [chartPlaying, setChartPlaying] = useState(true)
   const [frozenDomainEnd, setFrozenDomainEnd] = useState<number | null>(null)
-  const [rangeStart, setRangeStart] = useState(0)
-  const [rangeEnd, setRangeEnd] = useState(1)
+  // Bumped whenever a new dataset (CSV) is loaded, so <ChartWorkspace key={chartResetKey}> remounts
+  // fresh -- cleanly resetting its internal hover/drag/time-range-slider state without needing to
+  // plumb individual reset callbacks down into it.
+  const [chartResetKey, setChartResetKey] = useState(0)
   const [maEnabled, setMaEnabled] = useState<MaEnabled>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('cvt-dyno-ma-enabled') ?? 'null')
@@ -178,13 +180,14 @@ function App() {
     return samples.filter((sample) => sample.time <= frozenDomainEnd)
   }, [samples, chartPlaying, frozenDomainEnd])
   const domainStart = displaySamples[0]?.time ?? 0
-  const domainEnd = displaySamples[displaySamples.length - 1]?.time ?? domainStart
-  const domainSpan = Math.max(0, domainEnd - domainStart)
-  const windowStartMs = domainStart + rangeStart * domainSpan
-  const windowEndMs = domainStart + rangeEnd * domainSpan
-  const chartData = useMemo(() => {
-    if (!displaySamples.length) return []
-    const windowed = displaySamples.filter((sample) => sample.time >= windowStartMs && sample.time <= windowEndMs)
+  // The full derived dataset (moving averages, cascaded power, etc.) computed once over every
+  // buffered/retained sample -- NOT windowed to the currently selected time-range-slider view.
+  // Windowing is a separate, much cheaper filter step (see ChartWorkspace) so dragging the range
+  // slider's handles doesn't re-run this whole (comparatively expensive) pipeline on every tick;
+  // it's also more correct, since a trailing moving average shouldn't reset just because the user
+  // scrolled/zoomed the display window.
+  const derivedFullData = useMemo(() => {
+    const windowed = displaySamples
     if (!windowed.length) return []
     const windowSize = Math.max(1, Math.round(maWindow))
 
@@ -245,7 +248,7 @@ function App() {
       efficiencyAvg: efficiencyAvgArr[index],
       shiftRatioAvg: shiftRatioAvgArr[index],
     }))
-  }, [displaySamples, windowStartMs, windowEndMs, domainStart, maWindow, maEnabled, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve])
+  }, [displaySamples, domainStart, maWindow, maEnabled, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve])
 
 
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
@@ -565,8 +568,7 @@ function App() {
       setPlaybackRangeEnd(1)
       setChartPlaying(true)
       setFrozenDomainEnd(null)
-      setRangeStart(0)
-      setRangeEnd(1)
+      setChartResetKey((key) => key + 1)
       setNotice(`Loaded ${parsed.length.toLocaleString()} samples from ${file.name}`)
     } catch { setNotice('Could not read that CSV file') }
   }
@@ -617,6 +619,7 @@ function App() {
     <section className="playback-bar"><div className="strip-label"><Upload size={17} /><span>CSV playback</span></div><input ref={fileInputRef} type="file" accept=".csv,text/csv" className="visually-hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadPlaybackFile(file); event.target.value = '' }} /><button className="button button-quiet" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load CSV</button>{isPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span><button className="icon-button" title={playbackPlaying ? 'Pause playback' : 'Play playback'} onClick={togglePlaybackPlaying}>{playbackPlaying ? <Pause size={16} /> : <Play size={16} />}</button><TimeRangeSlider startFraction={playbackRangeStart} endFraction={playbackRangeEnd} onChange={handlePlaybackRangeChange} formatValue={(fraction) => `${((fraction * playbackDurationMs) / 1000).toFixed(1)}s`} /><span className="mono">{(playbackElapsedMs / 1000).toFixed(1)}s / {(playbackDurationMs / 1000).toFixed(1)}s</span><select value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))}><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select><button className="icon-button" title="Save recalculated CSV (current power settings applied to every row)" onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear playback" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
     <ChartWorkspace
+      key={chartResetKey}
       sampleCount={samples.length}
       chartPlaying={chartPlaying}
       onToggleChartPlaying={toggleChartPlaying}
@@ -624,14 +627,7 @@ function App() {
       onMaWindowChange={setMaWindow}
       charts={charts}
       setCharts={setCharts}
-      domainSpan={domainSpan}
-      rangeStart={rangeStart}
-      rangeEnd={rangeEnd}
-      onRangeChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }}
-      onFullRange={() => { setRangeStart(0); setRangeEnd(1) }}
-      chartData={chartData}
-      windowStartMs={windowStartMs}
-      windowEndMs={windowEndMs}
+      data={derivedFullData}
       maEnabled={maEnabled}
       onToggleMa={toggleMa}
       lowRatio={lowRatio}
@@ -650,7 +646,18 @@ function App() {
  * hover would re-render the whole app (topbar, console, control deck, playback bar, etc.), not
  * just the charts, which is visibly laggy. Keeping it here means only this subtree re-renders.
  */
-function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, domainSpan, rangeStart, rangeEnd, onRangeChange, onFullRange, chartData, windowStartMs, windowEndMs, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; domainSpan: number; rangeStart: number; rangeEnd: number; onRangeChange: (next: { start: number; end: number }) => void; onFullRange: () => void; chartData: ChartPoint[]; windowStartMs: number; windowEndMs: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void }) {
+function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void }) {
+  // The time-range-slider selection lives here (not in App) so dragging it only re-renders this
+  // subtree. The expensive per-field moving-average computation already happened in App over the
+  // full `data`; windowing it down to the selected range here is a cheap filter, not a recompute.
+  const [rangeStart, setRangeStart] = useState(0)
+  const [rangeEnd, setRangeEnd] = useState(1)
+  const domainStart = data[0]?.time ?? 0
+  const domainEnd = data[data.length - 1]?.time ?? domainStart
+  const domainSpan = Math.max(0, domainEnd - domainStart)
+  const windowStartMs = domainStart + rangeStart * domainSpan
+  const windowEndMs = domainStart + rangeEnd * domainSpan
+  const chartData = useMemo(() => data.filter((point) => point.time >= windowStartMs && point.time <= windowEndMs), [data, windowStartMs, windowEndMs])
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const hoverFrameRef = useRef<number | null>(null)
   const pendingHoverRef = useRef<number | null>(null)
@@ -681,7 +688,7 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
 
   return <>
     <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span><button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
-    {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={onRangeChange} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={onFullRange}>Full range</button></section>}
+    {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>
 }
