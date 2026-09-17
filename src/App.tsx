@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
 import { channelNames, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type PowerMode, type TelemetrySample } from './protocol'
@@ -33,8 +33,6 @@ const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
 const SENSOR_RETENTION_MS = 300_000
 const MAX_CONSOLE_MESSAGES = 500
 const KW_TO_HP = 1.341022
-// Matches `.chart-body { padding: 0 10px; }` in styles.css -- see the note in handlePlotMouseMove.
-const CHART_BODY_PADDING_PX = 10
 
 
 function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
@@ -704,32 +702,47 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   // onMouseMove and rendering its <ReferenceLine> for the crosshair meant every one of the eight
   // charts fully re-rendered its SVG tree on every hover tick, which is what made hovering feel
   // slow and, under fast mouse movement, made the crosshair visibly lag behind the cursor. Instead
-  // the nearest point is found with plain DOM math (cheap, synchronous, no chart re-render), and
-  // the crosshair below is a plain CSS-positioned line, not an SVG element inside the chart.
-  // CSS containing-block rules for an absolutely positioned element (like the crosshair below)
-  // resolve percentages against the ancestor's *padding* box, which includes the ancestor's own
-  // padding -- so the crosshair's 0%-100% range spans the exact same box as
-  // getBoundingClientRect() on .chart-body, padding included. These constants (and the plain
-  // mouse math below) intentionally work in that same raw, padding-inclusive frame so the two
-  // stay in agreement: margin.left/right from `common`, the reserved Y-axis width, plus
-  // .chart-body's own 10px padding (see styles.css).
-  const plotLeftPx = (config.id === 'power' ? 40 : 46) + 4 + CHART_BODY_PADDING_PX
-  const plotRightPx = (config.id === 'power' ? 40 : 14) + (config.id === 'power' ? 4 : 0) + CHART_BODY_PADDING_PX
+  // the nearest point is found with plain DOM math, and the crosshair is a plain CSS-positioned
+  // line, not an SVG element inside the chart, so moving it never touches Recharts at all.
+  //
+  // The plot area's exact pixel bounds (margins, reserved axis width, the extra Y axis on the
+  // power chart, etc.) are read directly from Recharts' own rendered grid background rect
+  // (`.recharts-cartesian-grid-bg`, enabled by passing CartesianGrid a `fill`) instead of being
+  // separately guessed here as hardcoded margin constants -- guessing them by hand was fragile
+  // and got out of sync with Recharts' actual layout more than once. Reading the real geometry
+  // is simpler and correct for any chart's margin configuration automatically.
+  const chartBodyRef = useRef<HTMLDivElement | null>(null)
+  const crosshairRef = useRef<HTMLDivElement | null>(null)
+  function getPlotRect(chartBody: HTMLDivElement): DOMRect | null {
+    return chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
+  }
   function handlePlotMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
     if (isRelationshipChart || !data.length) return
-    const rect = event.currentTarget.getBoundingClientRect()
-    const usableWidth = rect.width - plotLeftPx - plotRightPx
-    if (usableWidth <= 0) return
-    const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left - plotLeftPx) / usableWidth))
+    const plotRect = getPlotRect(event.currentTarget)
+    if (!plotRect || plotRect.width <= 0) return
+    const fraction = Math.min(1, Math.max(0, (event.clientX - plotRect.left) / plotRect.width))
     const domainStart = data[0].seconds
     const domainEnd = data[data.length - 1].seconds
     const nearest = findNearestBySeconds(data, domainStart + fraction * (domainEnd - domainStart))
     if (nearest) onHoverRef.current(nearest.time)
   }
   function handlePlotMouseLeave() { onHoverRef.current(null) }
-  const crosshairFraction = !isRelationshipChart && hoveredPoint && data.length > 1
-    ? Math.min(1, Math.max(0, (hoveredPoint.seconds - data[0].seconds) / ((data[data.length - 1].seconds - data[0].seconds) || 1)))
-    : undefined
+  // Positions the crosshair imperatively (a direct style mutation, not React state) so showing it
+  // on the other seven charts when hovering one of them doesn't require yet another re-render.
+  useLayoutEffect(() => {
+    const crosshair = crosshairRef.current
+    const chartBody = chartBodyRef.current
+    if (!crosshair || !chartBody) return
+    if (isRelationshipChart || !hoveredPoint || data.length < 2) { crosshair.style.display = 'none'; return }
+    const plotRect = getPlotRect(chartBody)
+    if (!plotRect || plotRect.width <= 0) { crosshair.style.display = 'none'; return }
+    const domainStart = data[0].seconds
+    const domainEnd = data[data.length - 1].seconds
+    const fraction = domainEnd > domainStart ? (hoveredPoint.seconds - domainStart) / (domainEnd - domainStart) : 0
+    const bodyRect = chartBody.getBoundingClientRect()
+    crosshair.style.display = 'block'
+    crosshair.style.left = `${plotRect.left - bodyRect.left + Math.min(1, Math.max(0, fraction)) * plotRect.width}px`
+  }, [hoveredPoint, data, isRelationshipChart])
   function renderHoverDot(color: string) {
     const cached = dotRendererCache.current.get(color)
     if (cached) return cached
@@ -741,9 +754,9 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     dotRendererCache.current.set(color, renderer)
     return renderer
   }
-  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
+  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
   const powerMaxKw = Math.max(1, ...data.map((sample) => sample.power1), ...data.map((sample) => sample.power2)) * 1.1
-  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /></>
+  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /></>
   const lineProps = { isAnimationActive: false, animationDuration: 0, dot: false, activeDot: false, connectNulls: false }
   // Moving averages propagate downstream (RPM -> power -> efficiency, RPM -> shift ratio). When an
   // upstream field is being averaged, a chart's own raw trace is redundant -- only the resulting
@@ -799,8 +812,8 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   const lowRatioLine = [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * lowRatio }]
   const highRatioLine = [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * highRatio }]
   const relationshipAxis = config.id === 'scatter'
-    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey="rpm2" name="Secondary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}</>
-    : <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}</>
+    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="rpm2" name="Secondary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}</>
+    : <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}</>
   // Memoized so time-series charts (which no longer depend on hoveredPoint at all -- their
   // crosshair is the plain CSS overlay above, not an SVG element in here) skip Recharts'
   // reconciliation entirely while only the hover position changes. The two relationship charts
@@ -824,7 +837,7 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
         </label>
       </div>
     : null
-  return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body" onMouseMove={handlePlotMouseMove} onMouseLeave={handlePlotMouseLeave}>{chart}{typeof crosshairFraction === 'number' && <div className="chart-crosshair-line" style={{ left: `calc(${plotLeftPx}px + ${crosshairFraction} * (100% - ${plotLeftPx + plotRightPx}px))` }} />}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
+  return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body" ref={chartBodyRef} onMouseMove={handlePlotMouseMove} onMouseLeave={handlePlotMouseLeave}>{chart}{!isRelationshipChart && <div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
 }
 
 function SerialConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {
