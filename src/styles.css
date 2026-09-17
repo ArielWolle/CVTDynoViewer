@@ -45,5 +45,8 @@ button { cursor: pointer; }
 .ma-window-label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
 .ma-window-label input { width: 48px; border: 1px solid var(--line); border-radius: 2px; padding: 5px 6px; background: var(--paper); color: var(--ink); }
 .chart-ma-toggles { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.chart-ratio-inputs { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.ratio-input { display: flex; align-items: center; gap: 5px; font: 500 9px 'DM Mono', monospace; white-space: nowrap; }
+.ratio-input input { width: 44px; border: 1px solid var(--line); border-radius: 2px; padding: 3px 5px; background: var(--paper); color: var(--ink); font: 10px 'DM Mono', monospace; }
 .ma-toggle { display: flex; align-items: center; gap: 4px; font: 500 9px 'DM Mono', monospace; color: #67655e; white-space: nowrap; cursor: pointer; }
 .ma-toggle input { margin: 0; cursor: pointer; }

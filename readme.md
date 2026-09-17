@@ -54,6 +54,10 @@ Power mode defaults to **Inertia mode**, which estimates primary power from an e
 
 Use **Load CSV** to replay a previously logged CSV file (or any file matching the export header) as if it were live telemetry. Playback controls include play/pause, a speed selector (0.25×–4×), and a scrub bar. Loading a file pauses demo/live telemetry until playback is cleared or a device is connected.
 
+## Ratio reference lines
+
+The **Primary vs. secondary RPM** chart has **Low ratio** / **High ratio** number inputs in its header (defaults 2.5 and 0.9). Each draws a straight `y = ratio * x` reference line through the origin, giving a visual band for the expected/acceptable shift ratio range independent of the live telemetry trace.
+
 ## Moving averages
 
 Each RPM, power, efficiency, and shift-ratio chart has a **Moving avg** checkbox in its header (the power chart has separate Primary/Secondary checkboxes) that overlays a dashed trailing moving-average trace. Primary RPM and secondary power are on by default; the rest are off. The **MA points** field next to **Reset layout** sets how many trailing samples are averaged (default 5) and applies to every enabled trace.

@@ -112,11 +112,24 @@ function App() {
     } catch { return defaultCharts }
   })
   const [dragged, setDragged] = useState<ChartId | null>(null)
+  // Reference lines on the primary-vs-secondary RPM chart: y = ratio * x through the origin,
+  // marking a low/high acceptable ratio band for the user to compare live data against.
+  const [lowRatio, setLowRatio] = useState(() => {
+    const stored = Number(localStorage.getItem('cvt-dyno-low-ratio'))
+    return Number.isFinite(stored) && stored > 0 ? stored : 2.5
+  })
+  const [highRatio, setHighRatio] = useState(() => {
+    const stored = Number(localStorage.getItem('cvt-dyno-high-ratio'))
+    return Number.isFinite(stored) && stored > 0 ? stored : 0.9
+  })
   // Shared hover cursor, keyed by the actual sample `time` (not axis pixel position). Two charts
   // plot non-time values on their X axis (RPM-vs-RPM and shift ratio vs efficiency), where a
   // pixel-nearest lookup can land on the wrong sample since that axis isn't monotonic with time;
   // keying sync off the real timestamp keeps every chart aligned to the same instant regardless.
   const [hoverTime, setHoverTime] = useState<number | null>(null)
+  const hoverFrameRef = useRef<number | null>(null)
+  const pendingHoverRef = useRef<number | null>(null)
+  const hasPendingHoverRef = useRef(false)
   const [notice, setNotice] = useState('Demo telemetry is flowing')
   const [directoryName, setDirectoryName] = useState('Browser download')
   const transport = useRef<SerialTransport | null>(null)
@@ -230,6 +243,8 @@ function App() {
   useEffect(() => { localStorage.setItem('cvt-dyno-torque-curve', JSON.stringify(torqueCurve)) }, [torqueCurve])
   useEffect(() => { localStorage.setItem('cvt-dyno-ma-enabled', JSON.stringify(maEnabled)) }, [maEnabled])
   useEffect(() => { localStorage.setItem('cvt-dyno-ma-window', String(maWindow)) }, [maWindow])
+  useEffect(() => { localStorage.setItem('cvt-dyno-low-ratio', String(lowRatio)) }, [lowRatio])
+  useEffect(() => { localStorage.setItem('cvt-dyno-high-ratio', String(highRatio)) }, [highRatio])
   useEffect(() => {
     if (!playbackPlaying || !playbackSamples.length) return
     const timer = window.setInterval(() => { setPlaybackElapsedMs((elapsed) => Math.min(playbackEndBoundMs, elapsed + 100 * playbackSpeed)) }, 100)
@@ -270,7 +285,7 @@ function App() {
     }, 100)
     return () => window.clearInterval(demoTimer.current)
   }, [demoMode, connected, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve, isPlaybackActive])
-  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); window.clearTimeout(logCommitTimer.current); void commitLog(false); void transport.current?.disconnect() }, [])
+  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); window.clearTimeout(logCommitTimer.current); if (hoverFrameRef.current !== null) cancelAnimationFrame(hoverFrameRef.current); void commitLog(false); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
@@ -583,6 +598,18 @@ function App() {
     })
   }
   function toggleMa(field: MaField) { setMaEnabled((previous) => ({ ...previous, [field]: !previous[field] })) }
+  // Chart hover fires on every raw mousemove event, which can be very frequent; committing
+  // `hoverTime` directly would re-render all eight chart cards on every pixel of movement and
+  // thrash badly enough to look broken. Coalesce updates to at most one per animation frame.
+  function scheduleHover(time: number | null) {
+    pendingHoverRef.current = time
+    hasPendingHoverRef.current = true
+    if (hoverFrameRef.current !== null) return
+    hoverFrameRef.current = requestAnimationFrame(() => {
+      hoverFrameRef.current = null
+      if (hasPendingHoverRef.current) { setHoverTime(pendingHoverRef.current); hasPendingHoverRef.current = false }
+    })
+  }
 
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'Serial link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
@@ -596,12 +623,12 @@ function App() {
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
     <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{samples.length.toLocaleString()} samples buffered</span><button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={toggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); setMaWindow(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
-    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={toggleMa} hoverTime={hoverTime} onHover={setHoverTime} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
+    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={toggleMa} hoverTime={hoverTime} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={setLowRatio} onHighRatioChange={setHighRatio} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
     <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
 }
 
-function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hoverTime, onHover, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; hoverTime: number | null; onHover: (time: number | null) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
+function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hoverTime, onHover, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; hoverTime: number | null; onHover: (time: number | null) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
   const yUnit = config.id === 'rpm1' || config.id === 'rpm2' ? 'RPM' : config.id === 'shift' || config.id === 'efficiency' ? '%' : config.id === 'shiftRatio' ? 'Ratio' : ''
   const axisLabelStyle = { fill: '#8b8982', fontSize: 10 }
   const common = { data, margin: { top: 8, right: config.id === 'power' ? 4 : 14, left: 4, bottom: 14 } }
@@ -649,15 +676,32 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hoverTi
   const relationshipX = config.id === 'scatter' ? hoveredPoint?.rpm2 : hoveredPoint?.[shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio']
   const relationshipY = config.id === 'scatter' ? hoveredPoint?.rpm1 : hoveredPoint?.[efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency']
   const relationshipCrosshair = <>{typeof relationshipX === 'number' && <ReferenceLine x={relationshipX} {...hoverCursorProps} />}{typeof relationshipY === 'number' && <ReferenceLine y={relationshipY} {...hoverCursorProps} />}</>
+  // Reference lines y = ratio * x through the origin, marking a low/high acceptable shift-ratio
+  // band. Rendered as their own two-point Line series (with an explicit `data` override) so they
+  // draw independent of the live telemetry data, spanning the same square domain as the RPM axes.
+  const scatterMax = Math.max(10, ...data.map((point) => point.rpm1), ...data.map((point) => point.rpm2)) * 1.05
+  const lowRatioLine = [{ x: 0, y: 0 }, { x: scatterMax, y: scatterMax * lowRatio }]
+  const highRatioLine = [{ x: 0, y: 0 }, { x: scatterMax, y: scatterMax * highRatio }]
   const relationshipAxis = config.id === 'scatter'
-    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}<Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
+    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey="rpm2" name="Secondary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}<Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
     : <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}<Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
-  const chart = <ResponsiveContainer width="100%" height="100%"><LineChart {...common} onMouseMove={handleChartHover} onMouseLeave={handleChartLeave}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{config.id === 'scatter' && <Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} />}{config.id === 'shiftEfficiency' && <Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} />}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>
+  const chart = <ResponsiveContainer width="100%" height="100%"><LineChart {...common} onMouseMove={handleChartHover} onMouseLeave={handleChartLeave}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{config.id === 'scatter' && <><Line data={lowRatioLine} type="linear" dataKey="y" stroke="#d8a227" strokeWidth={1.5} strokeDasharray="5 4" isAnimationActive={false} dot={false} activeDot={false} legendType="none" /><Line data={highRatioLine} type="linear" dataKey="y" stroke="#3c8f88" strokeWidth={1.5} strokeDasharray="5 4" isAnimationActive={false} dot={false} activeDot={false} legendType="none" /><Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} /></>}{config.id === 'shiftEfficiency' && <Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} />}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>
   const singleMaField: MaField | null = config.id === 'rpm1' || config.id === 'rpm2' || config.id === 'efficiency' || config.id === 'shiftRatio' ? config.id : null
   const maToggles = config.id === 'power'
     ? <div className="chart-ma-toggles"><label className="ma-toggle" style={{ color: '#f05d3b' }}><input type="checkbox" checked={maEnabled.power1} onChange={() => onToggleMa('power1')} />Primary MA</label><label className="ma-toggle" style={{ color: '#3c8f88' }}><input type="checkbox" checked={maEnabled.power2} onChange={() => onToggleMa('power2')} />Secondary MA</label></div>
     : singleMaField
     ? <div className="chart-ma-toggles"><label className="ma-toggle"><input type="checkbox" checked={maEnabled[singleMaField]} onChange={() => onToggleMa(singleMaField)} />Moving avg</label></div>
+    : config.id === 'scatter'
+    ? <div className="chart-ratio-inputs">
+        <label className="ratio-input" style={{ color: '#d8a227' }}>
+          <span>Low ratio</span>
+          <input type="number" step="0.01" min="0" value={lowRatio} onChange={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next > 0) onLowRatioChange(next) }} />
+        </label>
+        <label className="ratio-input" style={{ color: '#3c8f88' }}>
+          <span>High ratio</span>
+          <input type="number" step="0.01" min="0" value={highRatio} onChange={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next > 0) onHighRatioChange(next) }} />
+        </label>
+      </div>
     : null
   return <article className="chart-card" draggable onDragStart={onDragStart} onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder"><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body">{chart}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span><span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
 }
