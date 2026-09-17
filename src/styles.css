@@ -33,6 +33,7 @@ button { cursor: pointer; }
 .torque-curve-editor { width: 100%; }
 .torque-curve-svg { width: 100%; height: 220px; touch-action: none; background: #fffdf8; border: 1px solid var(--line); }
 .torque-curve-hint { margin: 6px 0 0; color: var(--muted); font-size: 10px; }
+.torque-curve-warning { margin: 4px 0 0; color: #d92b2b; font-size: 10px; font-weight: 600; }
 @media (max-width: 720px) { .inertia-settings-body { grid-template-columns: 1fr; } }
 .playback-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; border-bottom: 1px solid var(--line); padding: 13px 0; }
 .playback-filename { color: #67655e; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

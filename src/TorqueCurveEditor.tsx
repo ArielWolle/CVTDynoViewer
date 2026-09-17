@@ -61,8 +61,22 @@ export function TorqueCurveEditor({ points, onChange }: Props) {
   const timeoutRef = useRef<number | null>(null)
   const lastCommitAtRef = useRef(0)
   const displayPoints = localPoints ?? points
+  // Surfaced whenever a drag or insert would otherwise create two points with the exact same
+  // RPM -- that makes the curve a one-to-many relation (not a function) that the downstream
+  // interpolation can't resolve, so we nudge the offending point apart automatically and tell
+  // the user why it stopped tracking the cursor exactly.
+  const [warning, setWarning] = useState<string | null>(null)
+  const warningTimeoutRef = useRef<number | null>(null)
+  function flashWarning(message: string) {
+    setWarning(message)
+    if (warningTimeoutRef.current !== null) window.clearTimeout(warningTimeoutRef.current)
+    warningTimeoutRef.current = window.setTimeout(() => { warningTimeoutRef.current = null; setWarning(null) }, 2000)
+  }
 
-  useEffect(() => () => { if (timeoutRef.current !== null) window.clearTimeout(timeoutRef.current) }, [])
+  useEffect(() => () => {
+    if (timeoutRef.current !== null) window.clearTimeout(timeoutRef.current)
+    if (warningTimeoutRef.current !== null) window.clearTimeout(warningTimeoutRef.current)
+  }, [])
 
   function scheduleCommit(next: EngineTorquePoint[]) {
     pendingCommitRef.current = next
@@ -123,20 +137,37 @@ export function TorqueCurveEditor({ points, onChange }: Props) {
 
   function handlePointerDown(index: number, event: React.PointerEvent<SVGCircleElement>) {
     event.stopPropagation()
-    event.currentTarget.setPointerCapture(event.pointerId)
+    // setPointerCapture can throw (e.g. certain synthetic or already-released pointer ids); it's
+    // only an optimization to keep receiving events if the cursor leaves the circle, so a failure
+    // here shouldn't block starting the drag.
+    try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* not fatal */ }
     setDraggingIndex(index)
   }
   function handlePointerMove(event: React.PointerEvent<SVGSVGElement>) {
     if (draggingIndex === null) return
     const { x, y } = clientToSvgPoint(event.clientX, event.clientY)
     const raw = fromSvg(x, y)
-    const prev = displayPoints[draggingIndex - 1]
-    const next = displayPoints[draggingIndex + 1]
-    const minRpm = prev ? prev.rpm + 1 : 0
-    const maxRpm = next ? next.rpm - 1 : rpmMax
-    const rpm = Math.round(Math.min(maxRpm, Math.max(minRpm, raw.rpm)))
+    const rpm = Math.round(Math.min(rpmMax, Math.max(0, raw.rpm)))
     const torque = Math.round(Math.min(torqueMax, Math.max(0, raw.torque)) * 10) / 10
-    const nextPoints = displayPoints.map((point, index) => (index === draggingIndex ? { rpm, torque } : point))
+    const dragged = { rpm, torque }
+    // Previously this clamped rpm to stay strictly between the dragged point's immediate
+    // neighbors, which made dragging feel stuck the moment you approached a neighbor (and made
+    // points that started close together, like the last two on the default curve, nearly
+    // impossible to move at all). Instead let the point move freely and re-sort the array by rpm
+    // afterward -- dragging past a neighbor now swaps their order instead of hitting a wall,
+    // while the sorted-ascending invariant the interpolation relies on is still preserved.
+    const others = displayPoints.filter((_, index) => index !== draggingIndex)
+    if (others.some((point) => point.rpm === dragged.rpm)) {
+      flashWarning('Two points can\u2019t share the same RPM \u2014 nudged apart automatically.')
+      for (let nudge = 1; nudge < rpmMax; nudge += 1) {
+        const up = dragged.rpm + nudge
+        const down = dragged.rpm - nudge
+        if (up <= rpmMax && !others.some((point) => point.rpm === up)) { dragged.rpm = up; break }
+        if (down >= 0 && !others.some((point) => point.rpm === down)) { dragged.rpm = down; break }
+      }
+    }
+    const nextPoints = [...others, dragged].sort((a, b) => a.rpm - b.rpm)
+    setDraggingIndex(nextPoints.indexOf(dragged))
     setLocalPoints(nextPoints)
     scheduleCommit(nextPoints)
   }
@@ -157,6 +188,15 @@ export function TorqueCurveEditor({ points, onChange }: Props) {
     const point = fromSvg(x, y)
     point.rpm = Math.round(point.rpm)
     point.torque = Math.round(point.torque * 10) / 10
+    if (points.some((existing) => existing.rpm === point.rpm)) {
+      flashWarning('Two points can\u2019t share the same RPM \u2014 nudged apart automatically.')
+      for (let nudge = 1; nudge < rpmMax; nudge += 1) {
+        const up = point.rpm + nudge
+        const down = point.rpm - nudge
+        if (up <= rpmMax && !points.some((existing) => existing.rpm === up)) { point.rpm = up; break }
+        if (down >= 0 && !points.some((existing) => existing.rpm === down)) { point.rpm = down; break }
+      }
+    }
     const insertIndex = points.findIndex((existing) => existing.rpm > point.rpm)
     const nextPoints = [...points]
     if (insertIndex === -1) nextPoints.push(point)
@@ -211,6 +251,7 @@ export function TorqueCurveEditor({ points, onChange }: Props) {
         ))}
       </svg>
       <p className="torque-curve-hint">Drag a point to reshape the curve. Double-click empty space to add a point, double-click a point to remove it.</p>
+      {warning && <p className="torque-curve-warning" role="alert">{warning}</p>}
     </div>
   )
 }
