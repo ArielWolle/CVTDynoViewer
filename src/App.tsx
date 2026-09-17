@@ -37,7 +37,10 @@ const KW_TO_HP = 1.341022
 // engine is at full throttle, and the same solid color for relationship-chart dots/points
 // recorded during it -- distinct from every existing series color in the app.
 const FULL_THROTTLE_COLOR = '#d92b2b'
-const FULL_THROTTLE_BAND_FILL = 'rgba(217, 43, 43, 0.08)'
+// Bumped from an initial 0.08 -- at that opacity the bands were technically rendering but only
+// as a barely-perceptible tint, easy to miss entirely at a glance (confirmed from a real
+// screenshot). This is deliberately strong enough to be unmistakable at a glance.
+const FULL_THROTTLE_BAND_FILL = 'rgba(217, 43, 43, 0.28)'
 
 
 function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
@@ -1054,14 +1057,25 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     if (segmentStart !== null) segments.push({ start: segmentStart, end: data[data.length - 1].seconds })
     return segments
   }, [data, isRelationshipChart, highlightFullThrottle])
-  function relationshipDot(color: string) {
+  // `extreme` makes full-throttle points dramatically larger/bolder rather than just a different
+  // fill color -- requested specifically for the primary-vs-secondary scatter chart, where the
+  // point cloud is dense enough that a same-size color swap alone was hard to pick out at a
+  // glance. Renders as a small "target" (an outer ring plus the filled dot) so it reads as
+  // distinctly different in shape, not just hue, from every other point.
+  function relationshipDot(color: string, extreme = false) {
     if (!highlightFullThrottle) return { ...staticDot, fill: color }
     return (dotProps: { cx?: number; cy?: number; payload?: ChartPoint }) => {
       const isFull = dotProps.payload?.fullThrottle === true
+      if (isFull && extreme) {
+        return <g>
+          <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r + 4} fill="none" stroke={FULL_THROTTLE_COLOR} strokeWidth={2} />
+          <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r + 1} strokeWidth={1.5} stroke="#fffdf8" fill={FULL_THROTTLE_COLOR} />
+        </g>
+      }
       return <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r} strokeWidth={staticDot.strokeWidth} stroke={staticDot.stroke} fill={isFull ? FULL_THROTTLE_COLOR : color} />
     }
   }
-  const chart = useMemo(() => <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{!isRelationshipChart && fullThrottleSegments.map((segment, index) => <ReferenceArea key={index} x1={segment.start} x2={segment.end} {...(config.id === 'power' ? { yAxisId: 'kw' } : {})} fill={FULL_THROTTLE_BAND_FILL} stroke="none" ifOverflow="visible" />)}{config.id === 'scatter' && <><Line data={lowRatioLine} name="Low ratio" type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line data={highRatioLine} name="High ratio" type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color)} /></>}{config.id === 'shiftEfficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} /><Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color)} /></>}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" name="Shift position" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>, [config, data, maEnabled, lowRatio, highRatio, highlightFullThrottle, fullThrottleSegments])
+  const chart = useMemo(() => <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{!isRelationshipChart && fullThrottleSegments.map((segment, index) => <ReferenceArea key={index} x1={segment.start} x2={segment.end} {...(config.id === 'power' ? { yAxisId: 'kw' } : {})} fill={FULL_THROTTLE_BAND_FILL} stroke="none" ifOverflow="visible" />)}{config.id === 'scatter' && <><Line data={lowRatioLine} name="Low ratio" type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line data={highRatioLine} name="High ratio" type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color, true)} /></>}{config.id === 'shiftEfficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} /><Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color)} /></>}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" name="Shift position" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>, [config, data, maEnabled, lowRatio, highRatio, highlightFullThrottle, fullThrottleSegments])
   const singleMaField: MaField | null = config.id === 'rpm1' || config.id === 'rpm2' || config.id === 'efficiency' || config.id === 'shiftRatio' ? config.id : null
   const maToggles = config.id === 'power'
     ? <div className="chart-ma-toggles"><label className="ma-toggle" style={{ color: '#f05d3b' }}><input type="checkbox" checked={maEnabled.power1} onChange={() => onToggleMa('power1')} />Primary MA</label><label className="ma-toggle" style={{ color: '#3c8f88' }}><input type="checkbox" checked={maEnabled.power2} onChange={() => onToggleMa('power2')} />Secondary MA</label></div>
