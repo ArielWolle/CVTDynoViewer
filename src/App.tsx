@@ -20,13 +20,13 @@ type ConsoleSort = 'time' | 'type' | 'data'
 
 const defaultCharts: ChartConfig[] = [
   { id: 'scatter', title: 'Primary vs secondary RPM', subtitle: 'Load transfer relationship', color: '#f05d3b', visible: true },
+  { id: 'shiftEfficiency', title: 'Ratio vs. efficiency', subtitle: 'Shift ratio / efficiency relationship', color: '#2f6f9e', visible: true },
   { id: 'rpm1', title: 'Primary RPM', subtitle: 'Engine speed / time', color: '#d8a227', visible: true },
   { id: 'rpm2', title: 'Secondary RPM', subtitle: 'Output speed / time', color: '#3c8f88', visible: true },
   { id: 'shift', title: 'Shift position', subtitle: 'Actuator travel / time', color: '#b86b3a', visible: true },
   { id: 'power', title: 'Power output', subtitle: 'Primary and secondary / time', color: '#f05d3b', visible: true },
   { id: 'efficiency', title: 'Efficiency', subtitle: 'Secondary power / primary power', color: '#668b48', visible: true },
   { id: 'shiftRatio', title: 'Shift ratio', subtitle: 'Primary RPM / secondary RPM', color: '#7d5ba6', visible: true },
-  { id: 'shiftEfficiency', title: 'Ratio vs. efficiency', subtitle: 'Shift ratio / efficiency relationship', color: '#2f6f9e', visible: true },
 ]
 
 const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
