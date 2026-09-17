@@ -32,14 +32,14 @@ const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
 const SENSOR_RETENTION_MS = 300_000
 const MAX_CONSOLE_MESSAGES = 500
 const KW_TO_HP = 1.341022
-const CHART_SYNC_ID = 'cvt-dyno-charts'
+
 
 function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
   const cutoff = next.time - SENSOR_RETENTION_MS
   return [...history.filter((sample) => sample.time >= cutoff), next]
 }
 
-function makeDemoSample(index: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: TelemetrySample, inertiaKgM2 = 0.3, torqueCurve: EngineTorquePoint[] = defaultEngineTorqueCurve as EngineTorquePoint[]): TelemetrySample {
+function makeDemoSample(index: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: TelemetrySample, inertiaKgM2 = 0.3134, torqueCurve: EngineTorquePoint[] = defaultEngineTorqueCurve as EngineTorquePoint[]): TelemetrySample {
   const phase = index / 10
   const values = { time: index * 100, rpm1: Math.round(3200 + Math.sin(phase) * 720 + index * 3), rpm2: Math.round(2200 + Math.sin(phase - 0.5) * 500 + index * 2), shift: Math.round(35 + Math.sin(phase * 0.45) * 20), torq1: Math.round(380 + Math.sin(phase * 0.8) * 90), torq2: Math.round(305 + Math.sin(phase * 0.8 - 0.3) * 76) }
   return deriveSample(values, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
@@ -52,7 +52,7 @@ function App() {
   const [demoMode, setDemoMode] = useState(false)
   const [firmwareDemoMode, setFirmwareDemoMode] = useState(false)
   const [powerMode, setPowerMode] = useState<PowerMode>('inertia')
-  const [inertiaKgM2, setInertiaKgM2] = useState(0.3)
+  const [inertiaKgM2, setInertiaKgM2] = useState(0.3134)
   const [torqueCurve, setTorqueCurve] = useState<EngineTorquePoint[]>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('cvt-dyno-torque-curve') ?? 'null')
@@ -112,6 +112,11 @@ function App() {
     } catch { return defaultCharts }
   })
   const [dragged, setDragged] = useState<ChartId | null>(null)
+  // Shared hover cursor, keyed by the actual sample `time` (not axis pixel position). Two charts
+  // plot non-time values on their X axis (RPM-vs-RPM and shift ratio vs efficiency), where a
+  // pixel-nearest lookup can land on the wrong sample since that axis isn't monotonic with time;
+  // keying sync off the real timestamp keeps every chart aligned to the same instant regardless.
+  const [hoverTime, setHoverTime] = useState<number | null>(null)
   const [notice, setNotice] = useState('Demo telemetry is flowing')
   const [directoryName, setDirectoryName] = useState('Browser download')
   const transport = useRef<SerialTransport | null>(null)
@@ -245,7 +250,7 @@ function App() {
     if (!logging || !logWriter.current) return
     const newSamples = samples.filter((sample) => lastLoggedSampleTime.current === null || sample.time > lastLoggedSampleTime.current)
     if (!newSamples.length) return
-    const rows = newSamples.map(sampleToCsvRow).join('\n') + '\n'
+    const rows = newSamples.map((sample) => sampleToCsvRow(sample, torqueScale, torqueOffset)).join('\n') + '\n'
     lastLoggedSampleTime.current = newSamples[newSamples.length - 1].time
     pendingLogRows.current += rows
     if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
@@ -439,7 +444,7 @@ function App() {
     void (async () => { if (transport.current) { await transport.current.send(encodeCommand(6, channel, spokes)) } })().catch(() => setNotice('Could not send spoke configuration'))
   }
   async function downloadCsv(sourceSamples: TelemetrySample[] = samples, baseName: string = sessionName || 'cvt-dyno-session') {
-    const csv = samplesToCsv(sourceSamples)
+    const csv = samplesToCsv(sourceSamples, torqueScale, torqueOffset)
     if (directoryHandle.current) {
       const file = await directoryHandle.current.getFileHandle(`${baseName}.csv`, { create: true })
       const writable = await file.createWritable(); await writable.write(csv); await writable.close()
@@ -525,7 +530,7 @@ function App() {
   async function loadPlaybackFile(file: File) {
     try {
       const text = await file.text()
-      const parsed = parseSamplesCsv(text)
+      const parsed = parseSamplesCsv(text, torqueScale, torqueOffset)
       if (!parsed.length) { setNotice('No samples found in that CSV file'); return }
       window.clearInterval(demoTimer.current)
       setDemoMode(false)
@@ -591,19 +596,36 @@ function App() {
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
     <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{samples.length.toLocaleString()} samples buffered</span><button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={toggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); setMaWindow(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
-    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={toggleMa} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
+    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={toggleMa} hoverTime={hoverTime} onHover={setHoverTime} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
     <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
 }
 
-function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
+function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hoverTime, onHover, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; hoverTime: number | null; onHover: (time: number | null) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
   const yUnit = config.id === 'rpm1' || config.id === 'rpm2' ? 'RPM' : config.id === 'shift' || config.id === 'efficiency' ? '%' : config.id === 'shiftRatio' ? 'Ratio' : ''
   const axisLabelStyle = { fill: '#8b8982', fontSize: 10 }
   const common = { data, margin: { top: 8, right: config.id === 'power' ? 4 : 14, left: 4, bottom: 14 } }
   const yDomain = config.id === 'shiftRatio' ? [0, 5] : undefined
-  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
+  // Cross-chart hover cursor: looked up by the hovered sample's actual time, not axis position
+  // (see note on `hoverTime` in the parent), so it stays correct even on the two relationship
+  // charts whose X axis isn't time-ordered.
+  const hoveredPoint = hoverTime !== null ? data.find((point) => point.time === hoverTime) : undefined
+  const hoverCursorProps = { stroke: '#67655e', strokeDasharray: '4 4', strokeWidth: 1 }
+  function handleChartHover(state: unknown) {
+    const point = (state as { activePayload?: { payload?: ChartPoint }[] } | null)?.activePayload?.[0]?.payload
+    if (point && typeof point.time === 'number') onHover(point.time)
+  }
+  function handleChartLeave() { onHover(null) }
+  function renderHoverDot(color: string) {
+    return (dotProps: { cx?: number; cy?: number; payload?: ChartPoint }) => {
+      const { cx, cy, payload } = dotProps
+      if (typeof cx !== 'number' || typeof cy !== 'number' || !payload) return <g key={payload?.time ?? Math.random()} />
+      return <circle key={payload.time} cx={cx} cy={cy} r={3.5} fill={color} stroke="#fffdf8" strokeWidth={1} style={{ cursor: 'pointer' }} onMouseEnter={() => onHover(payload.time)} onMouseLeave={() => onHover(null)} />
+    }
+  }
+  const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{hoveredPoint && <ReferenceLine x={hoveredPoint.seconds} {...hoverCursorProps} />}<Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
   const powerMaxKw = Math.max(1, ...data.map((sample) => sample.power1), ...data.map((sample) => sample.power2)) * 1.1
-  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} formatter={((value: number, name: string) => [`${value.toFixed(2)} kW / ${(value * KW_TO_HP).toFixed(2)} hp`, name === 'power1' ? 'Primary' : 'Secondary']) as never} /></>
+  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis dataKey="seconds" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} />{hoveredPoint && <ReferenceLine yAxisId="kw" x={hoveredPoint.seconds} {...hoverCursorProps} />}<Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} formatter={((value: number, name: string) => [`${value.toFixed(2)} kW / ${(value * KW_TO_HP).toFixed(2)} hp`, name === 'power1' ? 'Primary' : 'Secondary']) as never} /></>
   const lineProps = { isAnimationActive: false, animationDuration: 0, dot: false, activeDot: false, connectNulls: false }
   // Moving averages propagate downstream (RPM -> power -> efficiency, RPM -> shift ratio). When an
   // upstream field is being averaged, a chart's own raw trace is redundant -- only the resulting
@@ -624,10 +646,13 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, onDragS
     return <Line type="monotone" dataKey={dataKey} stroke={color} {...avgLineProps} {...extra} />
   }
   const isRelationshipChart = config.id === 'scatter' || config.id === 'shiftEfficiency'
+  const relationshipX = config.id === 'scatter' ? hoveredPoint?.rpm2 : hoveredPoint?.[shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio']
+  const relationshipY = config.id === 'scatter' ? hoveredPoint?.rpm1 : hoveredPoint?.[efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency']
+  const relationshipCrosshair = <>{typeof relationshipX === 'number' && <ReferenceLine x={relationshipX} {...hoverCursorProps} />}{typeof relationshipY === 'number' && <ReferenceLine y={relationshipY} {...hoverCursorProps} />}</>
   const relationshipAxis = config.id === 'scatter'
-    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
-    : <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
-  const chart = <ResponsiveContainer width="100%" height="100%"><LineChart {...common} syncId={CHART_SYNC_ID}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{config.id === 'scatter' && <Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'shiftEfficiency' && <Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>
+    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey="rpm2" name="Secondary" tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}<Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
+    : <><CartesianGrid stroke="#e4dfd5" vertical={false} /><XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} />{relationshipCrosshair}<Tooltip contentStyle={{ border: '1px solid #ded8cc', borderRadius: 2, fontSize: 12, background: '#fffdf8' }} /></>
+  const chart = <ResponsiveContainer width="100%" height="100%"><LineChart {...common} onMouseMove={handleChartHover} onMouseLeave={handleChartLeave}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{config.id === 'scatter' && <Line type="monotone" dataKey="rpm1" stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} />}{config.id === 'shiftEfficiency' && <Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} stroke={config.color} strokeWidth={2} {...lineProps} dot={renderHoverDot(config.color)} />}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>
   const singleMaField: MaField | null = config.id === 'rpm1' || config.id === 'rpm2' || config.id === 'efficiency' || config.id === 'shiftRatio' ? config.id : null
   const maToggles = config.id === 'power'
     ? <div className="chart-ma-toggles"><label className="ma-toggle" style={{ color: '#f05d3b' }}><input type="checkbox" checked={maEnabled.power1} onChange={() => onToggleMa('power1')} />Primary MA</label><label className="ma-toggle" style={{ color: '#3c8f88' }}><input type="checkbox" checked={maEnabled.power2} onChange={() => onToggleMa('power2')} />Secondary MA</label></div>

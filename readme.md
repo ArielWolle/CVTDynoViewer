@@ -33,6 +33,16 @@ Command `0x04` controls firmware bench mode. Send `[0x04, 0x00, 0x00, 0x01]` to 
 
 Choose a directory in Chromium to save CSV files directly through the File System Access API. Browsers without that API use a normal CSV download. Torque scale and zero are editable because the firmware exposes torque counts rather than a documented physical unit.
 
+CSV columns are exported in SI units, with the unit encoded in the header name:
+
+```
+timestamp_s, primary_angular_velocity_rad_s, secondary_angular_velocity_rad_s,
+shift_position_percent, primary_torque_nm, secondary_torque_nm,
+primary_power_w, secondary_power_w, efficiency_percent
+```
+
+RPM is converted to rad/s, power to watts, and torque counts to newton-meters using the current torque scale/zero calibration. Loading a CSV back in (playback, below) detects the unit from each column name and converts it back automatically -- older exports (`timestamp_ms`, `primary_rpm`, `primary_power_kw`, raw torque counts) are still read correctly.
+
 ## Inertia mode
 
 Power mode defaults to **Inertia mode**, which estimates primary power from an editable RPM-vs-torque engine curve and secondary power from shaft acceleration. Use the **Inertia settings** dropdown in the control room to:

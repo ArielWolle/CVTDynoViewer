@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { csvEscape, decodePacket, deriveSample, encodeCommand, parseSamplesCsv, samplesToCsv } from './protocol'
+import { csvEscape, decodePacket, deriveSample, encodeCommand, parseSamplesCsv, radPerSecondToRpm, rpmToRadPerSecond, samplesToCsv } from './protocol'
 
 describe('firmware protocol', () => {
   it('decodes little-endian telemetry packets', () => {
@@ -17,9 +17,18 @@ describe('firmware protocol', () => {
     expect(sample.efficiency).toBeCloseTo(25)
   })
 
-  it('escapes CSV values and emits a stable header', () => {
+  it('escapes CSV values and emits an SI-unit header', () => {
     expect(csvEscape('pull, A')).toBe('"pull, A"')
-    expect(samplesToCsv([]).split('\n')[0]).toContain('primary_rpm')
+    const header = samplesToCsv([]).split('\n')[0]
+    expect(header).toContain('timestamp_s')
+    expect(header).toContain('primary_angular_velocity_rad_s')
+    expect(header).toContain('primary_torque_nm')
+    expect(header).toContain('primary_power_w')
+  })
+
+  it('converts between RPM and rad/s', () => {
+    expect(rpmToRadPerSecond(60)).toBeCloseTo(2 * Math.PI)
+    expect(radPerSecondToRpm(2 * Math.PI)).toBeCloseTo(60)
   })
 
   it('derives inertia-mode power from shaft acceleration and an engine torque curve', () => {
@@ -36,15 +45,24 @@ describe('firmware protocol', () => {
     expect(sample.power1).toBeGreaterThan(defaultSample.power1)
   })
 
-  it('parses a logged CSV back into telemetry samples for playback', () => {
+  it('round-trips samples through the SI-unit CSV format', () => {
+    const torqueScale = 0.01
+    const torqueOffset = 5
     const csv = samplesToCsv([
       { time: 0, rpm1: 1000, rpm2: 900, shift: 10, torq1: 50, torq2: 40, power1: 5, power2: 4, efficiency: 80 },
       { time: 100, rpm1: 1100, rpm2: 950, shift: 12, torq1: 55, torq2: 42, power1: 6, power2: 4.5, efficiency: 75 },
-    ])
-    const parsed = parseSamplesCsv(csv)
+    ], torqueScale, torqueOffset)
+    expect(csv).toContain('primary_torque_nm')
+    const parsed = parseSamplesCsv(csv, torqueScale, torqueOffset)
     expect(parsed).toHaveLength(2)
-    expect(parsed[0]).toMatchObject({ time: 0, rpm1: 1000, rpm2: 900 })
-    expect(parsed[1]).toMatchObject({ time: 100, rpm1: 1100, rpm2: 950 })
+    expect(parsed[0].time).toBeCloseTo(0, 1)
+    expect(parsed[0].rpm1).toBeCloseTo(1000, 1)
+    expect(parsed[0].rpm2).toBeCloseTo(900, 1)
+    expect(parsed[0].torq1).toBeCloseTo(50, 1)
+    expect(parsed[0].power1).toBeCloseTo(5, 2)
+    expect(parsed[1].time).toBeCloseTo(100, 1)
+    expect(parsed[1].rpm1).toBeCloseTo(1100, 1)
+    expect(parsed[1].rpm2).toBeCloseTo(950, 1)
   })
 
   it('returns an empty array for CSV text missing required columns', () => {
