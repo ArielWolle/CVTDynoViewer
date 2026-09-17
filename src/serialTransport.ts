@@ -1,7 +1,7 @@
-import { decodePacket, type ChannelId } from './protocol'
+import { decodePacket, TELEMETRY_PACKET_LEN, TELEMETRY_SYNC0, TELEMETRY_SYNC1, type ChannelId } from './protocol'
 
 export type SerialHandlers = {
-  onValue: (channel: ChannelId, value: number) => void
+  onValue: (channel: ChannelId, value: number, tUs: number, seq: number) => void
   onPacket?: (raw: Uint8Array, channel: ChannelId, value: number) => void
   onText: (text: string) => void
 }
@@ -61,35 +61,41 @@ export class SerialTransport {
     this.buffer = combined
     while (this.buffer.length > 0) {
       const header = this.findPacketHeader()
-      if (header < 0) {
+      if (!header) {
         const newline = this.buffer.lastIndexOf(0x0a)
         if (newline < 0) return
         this.emitText(this.buffer.slice(0, newline + 1))
         this.buffer = this.buffer.slice(newline + 1)
         continue
       }
-      if (header > 0) {
-        this.emitText(this.buffer.slice(0, header))
-        this.buffer = this.buffer.slice(header)
+      if (header.index > 0) {
+        this.emitText(this.buffer.slice(0, header.index))
+        this.buffer = this.buffer.slice(header.index)
       }
-      if (this.buffer.length < 8) return
-      const packet = decodePacket(this.buffer.slice(0, 8))
+      if (this.buffer.length < header.length) return
+      const packet = decodePacket(this.buffer.slice(0, header.length))
       if (packet) {
-        this.handlers.onPacket?.(this.buffer.slice(0, 8), packet.channel, packet.value)
-        this.handlers.onValue(packet.channel, packet.value)
-        this.buffer = this.buffer.slice(8)
+        this.handlers.onPacket?.(this.buffer.slice(0, header.length), packet.channel, packet.value)
+        this.handlers.onValue(packet.channel, packet.value, packet.tUs, packet.seq)
+        this.buffer = this.buffer.slice(header.length)
       } else {
+        // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop only the
+        // sync bytes and keep scanning, instead of discarding the whole tentative packet length,
+        // so a false-positive sync match can't swallow real data that follows it.
         this.emitText(this.buffer.slice(0, 1))
         this.buffer = this.buffer.slice(1)
       }
     }
   }
 
-  private findPacketHeader() {
+  private findPacketHeader(): { index: number; length: number } | null {
     for (let index = 0; index < this.buffer.length - 1; index += 1) {
-      if ((this.buffer[index] === 0xbb && this.buffer[index + 1] === 0xaa) || (this.buffer[index] === 0xaa && this.buffer[index + 1] === 0xbb)) return index
+      const first = this.buffer[index]
+      const second = this.buffer[index + 1]
+      if (first === TELEMETRY_SYNC0 && second === TELEMETRY_SYNC1) return { index, length: TELEMETRY_PACKET_LEN }
+      if ((first === 0xbb && second === 0xaa) || (first === 0xaa && second === 0xbb)) return { index, length: 8 }
     }
-    return -1
+    return null
   }
 
   private emitText(bytes: Uint8Array) {
