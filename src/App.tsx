@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
-import { channelNames, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type PowerMode, type TelemetrySample } from './protocol'
+import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
 import { SerialTransport } from './serialTransport'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { TimeRangeSlider } from './TimeRangeSlider'
@@ -104,6 +104,12 @@ function App() {
   const [playbackRangeStart, setPlaybackRangeStart] = useState(0)
   const [playbackRangeEnd, setPlaybackRangeEnd] = useState(1)
   const [samples, setSamples] = useState<TelemetrySample[]>([])
+  // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
+  // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
+  // detect gaps with). Surfaced because it's genuinely diagnostic: dropped packets are otherwise
+  // invisible (they were confirmed happening in practice -- periodic host-side read stalls
+  // overflowing the WebSerial receive buffer -- with no symptom other than gaps in the data).
+  const [droppedPackets, setDroppedPackets] = useState(0)
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
   const [chartPlaying, setChartPlaying] = useState(true)
   const [frozenDomainEnd, setFrozenDomainEnd] = useState<number | null>(null)
@@ -149,14 +155,47 @@ function App() {
   const logCommitTimer = useRef<number | undefined>(undefined)
   const logCommitInProgress = useRef(false)
   const pendingLogRows = useRef('')
-  const lastLoggedSampleTime = useRef<number | null>(null)
+  const lastLoggedDemoSampleTime = useRef<number | null>(null)
   const logFileName = useRef('')
+  // Lossless per-channel raw log (long format, one line per packet, no forward-fill/resampling) --
+  // kept alongside the wide CSV so a channel running much faster than the others in the future
+  // (e.g. high-rate torque) never loses samples just because the wide format has to resample.
+  const rawLogWriter = useRef<FileSystemWritableFileStream | null>(null)
+  const rawLogCommitTimer = useRef<number | undefined>(undefined)
+  const rawLogCommitInProgress = useRef(false)
+  const pendingRawLogRows = useRef('')
+  const rawLogFileName = useRef('')
   const consoleOutputRef = useRef<HTMLDivElement | null>(null)
   const consoleMessageId = useRef(0)
   const demoTimer = useRef<number | undefined>(undefined)
-  const telemetryTimer = useRef<number | undefined>(undefined)
-  const pendingRaw = useRef<RawValues>(emptyRaw)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  // --- Live event-driven capture (real serial hardware) -------------------------------------
+  // Each incoming packet is handled and logged immediately (full rate, independent of React
+  // rendering); only the on-screen chart data is throttled/decimated, via `displayBufferRef`
+  // below, so pushing samples at the firmware's real rate can't stall or be capped by rendering.
+  const liveStateRef = useRef<LiveDerivationState>(createLiveDerivationState())
+  // Maps firmware time_us_64() timestamps to wall-clock ms, fixed from the first packet after
+  // connecting, so every sample's time is firmware-accurate (not receive-time-jittered) while
+  // still being comparable to Date.now()-based UI elements.
+  const timeOffsetMsRef = useRef<number | null>(null)
+  const channelSeqRef = useRef<number[]>([-1, -1, -1, -1, -1])
+  const droppedPacketsRef = useRef(0)
+  const displayBufferRef = useRef<TelemetrySample[]>([])
+  const pendingConsoleLinesRef = useRef<string[]>([])
+
+  // Mirrors of settings that the live serial packet handler needs to read. The handler is
+  // captured once into the SerialTransport instance when `connect()` runs, so if it closed over
+  // component state directly it would keep using whatever those values were *at connect time*
+  // even after the user changes them mid-session. Refs updated on every change avoid that.
+  const torqueScaleRef = useRef(torqueScale)
+  const torqueOffsetRef = useRef(torqueOffset)
+  const powerModeRef = useRef(powerMode)
+  const inertiaKgM2Ref = useRef(inertiaKgM2)
+  const torqueCurveRef = useRef(torqueCurve)
+  const loggingRef = useRef(logging)
+  const isPlaybackActiveRef = useRef(false)
+  const showSensorConsoleRef = useRef(showSensorConsole)
 
   const current = samples[samples.length - 1] ?? deriveSample({ time: 0, ...raw }, torqueScale, torqueOffset, powerMode, undefined, inertiaKgM2, torqueCurve)
   const isPlaybackActive = playbackSamples.length > 0
@@ -257,6 +296,14 @@ function App() {
   useEffect(() => { localStorage.setItem('cvt-dyno-ma-window', String(maWindow)) }, [maWindow])
   useEffect(() => { localStorage.setItem('cvt-dyno-low-ratio', String(lowRatio)) }, [lowRatio])
   useEffect(() => { localStorage.setItem('cvt-dyno-high-ratio', String(highRatio)) }, [highRatio])
+  useEffect(() => { torqueScaleRef.current = torqueScale }, [torqueScale])
+  useEffect(() => { torqueOffsetRef.current = torqueOffset }, [torqueOffset])
+  useEffect(() => { powerModeRef.current = powerMode }, [powerMode])
+  useEffect(() => { inertiaKgM2Ref.current = inertiaKgM2 }, [inertiaKgM2])
+  useEffect(() => { torqueCurveRef.current = torqueCurve }, [torqueCurve])
+  useEffect(() => { loggingRef.current = logging }, [logging])
+  useEffect(() => { isPlaybackActiveRef.current = isPlaybackActive }, [isPlaybackActive])
+  useEffect(() => { showSensorConsoleRef.current = showSensorConsole }, [showSensorConsole])
   useEffect(() => {
     if (!playbackPlaying || !playbackSamples.length) return
     const timer = window.setInterval(() => { setPlaybackElapsedMs((elapsed) => Math.min(playbackEndBoundMs, elapsed + 100 * playbackSpeed)) }, 100)
@@ -274,14 +321,44 @@ function App() {
     if (playbackPlaying && playbackElapsedMs >= playbackEndBoundMs) setPlaybackPlaying(false)
   }, [derivedPlaybackSamples, playbackElapsedMs, playbackPlaying, playbackEndBoundMs])
   useEffect(() => {
-    if (!logging || !logWriter.current) return
-    const newSamples = samples.filter((sample) => lastLoggedSampleTime.current === null || sample.time > lastLoggedSampleTime.current)
+    // Live serial hardware logs directly at full rate from the packet handler (see `handleValue`)
+    // instead of here, since watching the (now decimated-for-display) `samples` state would both
+    // cap logged resolution to the display rate and double-log against the packet handler's own
+    // writes. This path stays in service only for demo-mode sample logging, which has no discrete
+    // per-channel packets to hook into.
+    if (!logging || !logWriter.current || connected) return
+    const newSamples = samples.filter((sample) => lastLoggedDemoSampleTime.current === null || sample.time > lastLoggedDemoSampleTime.current)
     if (!newSamples.length) return
     const rows = newSamples.map((sample) => sampleToCsvRow(sample, torqueScale, torqueOffset)).join('\n') + '\n'
-    lastLoggedSampleTime.current = newSamples[newSamples.length - 1].time
+    lastLoggedDemoSampleTime.current = newSamples[newSamples.length - 1].time
     pendingLogRows.current += rows
     if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
-  }, [logging, samples])
+  }, [logging, samples, connected])
+  useEffect(() => {
+    // Live serial display/console throttle: real packets arrive (and are logged) at full rate in
+    // `handleValue`, independent of rendering. This interval instead periodically drains a small
+    // buffer into React state at a fixed, render-friendly cadence -- charts get a smooth but
+    // decimated view, and the sensor console gets batched updates instead of one re-render per
+    // packet, so neither can be starved by (or itself cause) a render backlog.
+    if (!connected) return
+    const flush = () => {
+      const buffered = displayBufferRef.current
+      if (buffered.length) {
+        displayBufferRef.current = []
+        const latest = buffered[buffered.length - 1]
+        setSamples((history) => retainRecentSamples(history, latest))
+        setRaw({ rpm1: latest.rpm1, rpm2: latest.rpm2, shift: latest.shift, torq1: latest.torq1, torq2: latest.torq2 })
+      }
+      const consoleLinesToFlush = pendingConsoleLinesRef.current
+      if (consoleLinesToFlush.length) {
+        pendingConsoleLinesRef.current = []
+        appendConsoleLines(consoleLinesToFlush)
+      }
+      setDroppedPackets(droppedPacketsRef.current)
+    }
+    const timer = window.setInterval(flush, 33) // ~30 Hz display refresh
+    return () => { window.clearInterval(timer); flush() }
+  }, [connected])
   useEffect(() => {
     if (autoScrollConsole && consoleOutputRef.current) consoleOutputRef.current.scrollTop = 0
   }, [autoScrollConsole, consoleLines])
@@ -297,12 +374,18 @@ function App() {
     }, 100)
     return () => window.clearInterval(demoTimer.current)
   }, [demoMode, connected, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve, isPlaybackActive])
-  useEffect(() => () => { window.clearTimeout(telemetryTimer.current); window.clearTimeout(logCommitTimer.current); void commitLog(false); void transport.current?.disconnect() }, [])
+  useEffect(() => () => { window.clearTimeout(logCommitTimer.current); window.clearTimeout(rawLogCommitTimer.current); void commitLog(false); void commitRawLog(false); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
       const next = new SerialTransport({ onValue: handleValue, onPacket: handleSerialPacket, onText: handleSerialText })
-      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); pendingRaw.current = emptyRaw; setPlaybackSamples([]); setPlaybackPlaying(false); setPlaybackFileName(''); setPlaybackElapsedMs(0); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
+      liveStateRef.current = createLiveDerivationState()
+      timeOffsetMsRef.current = null
+      channelSeqRef.current = [-1, -1, -1, -1, -1]
+      droppedPacketsRef.current = 0
+      displayBufferRef.current = []
+      pendingConsoleLinesRef.current = []
+      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); setPlaybackSamples([]); setPlaybackPlaying(false); setPlaybackFileName(''); setPlaybackElapsedMs(0); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to serial device') }
   }
   async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setNotice('Device disconnected') }
@@ -395,7 +478,13 @@ function App() {
     setNotice(text)
   }
   function handleSerialPacket(rawPacket: Uint8Array, channel: ChannelId, value: number) {
-    appendConsoleLines([`[RAW SENSOR] ${bytesToHex(rawPacket)} | [DECODED] ${channelNames[channel]} = ${value}`])
+    // Skip formatting/buffering entirely when the sensor console view is off -- at real telemetry
+    // rates (up to 50 Hz now, potentially much higher per-channel later) doing this unconditionally
+    // for every single packet would itself become a rendering bottleneck. When it is on, lines are
+    // buffered and flushed in a batch (see the display-throttle effect) rather than one React
+    // state update per packet.
+    if (!showSensorConsoleRef.current) return
+    pendingConsoleLinesRef.current.push(`[RAW SENSOR] ${bytesToHex(rawPacket)} | [DECODED] ${channelNames[channel]} = ${value}`)
   }
   function bytesToHex(bytes: Uint8Array) { return [...bytes].map((byte) => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ') }
   async function sendRawCommand(bytes: Uint8Array, description = 'Custom command') {
@@ -443,21 +532,51 @@ function App() {
       setNotice(enabled ? 'RPM count test enabled' : 'RPM count test disabled')
     } catch { setNotice('Could not change RPM count test mode') }
   }
-  function handleValue(channel: ChannelId, value: number) {
-    if (isPlaybackActive) return
-    const key = (['rpm1', 'rpm2', 'shift', 'torq1', 'torq2'] as const)[channel]
-    pendingRaw.current = { ...pendingRaw.current, [key]: value }
-    if (telemetryTimer.current !== undefined) return
-    telemetryTimer.current = window.setTimeout(() => {
-      telemetryTimer.current = undefined
-      const next = pendingRaw.current
-      setSamples((history) => {
-        const previous = history[history.length - 1] ?? undefined
-        const sample = deriveSample({ time: performance.timeOrigin + performance.now(), ...next }, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
-        return retainRecentSamples(history, sample)
-      })
-      setRaw(next)
-    }, 50)
+  // Event-driven: fires on every decoded packet from any channel, at whatever rate the firmware
+  // is configured to send it -- there is no coalescing timer here (the old 50 ms one hard-capped
+  // the whole pipeline at 20 Hz regardless of firmware rate, and was the primary reason 50 Hz RPM
+  // never actually showed up in captured data). A wide sample row is produced immediately with
+  // the other channels' latest known values forward-filled in, logged at full rate, and buffered
+  // for the throttled display path -- none of that work is gated on or blocked by rendering.
+  function handleValue(channel: ChannelId, value: number, tUs: number, seq: number) {
+    if (isPlaybackActiveRef.current) return
+    const receivedAtMs = performance.timeOrigin + performance.now()
+
+    // Map firmware time_us_64() to wall-clock ms once, from the first packet after connecting.
+    // Packets from firmware built before this protocol update report tUs === 0; fall back to
+    // receive time for those instead of mapping through a bogus zero offset.
+    let sampleTimeMs = receivedAtMs
+    if (tUs > 0) {
+      if (timeOffsetMsRef.current === null) timeOffsetMsRef.current = receivedAtMs - tUs / 1000
+      sampleTimeMs = timeOffsetMsRef.current + tUs / 1000
+    }
+
+    // Per-channel rolling sequence number (0..255, wraps) lets dropped packets be detected and
+    // surfaced instead of silently vanishing.
+    const expectedSeq = channelSeqRef.current[channel]
+    if (tUs > 0 && expectedSeq !== -1) {
+      const missed = (seq - expectedSeq - 1) & 0xff
+      if (missed > 0) droppedPacketsRef.current += missed
+    }
+    channelSeqRef.current[channel] = seq
+
+    const sample = applyChannelUpdate(
+      liveStateRef.current, channel, value, sampleTimeMs,
+      torqueScaleRef.current, torqueOffsetRef.current, powerModeRef.current, inertiaKgM2Ref.current, torqueCurveRef.current,
+    )
+
+    displayBufferRef.current.push(sample)
+
+    if (loggingRef.current) {
+      if (logWriter.current) {
+        pendingLogRows.current += sampleToCsvRow(sample, torqueScaleRef.current, torqueOffsetRef.current) + '\n'
+        if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
+      }
+      if (rawLogWriter.current) {
+        pendingRawLogRows.current += rawLogRow(channel, value, tUs, sampleTimeMs, seq) + '\n'
+        if (rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, 500)
+      }
+    }
   }
   async function sendConfig(channel: number, enabled: boolean, frequency: number) { if (transport.current) { await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0)); await transport.current.send(encodeCommand(2, channel, frequency)) } }
   function updateChannel(channel: number, enabled: boolean) { setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value)); void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration')) }
@@ -525,6 +644,29 @@ function App() {
       if (reopen && pendingLogRows.current && logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
     }
   }
+  async function openRawLogWriter(directory: FileSystemDirectoryHandle, name: string) {
+    const file = await directory.getFileHandle(name, { create: true })
+    const writer = await file.createWritable({ keepExistingData: true })
+    await writer.seek((await file.getFile()).size)
+    rawLogWriter.current = writer
+  }
+  async function commitRawLog(reopen: boolean) {
+    if (rawLogCommitInProgress.current || !rawLogWriter.current || !pendingRawLogRows.current) return
+    rawLogCommitInProgress.current = true
+    const rows = pendingRawLogRows.current
+    pendingRawLogRows.current = ''
+    const writer = rawLogWriter.current
+    try {
+      await writer.write(rows)
+      await writer.close()
+      rawLogWriter.current = null
+      if (reopen && directoryHandle.current) await openRawLogWriter(directoryHandle.current, rawLogFileName.current)
+    } catch { setNotice('Could not commit the raw log file') }
+    finally {
+      rawLogCommitInProgress.current = false
+      if (reopen && pendingRawLogRows.current && rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, 500)
+    }
+  }
   async function startLogging() {
     const directory = directoryHandle.current ?? await chooseDirectory()
     if (!directory) return
@@ -536,22 +678,39 @@ function App() {
       await writer.close()
       logWriter.current = writer
       logFileName.current = name
-      lastLoggedSampleTime.current = samples[samples.length - 1]?.time ?? null
+      lastLoggedDemoSampleTime.current = samples[samples.length - 1]?.time ?? null
       await openLogWriter(directory, name)
+
+      // Lossless raw per-channel log alongside the wide CSV -- see `rawLogHeader`'s comment.
+      const rawName = name.replace(/\.csv$/i, '-raw.csv')
+      const rawFile = await directory.getFileHandle(rawName, { create: true })
+      const rawWriter = await rawFile.createWritable()
+      await rawWriter.write(`${rawLogHeader}\n`)
+      await rawWriter.close()
+      rawLogFileName.current = rawName
+      await openRawLogWriter(directory, rawName)
+
       setLogging(true)
-      setNotice(`Writing ${name}`)
+      setNotice(`Writing ${name} (+ ${rawName})`)
     } catch { setNotice('Could not open a log file in that folder') }
   }
   async function stopLogging() {
     setLogging(false)
     window.clearTimeout(logCommitTimer.current)
     logCommitTimer.current = undefined
+    window.clearTimeout(rawLogCommitTimer.current)
+    rawLogCommitTimer.current = undefined
     if (logWriter.current) {
       await commitLog(false)
       await logWriter.current?.close().catch(() => undefined)
       logWriter.current = null
-      setNotice(`Closed ${logFileName.current}`)
     }
+    if (rawLogWriter.current) {
+      await commitRawLog(false)
+      await rawLogWriter.current?.close().catch(() => undefined)
+      rawLogWriter.current = null
+    }
+    setNotice(`Closed ${logFileName.current}`)
   }
   async function loadPlaybackFile(file: File) {
     try {
@@ -634,6 +793,7 @@ function App() {
       highRatio={highRatio}
       onLowRatioChange={setLowRatio}
       onHighRatioChange={setHighRatio}
+      droppedPackets={droppedPackets}
     />
     <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
@@ -646,7 +806,7 @@ function App() {
  * hover would re-render the whole app (topbar, console, control deck, playback bar, etc.), not
  * just the charts, which is visibly laggy. Keeping it here means only this subtree re-renders.
  */
-function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void }) {
+function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number }) {
   // The time-range-slider selection lives here (not in App) so dragging it only re-renders this
   // subtree. The expensive per-field moving-average computation already happened in App over the
   // full `data`; windowing it down to the selected range here is a cheap filter, not a recompute.
@@ -687,7 +847,7 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const hoveredPoint = useMemo(() => (hoverTime !== null ? chartData.find((point) => point.time === hoverTime) : undefined), [chartData, hoverTime])
 
   return <>
-    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span><button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
+    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the serial transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>
