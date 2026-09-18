@@ -545,17 +545,19 @@ function App() {
     }
     // RPM wheel teeth/spoke counts are no longer read from the firmware at all -- they're a
     // purely local display setting now (see the primarySpokes/secondarySpokes state comment).
-    // Firmware also includes a per-channel dropped-edge count now (see RpmCounter::popEdge()'s
-    // ring buffer) -- surfaced in the notice for visibility, though not wired into its own UI
-    // state beyond that.
-    const rpmCountMatch = text.match(/^RPM COUNT TEST \| RPM1 count=(\d+) dropped=(\d+) \| RPM2 count=(\d+) dropped=(\d+)$/i)
+    // Firmware also includes per-channel dropped-edge and rejected-noise counts now (see
+    // RpmCounter::popEdge()'s ring buffer and MIN_VALID_PERIOD_US respectively) -- surfaced in the
+    // notice for visibility, though not wired into their own UI state beyond that.
+    const rpmCountMatch = text.match(/^RPM COUNT TEST \| RPM1 count=(\d+) dropped=(\d+) rejected=(\d+) \| RPM2 count=(\d+) dropped=(\d+) rejected=(\d+)$/i)
     if (rpmCountMatch) {
       const rpm1Count = Number(rpmCountMatch[1])
       const rpm1Dropped = Number(rpmCountMatch[2])
-      const rpm2Count = Number(rpmCountMatch[3])
-      const rpm2Dropped = Number(rpmCountMatch[4])
+      const rpm1Rejected = Number(rpmCountMatch[3])
+      const rpm2Count = Number(rpmCountMatch[4])
+      const rpm2Dropped = Number(rpmCountMatch[5])
+      const rpm2Rejected = Number(rpmCountMatch[6])
       setRpmCountStates([rpm1Count, rpm2Count])
-      setNotice(`RPM counts: RPM1=${rpm1Count} (dropped ${rpm1Dropped}), RPM2=${rpm2Count} (dropped ${rpm2Dropped})`)
+      setNotice(`RPM counts: RPM1=${rpm1Count} (dropped ${rpm1Dropped}, rejected ${rpm1Rejected}), RPM2=${rpm2Count} (dropped ${rpm2Dropped}, rejected ${rpm2Rejected})`)
       return
     }
     // RPM channels (0/1) print a different tail now -- "Edge-triggered (...)" instead of "Target
