@@ -123,6 +123,18 @@ export function periodUsToRpm(periodUs: number, teethPerRevolution: number): num
 // Transport: the firmware exposes a WebUSB vendor-class interface (see usbTransport.ts), not a
 // virtual COM port -- there is no baud rate, and Windows binds it to WinUSB automatically via the
 // WebUSB descriptor's MS OS 2.0 registry property, with no separate driver install needed.
+//
+// Firmware/viewer version check: the firmware reports "Firmware git: <sha>" and "Protocol
+// version: <n>" in its command-0x03 config dump (sent automatically right after every connect --
+// see connect() in App.tsx). EXPECTED_PROTOCOL_VERSION here must match PROTOCOL_VERSION in the
+// firmware's main.cpp exactly; App.tsx warns loudly on a mismatch rather than silently
+// misbehaving. Bump this (and the firmware's constant, together, in the same change) whenever a
+// change alters wire-level semantics the viewer must know about -- e.g. the change that made RPM's
+// `value === 0` mean "stopped" instead of "first edge, nothing to diff against yet" (see the
+// comment on channels 0-1 above) is exactly the kind of change this exists to catch immediately
+// instead of it taking a live debugging session to track down, as happened once before this
+// existed.
+export const EXPECTED_PROTOCOL_VERSION = 1
 export const TELEMETRY_SYNC0 = 0xaa
 export const TELEMETRY_SYNC1 = 0x55
 export const TELEMETRY_PACKET_LEN = 17

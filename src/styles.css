@@ -55,3 +55,5 @@ button { cursor: pointer; }
 .ratio-input input { width: 44px; border: 1px solid var(--line); border-radius: 2px; padding: 3px 5px; background: var(--paper); color: var(--ink); font: 10px 'DM Mono', monospace; }
 .ma-toggle { display: flex; align-items: center; gap: 4px; font: 500 9px 'DM Mono', monospace; color: #67655e; white-space: nowrap; cursor: pointer; }
 .ma-toggle input { margin: 0; cursor: pointer; }
+.protocol-mismatch-banner { margin: 14px 0 0; padding: 14px 18px; color: #7a1f1f; background: #fbe4e2; border: 1px solid #e7a6a0; border-radius: 2px; font-size: 13px; line-height: 1.5; }
+.protocol-mismatch-banner strong { display: inline-block; margin-right: 4px; }

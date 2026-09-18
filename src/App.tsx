@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceArea, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
-import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, periodUsToRpm, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
+import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, EXPECTED_PROTOCOL_VERSION, parseSamplesCsv, periodUsToRpm, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
 import { UsbTransport } from './usbTransport'
 import { downsampleForChart } from './downsample'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
@@ -92,6 +92,14 @@ function App() {
   const [connected, setConnected] = useState(false)
   const [demoMode, setDemoMode] = useState(false)
   const [firmwareDemoMode, setFirmwareDemoMode] = useState(false)
+  // Populated from the firmware's "Firmware git: <sha>" / "Protocol version: <n>" lines in its
+  // command-0x03 config dump, sent automatically right after every connect (see connect() below).
+  // firmwareProtocolVersion !== null && !== EXPECTED_PROTOCOL_VERSION means the connected firmware
+  // predates (or postdates, in a breaking way) what this viewer was built against -- see
+  // EXPECTED_PROTOCOL_VERSION's comment in protocol.ts for why this exists and what it's meant to
+  // catch immediately instead of silently misbehaving.
+  const [firmwareGitSha, setFirmwareGitSha] = useState<string | null>(null)
+  const [firmwareProtocolVersion, setFirmwareProtocolVersion] = useState<number | null>(null)
   const [powerMode, setPowerMode] = useState<PowerMode>('inertia')
   const [inertiaKgM2, setInertiaKgM2] = useState(0.3134)
   const [torqueCurve, setTorqueCurve] = useState<EngineTorquePoint[]>(() => {
@@ -210,7 +218,7 @@ function App() {
 
   // --- Live event-driven capture (real USB hardware) -------------------------------------
   // Each incoming packet is handled and logged immediately (full rate, independent of React
-  // rendering); only the on-screen chart data is throttled/decimated, via `displayBufferRef`
+  // rendering); only the on-screen chart data is throttled/decimated, via `latestSampleRef`
   // below, so pushing samples at the firmware's real rate can't stall or be capped by rendering.
   const liveStateRef = useRef<LiveDerivationState>(createLiveDerivationState())
   // Maps firmware time_us_64() timestamps to wall-clock ms, fixed from the first packet after
@@ -219,7 +227,13 @@ function App() {
   const timeOffsetMsRef = useRef<number | null>(null)
   const channelSeqRef = useRef<number[]>([-1, -1, -1, -1, -1])
   const droppedPacketsRef = useRef(0)
-  const displayBufferRef = useRef<TelemetrySample[]>([])
+  // Only the most recently derived sample matters for the throttled display flush below (it reads
+  // the LATEST value every tick, discarding everything else) -- tracked as a single ref instead of
+  // an array that gets pushed to on every packet and thrown away every ~33ms. At high edge rates
+  // (per-tooth RPM streaming, up to ~1-2 kHz per channel) that used to mean building and discarding
+  // an array of hundreds-to-thousands of entries per flush tick for nothing; a direct overwrite is
+  // O(1) regardless of packet rate, removing that entirely from the hot path.
+  const latestSampleRef = useRef<TelemetrySample | null>(null)
   const pendingConsoleLinesRef = useRef<string[]>([])
 
   // Mirrors of settings that the live USB packet handler needs to read. The handler is
@@ -239,6 +253,11 @@ function App() {
 
   const current = samples[samples.length - 1] ?? deriveSample({ time: 0, ...raw }, torqueScale, torqueOffset, powerMode, undefined, inertiaKgM2, torqueCurve)
   const isPlaybackActive = playbackSamples.length > 0
+  // See EXPECTED_PROTOCOL_VERSION's comment in protocol.ts. Only meaningful once connected and the
+  // firmware has actually reported a version (older firmware -- from before this existed -- simply
+  // never sends the line at all, leaving firmwareProtocolVersion null forever; that's a real gap
+  // this can't detect, but is far less likely once every firmware build reports itself).
+  const protocolMismatch = connected && firmwareProtocolVersion !== null && firmwareProtocolVersion !== EXPECTED_PROTOCOL_VERSION
   // Recompute power/efficiency from the CSV's raw RPM/torque columns using the current power
   // mode, torque conversion, inertia value, and torque curve, so playback reflects live edits
   // to those settings instead of only replaying whatever was recorded at log time.
@@ -387,10 +406,9 @@ function App() {
     // packet, so neither can be starved by (or itself cause) a render backlog.
     if (!connected) return
     const flush = () => {
-      const buffered = displayBufferRef.current
-      if (buffered.length) {
-        displayBufferRef.current = []
-        const latest = buffered[buffered.length - 1]
+      const latest = latestSampleRef.current
+      if (latest) {
+        latestSampleRef.current = null
         setSamples((history) => retainRecentSamples(history, latest))
         setRaw({ rpm1: latest.rpm1, rpm2: latest.rpm2, shift: latest.shift, torq1: latest.torq1, torq2: latest.torq2 })
       }
@@ -428,12 +446,17 @@ function App() {
       timeOffsetMsRef.current = null
       channelSeqRef.current = [-1, -1, -1, -1, -1]
       droppedPacketsRef.current = 0
-      displayBufferRef.current = []
+      latestSampleRef.current = null
       pendingConsoleLinesRef.current = []
+      // Cleared on every fresh connect (not just at app startup) so stale info from a previously
+      // connected device -- or a firmware that hadn't been reflashed with this feature yet -- can
+      // never be mistaken for the currently connected device's actual identity.
+      setFirmwareGitSha(null)
+      setFirmwareProtocolVersion(null)
       await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); setPlaybackSamples([]); setPlaybackPlaying(false); setPlaybackFileName(''); setPlaybackElapsedMs(0); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to USB device') }
   }
-  async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setNotice('Device disconnected') }
+  async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setFirmwareGitSha(null); setFirmwareProtocolVersion(null); setNotice('Device disconnected') }
   function consoleTimestamp() {
     const now = new Date()
     return `${now.toLocaleTimeString([], { hour12: false })}.${String(now.getMilliseconds()).padStart(3, '0')}`
@@ -453,12 +476,39 @@ function App() {
     return 'TEXT'
   }
   function appendConsoleLines(linesToAdd: string[]) {
-    const messages = linesToAdd.map((line) => { const time = consoleTimestamp(); return { id: consoleMessageId.current++, time, type: consoleTypeFor(line), data: line } })
+    // Only the trailing MAX_CONSOLE_MESSAGES lines can ever survive the slice()s below anyway, so
+    // anything before that is dropped up front -- at a high packet rate (per-tooth RPM streaming
+    // with the sensor console open) a single ~33ms flush batch could otherwise contain thousands
+    // of buffered lines, each needlessly getting a real Date()/toLocaleTimeString() call and a
+    // classification pass before being thrown away regardless.
+    const relevant = linesToAdd.length > MAX_CONSOLE_MESSAGES ? linesToAdd.slice(-MAX_CONSOLE_MESSAGES) : linesToAdd
+    // One timestamp for the whole batch rather than one real Date() call per line -- they all
+    // arrived within the same flush tick anyway (this is receive time, not firmware capture time,
+    // so per-line precision here was never meaningful), and at burst sizes this removes what would
+    // otherwise be hundreds-to-thousands of redundant Date()/formatting calls per flush.
+    const time = consoleTimestamp()
+    const messages = relevant.map((line) => ({ id: consoleMessageId.current++, time, type: consoleTypeFor(line), data: line }))
     setConsoleMessages((messagesSoFar) => [...messagesSoFar, ...messages].slice(-MAX_CONSOLE_MESSAGES))
     setConsoleLines((lines) => [...lines, ...messages.map((message) => `${message.time} ${message.data}`)].slice(-MAX_CONSOLE_MESSAGES))
   }
   function handleUsbText(text: string) {
     appendConsoleLines([`[RAW TEXT] ${text}`])
+    // Sent as the first two lines of every command-0x03 config dump (see connect() below) --
+    // see EXPECTED_PROTOCOL_VERSION's comment in protocol.ts for why this exists.
+    const firmwareGitMatch = text.match(/^Firmware git:\s*(\S+)$/i)
+    if (firmwareGitMatch) {
+      setFirmwareGitSha(firmwareGitMatch[1])
+      return
+    }
+    const protocolVersionMatch = text.match(/^Protocol version:\s*(\d+)$/i)
+    if (protocolVersionMatch) {
+      const version = Number(protocolVersionMatch[1])
+      setFirmwareProtocolVersion(version)
+      if (version !== EXPECTED_PROTOCOL_VERSION) {
+        setNotice(`Firmware/viewer protocol mismatch: device reports v${version}, this viewer expects v${EXPECTED_PROTOCOL_VERSION}. Reflash the firmware (or update the viewer) before trusting any data.`)
+      }
+      return
+    }
     const rpmTestMatch = text.match(/^RPM TEST \| PIN_RPM1=(HIGH|LOW) edges=(\d+) \| PIN_RPM2=(HIGH|LOW) edges=(\d+)$/i)
     if (rpmTestMatch) {
       setRpmPinStates([rpmTestMatch[1].toUpperCase() === 'HIGH', rpmTestMatch[3].toUpperCase() === 'HIGH'])
@@ -535,6 +585,12 @@ function App() {
     // buffered and flushed in a batch (see the display-throttle effect) rather than one React
     // state update per packet.
     if (!showSensorConsoleRef.current) return
+    // Bounded so a high-rate burst (per-tooth RPM streaming with the console open) can't build up
+    // an ever-growing backlog of formatted lines between ~33ms flushes -- only the trailing
+    // MAX_CONSOLE_MESSAGES can ever be shown anyway (see appendConsoleLines()), so skip the
+    // hex/decode formatting work below entirely once already at that cap rather than doing it just
+    // to throw the result away at flush time.
+    if (pendingConsoleLinesRef.current.length >= MAX_CONSOLE_MESSAGES) return
     // RPM channels carry a raw period_us on the wire, not RPM (see protocol.ts) -- show both the
     // raw value and the translated RPM (using this app's own tooth-count setting) so the console
     // is actually readable at a glance instead of just a period figure. seq is labeled explicitly
@@ -650,7 +706,7 @@ function App() {
       primarySpokesRef.current, secondarySpokesRef.current,
     )
 
-    displayBufferRef.current.push(sample)
+    latestSampleRef.current = sample
 
     if (loggingRef.current && logWriter.current) {
       pendingLogRows.current += sampleToCsvRow(sample, torqueScaleRef.current, torqueOffsetRef.current) + '\n'
@@ -854,7 +910,11 @@ function App() {
   }
   function toggleMa(field: MaField) { setMaEnabled((previous) => ({ ...previous, [field]: !previous[field] })) }
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span>{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
+    {protocolMismatch && <section className="protocol-mismatch-banner" role="alert">
+      <strong>Firmware/viewer protocol mismatch.</strong> Connected device reports protocol v{firmwareProtocolVersion}{firmwareGitSha ? ` (build ${firmwareGitSha})` : ''}, this viewer expects v{EXPECTED_PROTOCOL_VERSION}.
+      Data may be misinterpreted -- reflash the firmware from the latest build, or use a matching viewer version, before trusting anything shown below.
+    </section>}
     {consoleOpen && <UsbConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
     <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 2)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
         <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${logFileName.current}` : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
@@ -1197,11 +1257,20 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body" ref={chartBodyRef} onMouseMove={handlePlotMouseMove} onMouseLeave={handlePlotMouseLeave}>{chart}<div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />{isRelationshipChart && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
 }
 
+// Hoisted to module scope (rather than declared inside UsbConsolePanel, where it's also used) so
+// it's available to the useState lazy initializers below, which run before any in-component
+// `const` declarations further down the function body would be reachable.
+const CONSOLE_TYPES: ConsoleType[] = ['RPM1', 'RPM2', 'SHIFT', 'TORQ1', 'TORQ2', 'READ CONFIG', 'RPM TEST', 'RPM COUNT TEST', 'TEXT', 'TX']
+
 function UsbConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {
   const [sortBy, setSortBy] = useState<ConsoleSort>('time')
   const [sortAscending, setSortAscending] = useState(false)
-  const [globalStackByType, setGlobalStackByType] = useState(false)
-  const [stackedTypes, setStackedTypes] = useState<Partial<Record<ConsoleType, boolean>>>({})
+  // Defaults to ON (not persisted -- resets to on every load/reopen) so the console shows only the
+  // latest message per type from the moment it's opened, rather than an unbounded, fast-scrolling
+  // list -- especially important at high packet rates (per-tooth RPM streaming) where "one row per
+  // packet" would otherwise mean thousands of rows accumulating almost instantly.
+  const [globalStackByType, setGlobalStackByType] = useState(true)
+  const [stackedTypes, setStackedTypes] = useState<Partial<Record<ConsoleType, boolean>>>(() => Object.fromEntries(CONSOLE_TYPES.map((type) => [type, true])))
   const visibleMessages = showSensorData ? messages : messages.filter((message) => !['RPM1', 'RPM2', 'SHIFT', 'TORQ1', 'TORQ2'].includes(message.type))
   const stackedMessages = Object.entries(stackedTypes).reduce((current, [type, enabled]) => {
     if (!enabled) return current
@@ -1213,7 +1282,7 @@ function UsbConsolePanel({ messages, showSensorData, autoScroll, customCommand, 
     const comparison = sortBy === 'time' ? left.id - right.id : sortBy === 'type' ? left.type.localeCompare(right.type) : left.data.localeCompare(right.data)
     return (sortAscending ? 1 : -1) * comparison
   })
-  const types: ConsoleType[] = ['RPM1', 'RPM2', 'SHIFT', 'TORQ1', 'TORQ2', 'READ CONFIG', 'RPM TEST', 'RPM COUNT TEST', 'TEXT', 'TX']
+  const types = CONSOLE_TYPES
   function changeSort(next: ConsoleSort) { if (sortBy === next) setSortAscending((value) => !value); else { setSortBy(next); setSortAscending(next !== 'time') } }
   function toggleGlobalStackByType() {
     setGlobalStackByType((current) => !current)
