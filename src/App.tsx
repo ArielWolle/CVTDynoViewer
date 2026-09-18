@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceArea, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
 import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
-import { SerialTransport } from './serialTransport'
+import { UsbTransport } from './usbTransport'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { TimeRangeSlider } from './TimeRangeSlider'
 
@@ -105,8 +105,18 @@ function App() {
   const [torqueOffset, setTorqueOffset] = useState(0)
   const [channels, setChannels] = useState([true, true, true, true, true])
   const [frequencies, setFrequencies] = useState([20, 20, 10, 50, 50])
-  const [primarySpokes, setPrimarySpokes] = useState(16)
-  const [secondarySpokes, setSecondarySpokes] = useState(12)
+  // RPM tooth/spoke counts are a purely local display setting now -- the firmware streams a raw
+  // per-tooth period for channels 0/1 and has no concept of tooth count at all anymore (see
+  // periodUsToRpm() in protocol.ts), so these persist to localStorage like the other display
+  // settings below instead of being read from / sent to the firmware.
+  const [primarySpokes, setPrimarySpokes] = useState(() => {
+    const stored = Number(localStorage.getItem('cvt-dyno-primary-teeth'))
+    return Number.isFinite(stored) && stored >= 1 ? stored : 16
+  })
+  const [secondarySpokes, setSecondarySpokes] = useState(() => {
+    const stored = Number(localStorage.getItem('cvt-dyno-secondary-teeth'))
+    return Number.isFinite(stored) && stored >= 1 ? stored : 12
+  })
   const [playbackSamples, setPlaybackSamples] = useState<TelemetrySample[]>([])
   const [playbackFileName, setPlaybackFileName] = useState('')
   const [playbackElapsedMs, setPlaybackElapsedMs] = useState(0)
@@ -118,8 +128,8 @@ function App() {
   // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
   // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
   // detect gaps with). Surfaced because it's genuinely diagnostic: dropped packets are otherwise
-  // invisible (they were confirmed happening in practice -- periodic host-side read stalls
-  // overflowing the WebSerial receive buffer -- with no symptom other than gaps in the data).
+  // invisible (a real host-side read stall, or the firmware's own ring buffer overflowing on an
+  // undrained RPM channel, would otherwise show no symptom other than gaps in the data).
   const [droppedPackets, setDroppedPackets] = useState(0)
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
   const [chartPlaying, setChartPlaying] = useState(true)
@@ -164,7 +174,7 @@ function App() {
   const [highlightFullThrottle, setHighlightFullThrottle] = useState(() => localStorage.getItem('cvt-dyno-highlight-full-throttle') !== 'false')
   const [notice, setNotice] = useState('Demo telemetry is flowing')
   const [directoryName, setDirectoryName] = useState('Browser download')
-  const transport = useRef<SerialTransport | null>(null)
+  const transport = useRef<UsbTransport | null>(null)
   const directoryHandle = useRef<FileSystemDirectoryHandle | null>(null)
   const logWriter = useRef<FileSystemWritableFileStream | null>(null)
   const logCommitTimer = useRef<number | undefined>(undefined)
@@ -185,7 +195,7 @@ function App() {
   const demoTimer = useRef<number | undefined>(undefined)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  // --- Live event-driven capture (real serial hardware) -------------------------------------
+  // --- Live event-driven capture (real USB hardware) -------------------------------------
   // Each incoming packet is handled and logged immediately (full rate, independent of React
   // rendering); only the on-screen chart data is throttled/decimated, via `displayBufferRef`
   // below, so pushing samples at the firmware's real rate can't stall or be capped by rendering.
@@ -199,8 +209,8 @@ function App() {
   const displayBufferRef = useRef<TelemetrySample[]>([])
   const pendingConsoleLinesRef = useRef<string[]>([])
 
-  // Mirrors of settings that the live serial packet handler needs to read. The handler is
-  // captured once into the SerialTransport instance when `connect()` runs, so if it closed over
+  // Mirrors of settings that the live USB packet handler needs to read. The handler is
+  // captured once into the UsbTransport instance when `connect()` runs, so if it closed over
   // component state directly it would keep using whatever those values were *at connect time*
   // even after the user changes them mid-session. Refs updated on every change avoid that.
   const torqueScaleRef = useRef(torqueScale)
@@ -208,6 +218,8 @@ function App() {
   const powerModeRef = useRef(powerMode)
   const inertiaKgM2Ref = useRef(inertiaKgM2)
   const torqueCurveRef = useRef(torqueCurve)
+  const primarySpokesRef = useRef(primarySpokes)
+  const secondarySpokesRef = useRef(secondarySpokes)
   const loggingRef = useRef(logging)
   const isPlaybackActiveRef = useRef(false)
   const showSensorConsoleRef = useRef(showSensorConsole)
@@ -312,11 +324,15 @@ function App() {
   useEffect(() => { localStorage.setItem('cvt-dyno-low-ratio', String(lowRatio)) }, [lowRatio])
   useEffect(() => { localStorage.setItem('cvt-dyno-high-ratio', String(highRatio)) }, [highRatio])
   useEffect(() => { localStorage.setItem('cvt-dyno-highlight-full-throttle', String(highlightFullThrottle)) }, [highlightFullThrottle])
+  useEffect(() => { localStorage.setItem('cvt-dyno-primary-teeth', String(primarySpokes)) }, [primarySpokes])
+  useEffect(() => { localStorage.setItem('cvt-dyno-secondary-teeth', String(secondarySpokes)) }, [secondarySpokes])
   useEffect(() => { torqueScaleRef.current = torqueScale }, [torqueScale])
   useEffect(() => { torqueOffsetRef.current = torqueOffset }, [torqueOffset])
   useEffect(() => { powerModeRef.current = powerMode }, [powerMode])
   useEffect(() => { inertiaKgM2Ref.current = inertiaKgM2 }, [inertiaKgM2])
   useEffect(() => { torqueCurveRef.current = torqueCurve }, [torqueCurve])
+  useEffect(() => { primarySpokesRef.current = primarySpokes }, [primarySpokes])
+  useEffect(() => { secondarySpokesRef.current = secondarySpokes }, [secondarySpokes])
   useEffect(() => { loggingRef.current = logging }, [logging])
   useEffect(() => { isPlaybackActiveRef.current = isPlaybackActive }, [isPlaybackActive])
   useEffect(() => { showSensorConsoleRef.current = showSensorConsole }, [showSensorConsole])
@@ -337,7 +353,7 @@ function App() {
     if (playbackPlaying && playbackElapsedMs >= playbackEndBoundMs) setPlaybackPlaying(false)
   }, [derivedPlaybackSamples, playbackElapsedMs, playbackPlaying, playbackEndBoundMs])
   useEffect(() => {
-    // Live serial hardware logs directly at full rate from the packet handler (see `handleValue`)
+    // Live USB hardware logs directly at full rate from the packet handler (see `handleValue`)
     // instead of here, since watching the (now decimated-for-display) `samples` state would both
     // cap logged resolution to the display rate and double-log against the packet handler's own
     // writes. This path stays in service only for demo-mode sample logging, which has no discrete
@@ -351,7 +367,7 @@ function App() {
     if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
   }, [logging, samples, connected])
   useEffect(() => {
-    // Live serial display/console throttle: real packets arrive (and are logged) at full rate in
+    // Live USB display/console throttle: real packets arrive (and are logged) at full rate in
     // `handleValue`, independent of rendering. This interval instead periodically drains a small
     // buffer into React state at a fixed, render-friendly cadence -- charts get a smooth but
     // decimated view, and the sensor console gets batched updates instead of one re-render per
@@ -394,7 +410,7 @@ function App() {
 
   async function connect() {
     try {
-      const next = new SerialTransport({ onValue: handleValue, onPacket: handleSerialPacket, onText: handleSerialText })
+      const next = new UsbTransport({ onValue: handleValue, onPacket: handleUsbPacket, onText: handleUsbText })
       liveStateRef.current = createLiveDerivationState()
       timeOffsetMsRef.current = null
       channelSeqRef.current = [-1, -1, -1, -1, -1]
@@ -402,7 +418,7 @@ function App() {
       displayBufferRef.current = []
       pendingConsoleLinesRef.current = []
       await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); setPlaybackSamples([]); setPlaybackPlaying(false); setPlaybackFileName(''); setPlaybackElapsedMs(0); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
-    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to serial device') }
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to USB device') }
   }
   async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setNotice('Device disconnected') }
   function consoleTimestamp() {
@@ -428,7 +444,7 @@ function App() {
     setConsoleMessages((messagesSoFar) => [...messagesSoFar, ...messages].slice(-MAX_CONSOLE_MESSAGES))
     setConsoleLines((lines) => [...lines, ...messages.map((message) => `${message.time} ${message.data}`)].slice(-MAX_CONSOLE_MESSAGES))
   }
-  function handleSerialText(text: string) {
+  function handleUsbText(text: string) {
     appendConsoleLines([`[RAW TEXT] ${text}`])
     const rpmTestMatch = text.match(/^RPM TEST \| PIN_RPM1=(HIGH|LOW) edges=(\d+) \| PIN_RPM2=(HIGH|LOW) edges=(\d+)$/i)
     if (rpmTestMatch) {
@@ -464,21 +480,19 @@ function App() {
       setNotice(`RPM count test: ${enabled ? 'enabled' : 'disabled'}`)
       return
     }
-    const spokesMatch = text.match(/^RPM Spokes - PRIMARY:\s*(\d+)\s*\|\s*SECONDARY:\s*(\d+)$/i)
-    if (spokesMatch) {
-      const primary = Number(spokesMatch[1])
-      const secondary = Number(spokesMatch[2])
-      setPrimarySpokes(primary)
-      setSecondarySpokes(secondary)
-      setNotice(`RPM spokes: Primary=${primary}, Secondary=${secondary}`)
-      return
-    }
-    const rpmCountMatch = text.match(/^RPM COUNT TEST \| RPM1 count=(\d+) \| RPM2 count=(\d+)$/i)
+    // RPM wheel teeth/spoke counts are no longer read from the firmware at all -- they're a
+    // purely local display setting now (see the primarySpokes/secondarySpokes state comment).
+    // Firmware also includes a per-channel dropped-edge count now (see RpmCounter::popEdge()'s
+    // ring buffer) -- surfaced in the notice for visibility, though not wired into its own UI
+    // state beyond that.
+    const rpmCountMatch = text.match(/^RPM COUNT TEST \| RPM1 count=(\d+) dropped=(\d+) \| RPM2 count=(\d+) dropped=(\d+)$/i)
     if (rpmCountMatch) {
       const rpm1Count = Number(rpmCountMatch[1])
-      const rpm2Count = Number(rpmCountMatch[2])
+      const rpm1Dropped = Number(rpmCountMatch[2])
+      const rpm2Count = Number(rpmCountMatch[3])
+      const rpm2Dropped = Number(rpmCountMatch[4])
       setRpmCountStates([rpm1Count, rpm2Count])
-      setNotice(`RPM counts: RPM1=${rpm1Count}, RPM2=${rpm2Count}`)
+      setNotice(`RPM counts: RPM1=${rpm1Count} (dropped ${rpm1Dropped}), RPM2=${rpm2Count} (dropped ${rpm2Dropped})`)
       return
     }
     const configMatch = text.match(/^Channel \[(\d)\].*:\s(ENABLED|DISABLED)\s+\|\s+Target Tx Freq:\s+(\d+)\s+Hz$/i)
@@ -493,7 +507,7 @@ function App() {
     }
     setNotice(text)
   }
-  function handleSerialPacket(rawPacket: Uint8Array, channel: ChannelId, value: number) {
+  function handleUsbPacket(rawPacket: Uint8Array, channel: ChannelId, value: number) {
     // Skip formatting/buffering entirely when the sensor console view is off -- at real telemetry
     // rates (up to 50 Hz now, potentially much higher per-channel later) doing this unconditionally
     // for every single packet would itself become a rendering bottleneck. When it is on, lines are
@@ -579,6 +593,7 @@ function App() {
     const sample = applyChannelUpdate(
       liveStateRef.current, channel, value, sampleTimeMs,
       torqueScaleRef.current, torqueOffsetRef.current, powerModeRef.current, inertiaKgM2Ref.current, torqueCurveRef.current,
+      primarySpokesRef.current, secondarySpokesRef.current,
     )
 
     displayBufferRef.current.push(sample)
@@ -594,16 +609,23 @@ function App() {
       }
     }
   }
-  async function sendConfig(channel: number, enabled: boolean, frequency: number) { if (transport.current) { await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0)); await transport.current.send(encodeCommand(2, channel, frequency)) } }
+  // RPM channels (0/1) are edge-triggered now, not polled -- command 0x02 (target frequency) is
+  // vestigial for them (see the firmware's cfg_freq[] comment), so it's simply never sent for
+  // those two channels. The enable toggle (command 0x01) still matters for every channel, RPM
+  // included -- it gates whether the firmware bothers draining/transmitting that channel at all.
+  async function sendConfig(channel: number, enabled: boolean, frequency: number) {
+    if (!transport.current) return
+    await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0))
+    if (channel > 1) await transport.current.send(encodeCommand(2, channel, frequency))
+  }
   function updateChannel(channel: number, enabled: boolean) { setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value)); void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration')) }
   function updateFrequency(channel: number, frequency: number) { setFrequencies((previous) => previous.map((value, index) => index === channel ? frequency : value)); void sendConfig(channel, channels[channel], frequency).catch(() => setNotice('Could not send frequency configuration')) }
+  // Local-only display setting now -- see the primarySpokes/secondarySpokes state comment. No
+  // firmware command is sent; command 0x06 (the old "set RPM spoke count") is reserved/removed on
+  // the firmware side, since spoke count no longer has any on-device meaning to configure.
   function updateSpokes(channel: 0 | 1, spokes: number) {
-    if (channel === 0) {
-      setPrimarySpokes(spokes)
-    } else {
-      setSecondarySpokes(spokes)
-    }
-    void (async () => { if (transport.current) { await transport.current.send(encodeCommand(6, channel, spokes)) } })().catch(() => setNotice('Could not send spoke configuration'))
+    if (channel === 0) setPrimarySpokes(spokes)
+    else setSecondarySpokes(spokes)
   }
   async function downloadCsv(sourceSamples: TelemetrySample[] = samples, baseName: string = sessionName || 'cvt-dyno-session') {
     const csv = samplesToCsv(sourceSamples, torqueScale, torqueOffset)
@@ -784,12 +806,12 @@ function App() {
   }
   function toggleMa(field: MaField) { setMaEnabled((previous) => ({ ...previous, [field]: !previous[field] })) }
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'Serial link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
-    {consoleOpen && <SerialConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span></div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
+    {consoleOpen && <UsbConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
     <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 2)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
         <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${logFileName.current}` : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
     {powerMode === 'inertia' && inertiaSettingsOpen && <section className="inertia-settings"><div className="inertia-settings-header"><span className="section-kicker">INERTIA MODE SETTINGS</span><h3>Shaft inertia and engine curve</h3><button className="icon-button" title="Close" onClick={() => setInertiaSettingsOpen(false)}><X size={15} /></button></div><div className="inertia-settings-body"><div className="control-group compact inertia-input"><label htmlFor="inertia-value">Secondary inertia</label><div className="input-with-unit"><input id="inertia-value" type="number" step="0.01" min="0" value={inertiaKgM2} onChange={(event) => setInertiaKgM2(Number(event.target.value))} /><span>kg·m²</span></div></div><div className="torque-curve-wrap"><div className="torque-curve-heading"><span>Primary RPM vs. torque curve</span><button className="button button-quiet" onClick={() => setTorqueCurve([...defaultEngineTorqueCurve])}><RotateCcw size={13} />Reset curve</button></div><TorqueCurveEditor points={torqueCurve} onChange={setTorqueCurve} /></div></div></section>}
-    <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span><select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select></div>)}</section>
+    <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span>{index <= 1 ? <span className="mono" title="RPM channels are edge-triggered (one packet per physical tooth), not polled at a configurable rate">Per-tooth</span> : <select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select>}</div>)}</section>
     <section className="channel-strip"><div className="strip-label"><Gauge size={17} /><span>RPM wheel teeth / spokes</span></div><div className="channel-control"><span>Primary wheel teeth</span><input type="number" min="1" max="999" value={primarySpokes} onChange={(event) => updateSpokes(0, Number(event.target.value))} /></div><div className="channel-control"><span>Secondary wheel teeth</span><input type="number" min="1" max="999" value={secondarySpokes} onChange={(event) => updateSpokes(1, Number(event.target.value))} /></div></section>
     <section className="playback-bar"><div className="strip-label"><Upload size={17} /><span>CSV playback</span></div><input ref={fileInputRef} type="file" accept=".csv,text/csv" className="visually-hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadPlaybackFile(file); event.target.value = '' }} /><button className="button button-quiet" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load CSV</button>{isPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span><button className="icon-button" title={playbackPlaying ? 'Pause playback' : 'Play playback'} onClick={togglePlaybackPlaying}>{playbackPlaying ? <Pause size={16} /> : <Play size={16} />}</button><TimeRangeSlider startFraction={playbackRangeStart} endFraction={playbackRangeEnd} onChange={handlePlaybackRangeChange} formatValue={(fraction) => `${((fraction * playbackDurationMs) / 1000).toFixed(1)}s`} /><span className="mono">{(playbackElapsedMs / 1000).toFixed(1)}s / {(playbackDurationMs / 1000).toFixed(1)}s</span><select value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))}><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select><button className="icon-button" title="Save recalculated CSV (current power settings applied to every row)" onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear playback" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
     <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
@@ -813,7 +835,7 @@ function App() {
       highlightFullThrottle={highlightFullThrottle}
       onToggleHighlightFullThrottle={() => setHighlightFullThrottle((value) => !value)}
     />
-    <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
+    <footer className="footer"><span><Wifi size={14} /> Browser WebUSB requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
 }
 
@@ -865,7 +887,7 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const hoveredPoint = useMemo(() => (hoverTime !== null ? chartData.find((point) => point.time === hoverTime) : undefined), [chartData, hoverTime])
 
   return <>
-    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the serial transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><label className="ma-toggle" title="Shade time-series chart backgrounds and color relationship-chart points while the full-throttle input is asserted"><input type="checkbox" checked={highlightFullThrottle} onChange={onToggleHighlightFullThrottle} />Highlight full throttle</label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
+    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the USB transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><label className="ma-toggle" title="Shade time-series chart backgrounds and color relationship-chart points while the full-throttle input is asserted"><input type="checkbox" checked={highlightFullThrottle} onChange={onToggleHighlightFullThrottle} />Highlight full throttle</label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} highlightFullThrottle={highlightFullThrottle} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>
@@ -1096,7 +1118,7 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body" ref={chartBodyRef} onMouseMove={handlePlotMouseMove} onMouseLeave={handlePlotMouseLeave}>{chart}<div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />{isRelationshipChart && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
 }
 
-function SerialConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {
+function UsbConsolePanel({ messages, showSensorData, autoScroll, customCommand, setCustomCommand, onToggleSensorData, onToggleAutoScroll, onClear, onSendCommand, onSendCustom, rpmPinTest, rpmInterruptTest, rpmCountTest, rpmPinStates, rpmCountStates, onToggleRpmPinTest, onToggleRpmInterruptTest, onToggleRpmCountTest }: { messages: ConsoleMessage[]; showSensorData: boolean; autoScroll: boolean; customCommand: string; setCustomCommand: (value: string) => void; onToggleSensorData: () => void; onToggleAutoScroll: () => void; onClear: () => void; onSendCommand: (bytes: Uint8Array, description?: string) => Promise<void>; onSendCustom: () => Promise<void>; rpmPinTest: boolean; rpmInterruptTest: boolean; rpmCountTest: boolean; rpmPinStates: [boolean | null, boolean | null]; rpmCountStates: [number | null, number | null]; onToggleRpmPinTest: () => Promise<void>; onToggleRpmInterruptTest: () => Promise<void>; onToggleRpmCountTest: () => Promise<void> }) {
   const [sortBy, setSortBy] = useState<ConsoleSort>('time')
   const [sortAscending, setSortAscending] = useState(false)
   const [globalStackByType, setGlobalStackByType] = useState(false)
@@ -1124,7 +1146,7 @@ function SerialConsolePanel({ messages, showSensorData, autoScroll, customComman
       setStackedTypes({})
     }
   }
-  return <section className="serial-console serial-console-structured"><div className="console-toolbar"><div><span className="section-kicker">SERIAL CONSOLE / 115200 BAUD</span><h2>Command link</h2></div><div className="console-toolbar-actions"><button className={`button ${showSensorData ? 'button-accent' : 'button-quiet'}`} onClick={onToggleSensorData}>{showSensorData ? 'Hide sensor data' : 'Show sensor data'}</button><button className={`button ${autoScroll ? 'button-accent' : 'button-quiet'}`} onClick={onToggleAutoScroll}>{autoScroll ? 'Auto-scroll on' : 'Auto-scroll off'}</button><button className="button button-quiet" onClick={onClear}><Trash2 size={14} />Clear</button></div></div><div className="console-stack-controls"><button className={`button ${globalStackByType ? 'button-accent' : 'button-quiet'}`} onClick={toggleGlobalStackByType}>Stack latest by type</button></div><div className="console-grid"><div className="console-table-wrap"><table className="console-table"><thead><tr><th><button onClick={() => changeSort('time')}>Time {sortBy === 'time' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('type')}>Type {sortBy === 'type' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('data')}>Data {sortBy === 'data' && (sortAscending ? '↑' : '↓')}</button></th></tr></thead><tbody>{sortedMessages.length ? sortedMessages.map((message) => <tr key={message.id}><td>{message.time}</td><td><span className={`console-type-pill type-${message.type.toLowerCase().replaceAll(' ', '-')}`}>{message.type}</span></td><td>{message.data}</td></tr>) : <tr><td colSpan={3} className="console-empty">No serial messages yet. Connect the firmware or send a command.</td></tr>}</tbody></table></div><div className="console-controls"><span className="console-label">Firmware commands</span><div className="rpm-pin-status"><div className={`rpm-pin-card ${rpmPinStates[0] === null ? 'unknown' : rpmPinStates[0] ? 'is-high' : 'is-low'}`}><span>RPM1 / PIN 1</span><strong>{rpmPinStates[0] === null ? 'WAITING' : rpmPinStates[0] ? 'HIGH' : 'LOW'}</strong></div><div className={`rpm-pin-card ${rpmPinStates[1] === null ? 'unknown' : rpmPinStates[1] ? 'is-high' : 'is-low'}`}><span>RPM2 / PIN 3</span><strong>{rpmPinStates[1] === null ? 'WAITING' : rpmPinStates[1] ? 'HIGH' : 'LOW'}</strong></div></div><div className="rpm-pin-status"><div className={`rpm-pin-card ${rpmCountStates[0] === null ? 'unknown' : 'is-high'}`}><span>RPM1 count</span><strong>{rpmCountStates[0] === null ? 'WAITING' : rpmCountStates[0]}</strong></div><div className={`rpm-pin-card ${rpmCountStates[1] === null ? 'unknown' : 'is-high'}`}><span>RPM2 count</span><strong>{rpmCountStates[1] === null ? 'WAITING' : rpmCountStates[1]}</strong></div></div><button className="console-command" onClick={() => void onSendCommand(encodeCommand(3), 'Read configuration')}><span>Read configuration</span><code>03 00 00 00</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 1), 'Enable bench mode')}><span>Enable bench mode</span><code>04 00 00 01</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 0), 'Disable bench mode')}><span>Use real sensors</span><code>04 00 00 00</code></button><button className={`console-command ${rpmPinTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmPinTest()}><span>{rpmPinTest ? 'Stop RPM pin test' : 'Start RPM pin test'}</span><code>05 00 00 0{rpmPinTest ? '0' : '1'}</code></button><button className={`console-command ${rpmInterruptTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmInterruptTest()}><span>{rpmInterruptTest ? 'Stop interrupt test' : 'Start interrupt test'}</span><code>07 00 00 0{rpmInterruptTest ? '0' : '1'}</code></button><button className={`console-command ${rpmCountTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmCountTest()}><span>{rpmCountTest ? 'Stop RPM count test' : 'Start RPM count test'}</span><code>08 00 00 0{rpmCountTest ? '0' : '1'}</code></button><label className="console-label" htmlFor="custom-command">Custom hex bytes</label><div className="custom-command"><input id="custom-command" value={customCommand} onChange={(event) => setCustomCommand(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void onSendCustom() }} /><button className="icon-button" title="Send custom bytes" onClick={() => void onSendCustom()}><Send size={16} /></button></div></div></div></section>
+  return <section className="serial-console serial-console-structured"><div className="console-toolbar"><div><span className="section-kicker">USB CONSOLE</span><h2>Command link</h2></div><div className="console-toolbar-actions"><button className={`button ${showSensorData ? 'button-accent' : 'button-quiet'}`} onClick={onToggleSensorData}>{showSensorData ? 'Hide sensor data' : 'Show sensor data'}</button><button className={`button ${autoScroll ? 'button-accent' : 'button-quiet'}`} onClick={onToggleAutoScroll}>{autoScroll ? 'Auto-scroll on' : 'Auto-scroll off'}</button><button className="button button-quiet" onClick={onClear}><Trash2 size={14} />Clear</button></div></div><div className="console-stack-controls"><button className={`button ${globalStackByType ? 'button-accent' : 'button-quiet'}`} onClick={toggleGlobalStackByType}>Stack latest by type</button></div><div className="console-grid"><div className="console-table-wrap"><table className="console-table"><thead><tr><th><button onClick={() => changeSort('time')}>Time {sortBy === 'time' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('type')}>Type {sortBy === 'type' && (sortAscending ? '↑' : '↓')}</button></th><th><button onClick={() => changeSort('data')}>Data {sortBy === 'data' && (sortAscending ? '↑' : '↓')}</button></th></tr></thead><tbody>{sortedMessages.length ? sortedMessages.map((message) => <tr key={message.id}><td>{message.time}</td><td><span className={`console-type-pill type-${message.type.toLowerCase().replaceAll(' ', '-')}`}>{message.type}</span></td><td>{message.data}</td></tr>) : <tr><td colSpan={3} className="console-empty">No USB messages yet. Connect the firmware or send a command.</td></tr>}</tbody></table></div><div className="console-controls"><span className="console-label">Firmware commands</span><div className="rpm-pin-status"><div className={`rpm-pin-card ${rpmPinStates[0] === null ? 'unknown' : rpmPinStates[0] ? 'is-high' : 'is-low'}`}><span>RPM1 / PIN 1</span><strong>{rpmPinStates[0] === null ? 'WAITING' : rpmPinStates[0] ? 'HIGH' : 'LOW'}</strong></div><div className={`rpm-pin-card ${rpmPinStates[1] === null ? 'unknown' : rpmPinStates[1] ? 'is-high' : 'is-low'}`}><span>RPM2 / PIN 3</span><strong>{rpmPinStates[1] === null ? 'WAITING' : rpmPinStates[1] ? 'HIGH' : 'LOW'}</strong></div></div><div className="rpm-pin-status"><div className={`rpm-pin-card ${rpmCountStates[0] === null ? 'unknown' : 'is-high'}`}><span>RPM1 count</span><strong>{rpmCountStates[0] === null ? 'WAITING' : rpmCountStates[0]}</strong></div><div className={`rpm-pin-card ${rpmCountStates[1] === null ? 'unknown' : 'is-high'}`}><span>RPM2 count</span><strong>{rpmCountStates[1] === null ? 'WAITING' : rpmCountStates[1]}</strong></div></div><button className="console-command" onClick={() => void onSendCommand(encodeCommand(3), 'Read configuration')}><span>Read configuration</span><code>03 00 00 00</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 1), 'Enable bench mode')}><span>Enable bench mode</span><code>04 00 00 01</code></button><button className="console-command" onClick={() => void onSendCommand(encodeCommand(4, 0, 0), 'Disable bench mode')}><span>Use real sensors</span><code>04 00 00 00</code></button><button className={`console-command ${rpmPinTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmPinTest()}><span>{rpmPinTest ? 'Stop RPM pin test' : 'Start RPM pin test'}</span><code>05 00 00 0{rpmPinTest ? '0' : '1'}</code></button><button className={`console-command ${rpmInterruptTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmInterruptTest()}><span>{rpmInterruptTest ? 'Stop interrupt test' : 'Start interrupt test'}</span><code>07 00 00 0{rpmInterruptTest ? '0' : '1'}</code></button><button className={`console-command ${rpmCountTest ? 'is-active' : ''}`} onClick={() => void onToggleRpmCountTest()}><span>{rpmCountTest ? 'Stop RPM count test' : 'Start RPM count test'}</span><code>08 00 00 0{rpmCountTest ? '0' : '1'}</code></button><label className="console-label" htmlFor="custom-command">Custom hex bytes</label><div className="custom-command"><input id="custom-command" value={customCommand} onChange={(event) => setCustomCommand(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void onSendCustom() }} /><button className="icon-button" title="Send custom bytes" onClick={() => void onSendCustom()}><Send size={16} /></button></div></div></div></section>
 }
 
 export default App

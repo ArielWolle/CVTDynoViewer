@@ -89,12 +89,36 @@ export function radPerSecondToRpm(radPerSecond: number): number {
   return radPerSecond / RAD_PER_SEC_PER_RPM
 }
 
-// --- Serial protocol v2 -----------------------------------------------------------------------
-// Telemetry packet (17 bytes), sent independently per channel so each channel keeps its own
-// firmware-configured rate -- e.g. torque can run much faster than RPM without either one
-// throttling the other. Layout: [0xAA][0x55][channel][seq][int32 value LE][uint64 t_us LE][crc8].
-// The CRC (and fixed length) means a value that happens to contain the sync bytes can no longer
-// desync the parser the way the old length-less v1 framing could.
+// Converts a raw per-tooth inter-edge period (as sent by RPM channels 0/1, see the protocol
+// comment below) into RPM, given the wheel's tooth count. teethPerRevolution is purely a
+// display/reconstruction setting on this side -- the firmware has no concept of it at all -- so
+// changing it here takes effect immediately with no firmware round-trip. Returns 0 for
+// non-physical inputs (period_us <= 0, i.e. the reset/discontinuity marker, or a non-positive
+// tooth count) rather than Infinity/NaN from a division by zero.
+export function periodUsToRpm(periodUs: number, teethPerRevolution: number): number {
+  if (periodUs <= 0 || teethPerRevolution <= 0) return 0
+  return 60_000_000 / (periodUs * teethPerRevolution)
+}
+
+// --- USB telemetry protocol v2 --------------------------------------------------------------
+// Telemetry packet (17 bytes). Layout: [0xAA][0x55][channel][seq][int32 value LE][uint64 t_us
+// LE][crc8]. The CRC (and fixed length) means a value that happens to contain the sync bytes can
+// no longer desync the parser the way the old length-less v1 framing could.
+//
+// Channels 2-4 (shift/torque) are sent independently per channel on their own firmware-configured
+// polling rate -- e.g. torque can run much faster than shift without either one throttling the
+// other -- and `value` is the polled sensor reading directly.
+//
+// Channels 0-1 (RPM1/RPM2) are edge-triggered instead of polled: the firmware sends one packet
+// per physical tooth as soon as it's detected, with `value` = the raw inter-edge period in
+// microseconds since the previous tooth on that channel, NOT an RPM value (see periodUsToRpm()
+// below for the conversion this app applies). `value === 0` is a reset/discontinuity marker (the
+// first edge since firmware boot, or the first edge after an idle gap) rather than a real
+// zero-length period, and is NOT converted to RPM -- see applyChannelUpdate().
+//
+// Transport: the firmware exposes a WebUSB vendor-class interface (see usbTransport.ts), not a
+// virtual COM port -- there is no baud rate, and Windows binds it to WinUSB automatically via the
+// WebUSB descriptor's MS OS 2.0 registry property, with no separate driver install needed.
 export const TELEMETRY_SYNC0 = 0xaa
 export const TELEMETRY_SYNC1 = 0x55
 export const TELEMETRY_PACKET_LEN = 17
@@ -199,21 +223,32 @@ const MIN_RPM2_SAMPLE_INTERVAL_MS = 2
  * `timeMs` should be the value's own capture time (mapped from the firmware timestamp), not
  * receive time, so the returned sample's `time` -- and therefore any dt derived from it -- is
  * accurate even when channels arrive at very different rates.
+ *
+ * For channels 0/1 (RPM), `value` is the raw wire period_us (see the protocol comment above), and
+ * `primaryTeeth`/`secondaryTeeth` are this app's own display-side tooth counts used to convert it
+ * to RPM via periodUsToRpm() -- the firmware has no concept of spoke/tooth count at all anymore,
+ * so this conversion happens entirely here. `value === 0` (the reset/discontinuity marker) is NOT
+ * converted or applied -- the channel's RPM is simply forward-filled from its last known value,
+ * same as any other channel that hasn't updated on this call.
  */
-export function applyChannelUpdate(state: LiveDerivationState, channel: ChannelId, value: number, timeMs: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode, inertiaKgM2 = 0.3134, torqueCurve: ReadonlyArray<EngineTorquePoint> = defaultEngineTorqueCurve): TelemetrySample {
-  if (channel === 0) state.rpm1 = value
-  else if (channel === 1) {
-    const elapsedSinceLastRpm2 = timeMs - state.lastRpm2TimeMs
-    const longEnough = !state.hasRpm2Sample || elapsedSinceLastRpm2 >= MIN_RPM2_SAMPLE_INTERVAL_MS
-    if (powerMode === 'inertia' && longEnough) {
-      state.power2 = estimateSecondaryPowerFromInertia(value, state.hasRpm2Sample ? state.lastRpm2 : value, timeMs, state.hasRpm2Sample ? state.lastRpm2TimeMs : timeMs, inertiaKgM2)
+export function applyChannelUpdate(state: LiveDerivationState, channel: ChannelId, value: number, timeMs: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode, inertiaKgM2 = 0.3134, torqueCurve: ReadonlyArray<EngineTorquePoint> = defaultEngineTorqueCurve, primaryTeeth = 1, secondaryTeeth = 1): TelemetrySample {
+  if (channel === 0) {
+    if (value > 0) state.rpm1 = periodUsToRpm(value, primaryTeeth)
+  } else if (channel === 1) {
+    if (value > 0) {
+      const rpm2Value = periodUsToRpm(value, secondaryTeeth)
+      const elapsedSinceLastRpm2 = timeMs - state.lastRpm2TimeMs
+      const longEnough = !state.hasRpm2Sample || elapsedSinceLastRpm2 >= MIN_RPM2_SAMPLE_INTERVAL_MS
+      if (powerMode === 'inertia' && longEnough) {
+        state.power2 = estimateSecondaryPowerFromInertia(rpm2Value, state.hasRpm2Sample ? state.lastRpm2 : rpm2Value, timeMs, state.hasRpm2Sample ? state.lastRpm2TimeMs : timeMs, inertiaKgM2)
+      }
+      if (longEnough) {
+        state.lastRpm2 = rpm2Value
+        state.lastRpm2TimeMs = timeMs
+        state.hasRpm2Sample = true
+      }
+      state.rpm2 = rpm2Value
     }
-    if (longEnough) {
-      state.lastRpm2 = value
-      state.lastRpm2TimeMs = timeMs
-      state.hasRpm2Sample = true
-    }
-    state.rpm2 = value
   } else if (channel === 2) state.shift = value
   else if (channel === 3) state.torq1 = value
   else if (channel === 4) state.torq2 = value
