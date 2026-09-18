@@ -86,3 +86,9 @@ interface USB {
 interface Navigator {
   usb: USB
 }
+
+// WebUSB is also available in dedicated workers (WorkerNavigator.usb) -- see usbWorker.ts, which
+// owns the actual USBDevice on its own thread.
+interface WorkerNavigator {
+  usb: USB
+}
