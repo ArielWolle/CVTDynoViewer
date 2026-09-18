@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { applyChannelUpdate, COMMAND_SYNC, createLiveDerivationState, crc8, csvEscape, decodePacket, deriveSample, encodeCommand, parseSamplesCsv, radPerSecondToRpm, rawLogRow, rpmToRadPerSecond, samplesToCsv, TELEMETRY_SYNC0, TELEMETRY_SYNC1, type ChannelId } from './protocol'
+import { applyChannelUpdate, COMMAND_SYNC, createLiveDerivationState, crc8, csvEscape, decodePacket, deriveSample, encodeCommand, parseSamplesCsv, periodUsToRpm, radPerSecondToRpm, rawLogRow, rpmToRadPerSecond, samplesToCsv, TELEMETRY_SYNC0, TELEMETRY_SYNC1, type ChannelId } from './protocol'
+
+/** Inverse of periodUsToRpm(), for building RPM-channel test fixtures against the raw wire value (period_us) the firmware actually sends, at a given tooth count (default 1 -- matches applyChannelUpdate's own default). */
+function rpmToPeriodUs(rpm: number, teethPerRevolution = 1): number {
+  return rpm > 0 ? 60_000_000 / (rpm * teethPerRevolution) : 0
+}
 
 /** Builds a valid v2 telemetry packet (matching the firmware's framing) for test fixtures. */
 function buildV2Packet(channel: number, value: number, tUs: number, seq: number, corruptCrc = false): Uint8Array {
@@ -69,6 +74,18 @@ describe('firmware protocol', () => {
     expect(radPerSecondToRpm(2 * Math.PI)).toBeCloseTo(60)
   })
 
+  it('converts a raw per-tooth period to RPM using the given tooth count', () => {
+    // 16 teeth, 1000 RPM -> one tooth every 60e6 / (1000 * 16) = 3750us
+    expect(periodUsToRpm(3750, 16)).toBeCloseTo(1000, 6)
+    // periodUs === 0 is the firmware's explicit "stopped" report -- a real reading, correctly
+    // converting to a real 0 RPM (not skipped, not Infinity/NaN).
+    expect(periodUsToRpm(0, 16)).toBe(0)
+    // Other non-physical inputs (a negative period, or a bad tooth count) must not produce
+    // Infinity/NaN either.
+    expect(periodUsToRpm(-5, 16)).toBe(0)
+    expect(periodUsToRpm(3750, 0)).toBe(0)
+  })
+
   it('derives inertia-mode power from shaft acceleration and an engine torque curve', () => {
     const sample = deriveSample({ time: 1000, rpm1: 1800, rpm2: 1800, shift: 0, torq1: 0, torq2: 0 }, 1, 0, 'inertia', { time: 0, rpm1: 1000, rpm2: 0 })
     expect(sample.power1).toBeGreaterThan(4)
@@ -128,11 +145,22 @@ describe('firmware protocol', () => {
 describe('event-driven live capture', () => {
   it('forward-fills channels that have not updated yet into every emitted row', () => {
     const state = createLiveDerivationState()
-    const first = applyChannelUpdate(state, 0 as ChannelId, 3000, 0, 1, 0, 'torque')
+    const first = applyChannelUpdate(state, 0 as ChannelId, rpmToPeriodUs(3000), 0, 1, 0, 'torque')
     expect(first).toMatchObject({ rpm1: 3000, rpm2: 0, shift: 0, torq1: 0, torq2: 0 })
     // A later, unrelated channel (shift) update should still carry the earlier rpm1 value forward.
     const second = applyChannelUpdate(state, 2 as ChannelId, 55, 10, 1, 0, 'torque')
     expect(second).toMatchObject({ rpm1: 3000, shift: 55 })
+  })
+
+  it('treats a raw period_us of 0 (the firmware\u2019s explicit "stopped" report) as a real RPM === 0 reading, applied like any other update', () => {
+    const state = createLiveDerivationState()
+    const primed = applyChannelUpdate(state, 0 as ChannelId, rpmToPeriodUs(3000), 0, 1, 0, 'torque')
+    expect(primed.rpm1).toBe(3000)
+    // The firmware only ever sends periodUs === 0 to explicitly report a channel has stopped (see
+    // RpmCounter::pollStale() in the firmware) -- this must actually zero out rpm1, not hold the
+    // last nonzero reading forever.
+    const afterStop = applyChannelUpdate(state, 0 as ChannelId, 0, 10, 1, 0, 'torque')
+    expect(afterStop.rpm1).toBe(0)
   })
 
   it('in inertia mode, only recomputes secondary power when rpm2 itself updates, holding the last value on other channels', () => {
@@ -141,7 +169,7 @@ describe('event-driven live capture', () => {
     // `deriveSample`'s own convention), so it establishes a baseline at rest with zero power.
     applyChannelUpdate(state, 1 as ChannelId, 0, 0, 1, 0, 'inertia', 0.3134)
     // rpm2 then accelerates to 1800 over the next 100ms -- a real acceleration event.
-    const rpm2Update = applyChannelUpdate(state, 1 as ChannelId, 1800, 100, 1, 0, 'inertia', 0.3134)
+    const rpm2Update = applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(1800), 100, 1, 0, 'inertia', 0.3134)
     expect(rpm2Update.power2).toBeGreaterThan(0)
     const powerAfterRpm2Update = rpm2Update.power2
 
@@ -154,35 +182,35 @@ describe('event-driven live capture', () => {
 
     // A second, later rpm2 update (no further acceleration) should compute a fresh dt against the
     // *previous rpm2 sample* (100ms) rather than the intervening torque row (105ms).
-    const secondRpm2Update = applyChannelUpdate(state, 1 as ChannelId, 1800, 200, 1, 0, 'inertia', 0.3134)
+    const secondRpm2Update = applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(1800), 200, 1, 0, 'inertia', 0.3134)
     expect(secondRpm2Update.power2).toBeCloseTo(0, 5)
   })
 
   it('does not spike secondary power when a burst of rpm2 samples land a fraction of a millisecond apart (no firmware timestamp)', () => {
     const state = createLiveDerivationState()
-    applyChannelUpdate(state, 1 as ChannelId, 1000, 0, 1, 0, 'inertia', 0.3134)
+    applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(1000), 0, 1, 0, 'inertia', 0.3134)
     // Three "distinct" rpm2 samples arrive within a sub-millisecond burst, as can happen when a
     // browser read() call returns several buffered packets that get processed in one synchronous
     // loop and timestamped with receive time (e.g. older firmware with no capture timestamp).
     // Differentiating naively against each tiny sub-millisecond gap would produce a
     // multi-megawatt spike from an ordinary RPM step.
-    const burst1 = applyChannelUpdate(state, 1 as ChannelId, 1010, 0.1, 1, 0, 'inertia', 0.3134)
-    const burst2 = applyChannelUpdate(state, 1 as ChannelId, 1020, 0.15, 1, 0, 'inertia', 0.3134)
+    const burst1 = applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(1010), 0.1, 1, 0, 'inertia', 0.3134)
+    const burst2 = applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(1020), 0.15, 1, 0, 'inertia', 0.3134)
     expect(burst1.power2).toBeLessThan(1) // still ~0: held from the baseline, not recomputed against a ~0ms gap
     expect(burst2.power2).toBeLessThan(1)
-    expect(burst1.rpm2).toBe(1010) // the *value* still updates/forward-fills normally
-    expect(burst2.rpm2).toBe(1020)
+    expect(burst1.rpm2).toBeCloseTo(1010, 6) // the *value* still updates/forward-fills normally (round-tripped through period_us, not bit-exact)
+    expect(burst2.rpm2).toBeCloseTo(1020, 6)
 
     // The next update after a real interval measures the combined change (1000 -> 1030) over the
     // combined elapsed time (0 -> 50ms) -- i.e. the burst's skipped baseline updates didn't lose
     // or corrupt the eventual acceleration measurement.
-    const afterBurst = applyChannelUpdate(state, 1 as ChannelId, 1030, 50, 1, 0, 'inertia', 0.3134)
+    const afterBurst = applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(1030), 50, 1, 0, 'inertia', 0.3134)
     expect(afterBurst.power2).toBeGreaterThan(0)
   })
 
   it('holds the full-throttle state across other channels\u2019 updates until it actually changes', () => {
     const state = createLiveDerivationState()
-    const initial = applyChannelUpdate(state, 0 as ChannelId, 3000, 0, 1, 0, 'torque')
+    const initial = applyChannelUpdate(state, 0 as ChannelId, rpmToPeriodUs(3000), 0, 1, 0, 'torque')
     expect(initial.fullThrottle).toBe(false)
     const asserted = applyChannelUpdate(state, 5 as ChannelId, 1, 10, 1, 0, 'torque')
     expect(asserted.fullThrottle).toBe(true)

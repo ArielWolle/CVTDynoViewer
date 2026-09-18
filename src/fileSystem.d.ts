@@ -1,17 +1,6 @@
-interface SerialPort {
-  readable: ReadableStream<Uint8Array> | null
-  writable: WritableStream<Uint8Array> | null
-  open(options: { baudRate: number; bufferSize?: number }): Promise<void>
-  close(): Promise<void>
-}
-
-interface Serial {
-  requestPort(): Promise<SerialPort>
-}
-
-interface Navigator {
-  serial: Serial
-}
+// File System Access API ambient types -- not included in TypeScript's bundled "DOM" lib.
+// (Web Serial declarations formerly here moved out entirely; see usb.d.ts for the WebUSB
+// declarations that replaced them as the device transport.)
 
 interface Window {
   showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>
