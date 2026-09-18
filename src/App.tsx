@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
-import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
+import { CartesianGrid, Line, LineChart, ReferenceArea, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
 import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
 import { SerialTransport } from './serialTransport'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
@@ -33,6 +33,14 @@ const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
 const SENSOR_RETENTION_MS = 300_000
 const MAX_CONSOLE_MESSAGES = 500
 const KW_TO_HP = 1.341022
+// Full-throttle highlighting colors: a translucent band behind time-series charts while the
+// engine is at full throttle, and the same solid color for relationship-chart dots/points
+// recorded during it -- distinct from every existing series color in the app.
+const FULL_THROTTLE_COLOR = '#d92b2b'
+// Bumped from an initial 0.08 -- at that opacity the bands were technically rendering but only
+// as a barely-perceptible tint, easy to miss entirely at a glance (confirmed from a real
+// screenshot). This is deliberately strong enough to be unmistakable at a glance.
+const FULL_THROTTLE_BAND_FILL = 'rgba(217, 43, 43, 0.28)'
 
 
 function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
@@ -42,7 +50,10 @@ function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample):
 
 function makeDemoSample(index: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: TelemetrySample, inertiaKgM2 = 0.3134, torqueCurve: EngineTorquePoint[] = defaultEngineTorqueCurve as EngineTorquePoint[]): TelemetrySample {
   const phase = index / 10
-  const values = { time: index * 100, rpm1: Math.round(3200 + Math.sin(phase) * 720 + index * 3), rpm2: Math.round(2200 + Math.sin(phase - 0.5) * 500 + index * 2), shift: Math.round(35 + Math.sin(phase * 0.45) * 20), torq1: Math.round(380 + Math.sin(phase * 0.8) * 90), torq2: Math.round(305 + Math.sin(phase * 0.8 - 0.3) * 76) }
+  // Synthesizes contiguous full-throttle bands correlated with the RPM peaks, purely so the
+  // highlighting feature (background bands / dot coloring) has something to visibly demonstrate
+  // without needing real hardware.
+  const values = { time: index * 100, rpm1: Math.round(3200 + Math.sin(phase) * 720 + index * 3), rpm2: Math.round(2200 + Math.sin(phase - 0.5) * 500 + index * 2), shift: Math.round(35 + Math.sin(phase * 0.45) * 20), torq1: Math.round(380 + Math.sin(phase * 0.8) * 90), torq2: Math.round(305 + Math.sin(phase * 0.8 - 0.3) * 76), fullThrottle: Math.sin(phase) > 0.6 }
   return deriveSample(values, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
 }
 
@@ -147,6 +158,10 @@ function App() {
     const stored = Number(localStorage.getItem('cvt-dyno-high-ratio'))
     return Number.isFinite(stored) && stored > 0 ? stored : 0.9
   })
+  // Full-throttle input (channel 5) is never plotted as its own series -- it's purely a visual
+  // styling signal for the other charts (background band on time-series charts, dot color on
+  // relationship charts). Togglable since it's a visual effect some users may not want.
+  const [highlightFullThrottle, setHighlightFullThrottle] = useState(() => localStorage.getItem('cvt-dyno-highlight-full-throttle') !== 'false')
   const [notice, setNotice] = useState('Demo telemetry is flowing')
   const [directoryName, setDirectoryName] = useState('Browser download')
   const transport = useRef<SerialTransport | null>(null)
@@ -296,6 +311,7 @@ function App() {
   useEffect(() => { localStorage.setItem('cvt-dyno-ma-window', String(maWindow)) }, [maWindow])
   useEffect(() => { localStorage.setItem('cvt-dyno-low-ratio', String(lowRatio)) }, [lowRatio])
   useEffect(() => { localStorage.setItem('cvt-dyno-high-ratio', String(highRatio)) }, [highRatio])
+  useEffect(() => { localStorage.setItem('cvt-dyno-highlight-full-throttle', String(highlightFullThrottle)) }, [highlightFullThrottle])
   useEffect(() => { torqueScaleRef.current = torqueScale }, [torqueScale])
   useEffect(() => { torqueOffsetRef.current = torqueOffset }, [torqueOffset])
   useEffect(() => { powerModeRef.current = powerMode }, [powerMode])
@@ -794,6 +810,8 @@ function App() {
       onLowRatioChange={setLowRatio}
       onHighRatioChange={setHighRatio}
       droppedPackets={droppedPackets}
+      highlightFullThrottle={highlightFullThrottle}
+      onToggleHighlightFullThrottle={() => setHighlightFullThrottle((value) => !value)}
     />
     <footer className="footer"><span><Wifi size={14} /> Browser serial requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
@@ -806,7 +824,7 @@ function App() {
  * hover would re-render the whole app (topbar, console, control deck, playback bar, etc.), not
  * just the charts, which is visibly laggy. Keeping it here means only this subtree re-renders.
  */
-function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number }) {
+function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets, highlightFullThrottle, onToggleHighlightFullThrottle }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number; highlightFullThrottle: boolean; onToggleHighlightFullThrottle: () => void }) {
   // The time-range-slider selection lives here (not in App) so dragging it only re-renders this
   // subtree. The expensive per-field moving-average computation already happened in App over the
   // full `data`; windowing it down to the selected range here is a cheap filter, not a recompute.
@@ -847,13 +865,13 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const hoveredPoint = useMemo(() => (hoverTime !== null ? chartData.find((point) => point.time === hoverTime) : undefined), [chartData, hoverTime])
 
   return <>
-    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the serial transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
+    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the serial transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><label className="ma-toggle" title="Shade time-series chart backgrounds and color relationship-chart points while the full-throttle input is asserted"><input type="checkbox" checked={highlightFullThrottle} onChange={onToggleHighlightFullThrottle} />Highlight full throttle</label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
-    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
+    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} highlightFullThrottle={highlightFullThrottle} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>
 }
 
-function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hoveredPoint, onHover, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; hoveredPoint: ChartPoint | undefined; onHover: (time: number | null) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
+function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hoveredPoint, onHover, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, highlightFullThrottle, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; hoveredPoint: ChartPoint | undefined; onHover: (time: number | null) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; highlightFullThrottle: boolean; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
   const yUnit = config.id === 'rpm1' || config.id === 'rpm2' ? 'RPM' : config.id === 'shift' || config.id === 'efficiency' ? '%' : config.id === 'shiftRatio' ? 'Ratio' : ''
   const axisLabelStyle = { fill: '#8b8982', fontSize: 10 }
   const common = { data, margin: { top: 8, right: config.id === 'power' ? 4 : 14, left: 4, bottom: 14 } }
@@ -1016,7 +1034,48 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   // now that their crosshair is no longer a Recharts <ReferenceLine> -- fully skips Recharts'
   // reconciliation while only the hover position changes.
   const staticDot = { r: 3, strokeWidth: 1, stroke: '#fffdf8' }
-  const chart = useMemo(() => <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{config.id === 'scatter' && <><Line data={lowRatioLine} name="Low ratio" type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line data={highRatioLine} name="High ratio" type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...staticDot, fill: config.color }} /></>}{config.id === 'shiftEfficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} /><Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...staticDot, fill: config.color }} /></>}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" name="Shift position" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>, [config, data, maEnabled, lowRatio, highRatio])
+  // Full-throttle is never its own plotted series -- these two are purely visual styling that
+  // read `.fullThrottle` off the existing data points:
+  //  - Time-series charts get translucent <ReferenceArea> bands spanning each contiguous stretch
+  //    of full-throttle samples (computed once here rather than per-render inside the memo below).
+  //  - Relationship charts (scatter/shiftEfficiency) color each point's dot directly, which needs
+  //    a per-point render function instead of the shared static dot object used otherwise -- kept
+  //    conditional on `highlightFullThrottle` so the (cheaper) static object is still used when
+  //    the feature is off, preserving the existing "no dot re-render on every point" perf note.
+  const fullThrottleSegments = useMemo(() => {
+    if (isRelationshipChart || !highlightFullThrottle) return []
+    const segments: { start: number; end: number }[] = []
+    let segmentStart: number | null = null
+    data.forEach((point, index) => {
+      if (point.fullThrottle) {
+        if (segmentStart === null) segmentStart = point.seconds
+      } else if (segmentStart !== null) {
+        segments.push({ start: segmentStart, end: data[index - 1].seconds })
+        segmentStart = null
+      }
+    })
+    if (segmentStart !== null) segments.push({ start: segmentStart, end: data[data.length - 1].seconds })
+    return segments
+  }, [data, isRelationshipChart, highlightFullThrottle])
+  // `extreme` makes full-throttle points dramatically larger/bolder rather than just a different
+  // fill color -- requested specifically for the primary-vs-secondary scatter chart, where the
+  // point cloud is dense enough that a same-size color swap alone was hard to pick out at a
+  // glance. Renders as a small "target" (an outer ring plus the filled dot) so it reads as
+  // distinctly different in shape, not just hue, from every other point.
+  function relationshipDot(color: string, extreme = false) {
+    if (!highlightFullThrottle) return { ...staticDot, fill: color }
+    return (dotProps: { cx?: number; cy?: number; payload?: ChartPoint }) => {
+      const isFull = dotProps.payload?.fullThrottle === true
+      if (isFull && extreme) {
+        return <g>
+          <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r + 4} fill="none" stroke={FULL_THROTTLE_COLOR} strokeWidth={2} />
+          <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r + 1} strokeWidth={1.5} stroke="#fffdf8" fill={FULL_THROTTLE_COLOR} />
+        </g>
+      }
+      return <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r} strokeWidth={staticDot.strokeWidth} stroke={staticDot.stroke} fill={isFull ? FULL_THROTTLE_COLOR : color} />
+    }
+  }
+  const chart = useMemo(() => <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{!isRelationshipChart && fullThrottleSegments.map((segment, index) => <ReferenceArea key={index} x1={segment.start} x2={segment.end} {...(config.id === 'power' ? { yAxisId: 'kw' } : {})} fill={FULL_THROTTLE_BAND_FILL} stroke="none" ifOverflow="visible" />)}{config.id === 'scatter' && <><Line data={lowRatioLine} name="Low ratio" type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line data={highRatioLine} name="High ratio" type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color, true)} /></>}{config.id === 'shiftEfficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} /><Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color)} /></>}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" name="Shift position" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>, [config, data, maEnabled, lowRatio, highRatio, highlightFullThrottle, fullThrottleSegments])
   const singleMaField: MaField | null = config.id === 'rpm1' || config.id === 'rpm2' || config.id === 'efficiency' || config.id === 'shiftRatio' ? config.id : null
   const maToggles = config.id === 'power'
     ? <div className="chart-ma-toggles"><label className="ma-toggle" style={{ color: '#f05d3b' }}><input type="checkbox" checked={maEnabled.power1} onChange={() => onToggleMa('power1')} />Primary MA</label><label className="ma-toggle" style={{ color: '#3c8f88' }}><input type="checkbox" checked={maEnabled.power2} onChange={() => onToggleMa('power2')} />Secondary MA</label></div>

@@ -1,4 +1,4 @@
-export type ChannelId = 0 | 1 | 2 | 3 | 4
+export type ChannelId = 0 | 1 | 2 | 3 | 4 | 5
 
 export type PowerMode = 'torque' | 'inertia'
 
@@ -12,9 +12,14 @@ export type TelemetrySample = {
   power1: number
   power2: number
   efficiency: number
+  // Channel 5: a binary "engine at full throttle" input, reported on change rather than on a
+  // schedule (see the firmware's channel 5 comment). Not plotted as its own data series -- it's
+  // carried on every sample purely so the UI can style other charts differently while it's true
+  // (see ChartCard's full-throttle background/dot-color handling in App.tsx).
+  fullThrottle: boolean
 }
 
-export const channelNames = ['Primary RPM', 'Secondary RPM', 'Shift position', 'Primary torque', 'Secondary torque'] as const
+export const channelNames = ['Primary RPM', 'Secondary RPM', 'Shift position', 'Primary torque', 'Secondary torque', 'Full throttle'] as const
 
 export type EngineTorquePoint = { rpm: number; torque: number }
 
@@ -121,7 +126,7 @@ export type DecodedPacket = { channel: ChannelId; value: number; tUs: number; se
 export function decodePacket(packet: Uint8Array): DecodedPacket | null {
   if (packet.length >= TELEMETRY_PACKET_LEN && packet[0] === TELEMETRY_SYNC0 && packet[1] === TELEMETRY_SYNC1) {
     const channel = packet[2]
-    if (channel > 4) return null
+    if (channel > 5) return null
     const expectedCrc = crc8(packet.slice(2, 2 + TELEMETRY_CRC_SPAN))
     if (packet[16] !== expectedCrc) return null
     const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength)
@@ -142,10 +147,10 @@ export function encodeCommand(command: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8, channel = 
   return new Uint8Array([COMMAND_SYNC, command, channel, (value >> 8) & 0xff, value & 0xff])
 }
 
-export function deriveSample(values: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2' | 'shift' | 'torq1' | 'torq2'>, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2'>, inertiaKgM2 = 0.3134, torqueCurve: ReadonlyArray<EngineTorquePoint> = defaultEngineTorqueCurve): TelemetrySample {
+export function deriveSample(values: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2' | 'shift' | 'torq1' | 'torq2'> & { fullThrottle?: boolean }, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: Pick<TelemetrySample, 'time' | 'rpm1' | 'rpm2'>, inertiaKgM2 = 0.3134, torqueCurve: ReadonlyArray<EngineTorquePoint> = defaultEngineTorqueCurve): TelemetrySample {
   const power1 = powerMode === 'inertia' ? estimatePrimaryPowerFromCurve(values.rpm1, torqueCurve) : Math.max(0, ((values.torq1 - torqueOffset) * torqueScale * values.rpm1) / 9549)
   const power2 = powerMode === 'inertia' ? estimateSecondaryPowerFromInertia(values.rpm2, previous?.rpm2 ?? values.rpm2, values.time, previous?.time ?? values.time, inertiaKgM2) : Math.max(0, ((values.torq2 - torqueOffset) * torqueScale * values.rpm2) / 9549)
-  return { ...values, power1, power2, efficiency: power1 > 0 ? Math.min(150, (power2 / power1) * 100) : 0 }
+  return { ...values, fullThrottle: values.fullThrottle ?? false, power1, power2, efficiency: power1 > 0 ? Math.min(150, (power2 / power1) * 100) : 0 }
 }
 
 // --- Live event-driven derivation -------------------------------------------------------------
@@ -171,10 +176,11 @@ export type LiveDerivationState = {
   lastRpm2: number
   lastRpm2TimeMs: number
   hasRpm2Sample: boolean
+  fullThrottle: boolean
 }
 
 export function createLiveDerivationState(): LiveDerivationState {
-  return { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0, power1: 0, power2: 0, lastRpm2: 0, lastRpm2TimeMs: 0, hasRpm2Sample: false }
+  return { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0, power1: 0, power2: 0, lastRpm2: 0, lastRpm2TimeMs: 0, hasRpm2Sample: false, fullThrottle: false }
 }
 
 // Guards the inertia dt calculation against pathologically small intervals between "distinct"
@@ -211,6 +217,9 @@ export function applyChannelUpdate(state: LiveDerivationState, channel: ChannelI
   } else if (channel === 2) state.shift = value
   else if (channel === 3) state.torq1 = value
   else if (channel === 4) state.torq2 = value
+  // Channel 5 (full throttle) arrives purely on change, with no rate to forward-fill against --
+  // it's just held as the current boolean state until the next change.
+  else if (channel === 5) state.fullThrottle = value !== 0
 
   state.power1 = powerMode === 'inertia'
     ? estimatePrimaryPowerFromCurve(state.rpm1, torqueCurve)
@@ -221,7 +230,7 @@ export function applyChannelUpdate(state: LiveDerivationState, channel: ChannelI
   }
 
   const efficiency = state.power1 > 0 ? Math.min(150, (state.power2 / state.power1) * 100) : 0
-  return { time: timeMs, rpm1: state.rpm1, rpm2: state.rpm2, shift: state.shift, torq1: state.torq1, torq2: state.torq2, power1: state.power1, power2: state.power2, efficiency }
+  return { time: timeMs, rpm1: state.rpm1, rpm2: state.rpm2, shift: state.shift, torq1: state.torq1, torq2: state.torq2, power1: state.power1, power2: state.power2, efficiency, fullThrottle: state.fullThrottle }
 }
 
 // --- Raw per-channel log -----------------------------------------------------------------------
@@ -244,7 +253,7 @@ export function csvEscape(value: string | number): string {
 // Exported in SI units: seconds, rad/s, newton-meters, and watts. Torque counts are converted to
 // N*m using the current torque scale/zero calibration (the same conversion the app already uses
 // for torque-mode power) so the log is a physically meaningful, self-contained record.
-export const csvHeader = 'timestamp_s,primary_angular_velocity_rad_s,secondary_angular_velocity_rad_s,shift_position_percent,primary_torque_nm,secondary_torque_nm,primary_power_w,secondary_power_w,efficiency_percent'
+export const csvHeader = 'timestamp_s,primary_angular_velocity_rad_s,secondary_angular_velocity_rad_s,shift_position_percent,primary_torque_nm,secondary_torque_nm,primary_power_w,secondary_power_w,efficiency_percent,full_throttle'
 
 export function sampleToCsvRow(sample: TelemetrySample, torqueScale = 1, torqueOffset = 0): string {
   const primaryTorqueNm = (sample.torq1 - torqueOffset) * torqueScale
@@ -259,6 +268,7 @@ export function sampleToCsvRow(sample: TelemetrySample, torqueScale = 1, torqueO
     (sample.power1 * 1000).toFixed(2),
     (sample.power2 * 1000).toFixed(2),
     sample.efficiency.toFixed(2),
+    sample.fullThrottle ? 1 : 0,
   ].map(csvEscape).join(',')
 }
 
@@ -317,6 +327,7 @@ export function parseSamplesCsv(text: string, torqueScale = 1, torqueOffset = 0)
   const power1 = findColumn(header, [{ name: 'primary_power_w', unit: 'w' }, { name: 'primary_power_kw', unit: 'kw' }])
   const power2 = findColumn(header, [{ name: 'secondary_power_w', unit: 'w' }, { name: 'secondary_power_kw', unit: 'kw' }])
   const efficiency = findColumn(header, [{ name: 'efficiency_percent', unit: 'percent' }])
+  const fullThrottle = findColumn(header, [{ name: 'full_throttle', unit: 'bool' }])
   if (!time || !rpm1 || !rpm2) return []
 
   const samples: TelemetrySample[] = []
@@ -336,7 +347,10 @@ export function parseSamplesCsv(text: string, torqueScale = 1, torqueOffset = 0)
     const power1Value = power1?.unit === 'w' ? power1Raw / 1000 : power1Raw
     const power2Value = power2?.unit === 'w' ? power2Raw / 1000 : power2Raw
     const efficiencyValue = efficiency ? Number(cells[efficiency.index]) || 0 : power1Value > 0 ? Math.min(150, (power2Value / power1Value) * 100) : 0
-    samples.push({ time: timeMs, rpm1: rpm1Value, rpm2: rpm2Value, shift: shiftValue, torq1: torq1Value, torq2: torq2Value, power1: power1Value, power2: power2Value, efficiency: efficiencyValue })
+    // Optional column -- older logs (recorded before this input existed) simply don't have it, so
+    // playback of those files just shows no full-throttle highlighting rather than failing.
+    const fullThrottleValue = fullThrottle ? Number(cells[fullThrottle.index]) === 1 : false
+    samples.push({ time: timeMs, rpm1: rpm1Value, rpm2: rpm2Value, shift: shiftValue, torq1: torq1Value, torq2: torq2Value, power1: power1Value, power2: power2Value, efficiency: efficiencyValue, fullThrottle: fullThrottleValue })
   }
   return samples.sort((a, b) => a.time - b.time)
 }

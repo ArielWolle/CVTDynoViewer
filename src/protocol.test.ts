@@ -33,6 +33,11 @@ describe('firmware protocol', () => {
     expect(decodePacket(packet)).toBeNull()
   })
 
+  it('decodes channel 5 (full throttle), sent on change rather than on a schedule', () => {
+    const packet = buildV2Packet(5, 1, 5000, 0)
+    expect(decodePacket(packet)).toEqual({ channel: 5, value: 1, tUs: 5000, seq: 0 })
+  })
+
   it('still decodes the older 8-byte v1 packets (no CRC/timestamp) for pre-upgrade firmware', () => {
     expect(decodePacket(new Uint8Array([0xaa, 0xbb, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678, tUs: 0, seq: 0 })
     expect(decodePacket(new Uint8Array([0xbb, 0xaa, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678, tUs: 0, seq: 0 })
@@ -82,8 +87,8 @@ describe('firmware protocol', () => {
     const torqueScale = 0.01
     const torqueOffset = 5
     const csv = samplesToCsv([
-      { time: 0, rpm1: 1000, rpm2: 900, shift: 10, torq1: 50, torq2: 40, power1: 5, power2: 4, efficiency: 80 },
-      { time: 100, rpm1: 1100, rpm2: 950, shift: 12, torq1: 55, torq2: 42, power1: 6, power2: 4.5, efficiency: 75 },
+      { time: 0, rpm1: 1000, rpm2: 900, shift: 10, torq1: 50, torq2: 40, power1: 5, power2: 4, efficiency: 80, fullThrottle: false },
+      { time: 100, rpm1: 1100, rpm2: 950, shift: 12, torq1: 55, torq2: 42, power1: 6, power2: 4.5, efficiency: 75, fullThrottle: true },
     ], torqueScale, torqueOffset)
     expect(csv).toContain('primary_torque_nm')
     const parsed = parseSamplesCsv(csv, torqueScale, torqueOffset)
@@ -96,6 +101,15 @@ describe('firmware protocol', () => {
     expect(parsed[1].time).toBeCloseTo(100, 1)
     expect(parsed[1].rpm1).toBeCloseTo(1100, 1)
     expect(parsed[1].rpm2).toBeCloseTo(950, 1)
+    expect(parsed[0].fullThrottle).toBe(false)
+    expect(parsed[1].fullThrottle).toBe(true)
+  })
+
+  it('defaults full_throttle to false when reading an older CSV that predates the column', () => {
+    const csv = 'timestamp_s,primary_angular_velocity_rad_s,secondary_angular_velocity_rad_s,shift_position_percent,primary_torque_nm,secondary_torque_nm,primary_power_w,secondary_power_w,efficiency_percent\n0.000,100,90,10,5,4,500,400,80'
+    const parsed = parseSamplesCsv(csv)
+    expect(parsed).toHaveLength(1)
+    expect(parsed[0].fullThrottle).toBe(false)
   })
 
   it('returns an empty array for CSV text missing required columns', () => {
@@ -164,6 +178,20 @@ describe('event-driven live capture', () => {
     // or corrupt the eventual acceleration measurement.
     const afterBurst = applyChannelUpdate(state, 1 as ChannelId, 1030, 50, 1, 0, 'inertia', 0.3134)
     expect(afterBurst.power2).toBeGreaterThan(0)
+  })
+
+  it('holds the full-throttle state across other channels\u2019 updates until it actually changes', () => {
+    const state = createLiveDerivationState()
+    const initial = applyChannelUpdate(state, 0 as ChannelId, 3000, 0, 1, 0, 'torque')
+    expect(initial.fullThrottle).toBe(false)
+    const asserted = applyChannelUpdate(state, 5 as ChannelId, 1, 10, 1, 0, 'torque')
+    expect(asserted.fullThrottle).toBe(true)
+    // An unrelated channel update afterward should keep reporting full throttle as still true --
+    // it only changes on its own channel 5 packets, never forward-filled-away by other channels.
+    const unrelated = applyChannelUpdate(state, 3 as ChannelId, 55, 20, 1, 0, 'torque')
+    expect(unrelated.fullThrottle).toBe(true)
+    const released = applyChannelUpdate(state, 5 as ChannelId, 0, 30, 1, 0, 'torque')
+    expect(released.fullThrottle).toBe(false)
   })
 
   it('formats a lossless raw per-channel log row with firmware time, wall time, and sequence', () => {
