@@ -508,13 +508,21 @@ function App() {
       setNotice(`RPM counts: RPM1=${rpm1Count} (dropped ${rpm1Dropped}), RPM2=${rpm2Count} (dropped ${rpm2Dropped})`)
       return
     }
-    const configMatch = text.match(/^Channel \[(\d)\].*:\s(ENABLED|DISABLED)\s+\|\s+Target Tx Freq:\s+(\d+)\s+Hz$/i)
+    // RPM channels (0/1) print a different tail now -- "Edge-triggered (...)" instead of "Target
+    // Tx Freq: N Hz" -- since they're no longer polled at a configurable rate (see the firmware's
+    // printCurrentConfig()). Match both formats so the enable state still syncs for every channel;
+    // only channels 2-4 have a frequency to also sync.
+    const configMatchPolled = text.match(/^Channel \[(\d)\].*:\s(ENABLED|DISABLED)\s+\|\s+Target Tx Freq:\s+(\d+)\s+Hz$/i)
+    const configMatchEdgeTriggered = text.match(/^Channel \[(\d)\].*:\s(ENABLED|DISABLED)\s+\|\s+Edge-triggered/i)
+    const configMatch = configMatchPolled ?? configMatchEdgeTriggered
     if (configMatch) {
       const channel = Number(configMatch[1])
       const enabled = configMatch[2].toUpperCase() === 'ENABLED'
-      const frequency = Number(configMatch[3])
       setChannels((values) => values.map((value, index) => index === channel ? enabled : value))
-      setFrequencies((values) => values.map((value, index) => index === channel ? frequency : value))
+      if (configMatchPolled) {
+        const frequency = Number(configMatchPolled[3])
+        setFrequencies((values) => values.map((value, index) => index === channel ? frequency : value))
+      }
       setNotice(`Dyno configuration received: ${channelNames[channel]}`)
       return
     }
