@@ -38,6 +38,11 @@ const SENSOR_RETENTION_MS = 300_000
 // that a downsampled curve is visually indistinguishable from the full-fidelity one at a glance.
 const MAX_CHART_POINTS = 1500
 const MAX_CONSOLE_MESSAGES = 500
+// Default chart time-range window: starts pinned at 0s (showing everything so far) until this much
+// data exists, then becomes a rolling window of exactly this width tracking the live edge -- like a
+// scrolling oscilloscope trace -- until the user manually drags the range slider or picks "Full
+// range", at which point their selection is left alone (see ChartWorkspace's rangeStart/rangeEnd).
+const DEFAULT_LIVE_WINDOW_MS = 10000
 // The raw per-channel log is flushed to disk whichever comes first: this many bytes have piled up
 // in memory, or RAW_LOG_FLUSH_DEBOUNCE_MS has elapsed since the last flush. The byte threshold
 // matters specifically at high RPM edge rates (per-tooth streaming, see downsample.ts's comment)
@@ -960,11 +965,19 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   // The time-range-slider selection lives here (not in App) so dragging it only re-renders this
   // subtree. The expensive per-field moving-average computation already happened in App over the
   // full `data`; windowing it down to the selected range here is a cheap filter, not a recompute.
-  const [rangeStart, setRangeStart] = useState(0)
-  const [rangeEnd, setRangeEnd] = useState(1)
+  //
+  // `manualRange` is null until the user takes control (dragging the slider, or picking "Full
+  // range") -- while null, rangeStart/rangeEnd below are derived fresh every render from the
+  // current domain span instead of stored in state, so the window auto-tracks live data with no
+  // extra effect-triggered re-render on every incoming sample: pinned at [0, domain-so-far] until
+  // DEFAULT_LIVE_WINDOW_MS of data exists, then a fixed-width window ending at the live edge.
+  const [manualRange, setManualRange] = useState<{ start: number; end: number } | null>(null)
   const domainStart = data[0]?.time ?? 0
   const domainEnd = data[data.length - 1]?.time ?? domainStart
   const domainSpan = Math.max(0, domainEnd - domainStart)
+  const autoRangeStart = domainSpan <= DEFAULT_LIVE_WINDOW_MS ? 0 : 1 - DEFAULT_LIVE_WINDOW_MS / domainSpan
+  const rangeStart = manualRange ? manualRange.start : autoRangeStart
+  const rangeEnd = manualRange ? manualRange.end : 1
   const windowStartMs = domainStart + rangeStart * domainSpan
   const windowEndMs = domainStart + rangeEnd * domainSpan
   // Downsample AFTER windowing (not before): the time-range slider should still see every sample
@@ -1004,7 +1017,7 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
 
   return <>
     <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the USB transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><label className="ma-toggle" title="Shade time-series chart backgrounds and color relationship-chart points while the full-throttle input is asserted"><input type="checkbox" checked={highlightFullThrottle} onChange={onToggleHighlightFullThrottle} />Highlight full throttle</label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
-    {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => { setRangeStart(next.start); setRangeEnd(next.end) }} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => { setRangeStart(0); setRangeEnd(1) }}>Full range</button></section>}
+    {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => setManualRange(next)} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => setManualRange({ start: 0, end: 1 })}>Full range</button></section>}
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} highlightFullThrottle={highlightFullThrottle} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>
 }
