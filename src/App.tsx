@@ -966,9 +966,33 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   const chartBodyRef = useRef<HTMLDivElement | null>(null)
   const crosshairRef = useRef<HTMLDivElement | null>(null)
   const crosshairHRef = useRef<HTMLDivElement | null>(null)
-  function getPlotRect(chartBody: HTMLDivElement): DOMRect | null {
-    return chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
+  // Cached instead of measured live in the hover path: getBoundingClientRect() forces a
+  // synchronous layout recalculation, and calling it on every single mousemove pixel -- across up
+  // to 8 chart cards, each doing it twice more in the crosshair-positioning effect below -- was
+  // confirmed (via a real INP/Performance trace) to be the dominant cost of chart hover lag,
+  // independent of and on top of raw point count. The plot area's screen position/size only
+  // actually changes when the chart body's box changes (window resize, panel open/close, a card
+  // being hidden/shown), which is exactly what ResizeObserver reports -- so measuring only on
+  // those events instead of on every hover frame eliminates the repeated forced reflows entirely
+  // without ever going stale.
+  const plotRectRef = useRef<DOMRect | null>(null)
+  // The chart body's own rect (the crosshair's positioning offset reference) changes on exactly
+  // the same events as the plot rect above, so it's cached alongside it rather than being a second
+  // live getBoundingClientRect() call per hover frame.
+  const bodyRectRef = useRef<DOMRect | null>(null)
+  function measurePlotRect(chartBody: HTMLDivElement) {
+    plotRectRef.current = chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
+    bodyRectRef.current = chartBody.getBoundingClientRect()
   }
+  useEffect(() => {
+    const chartBody = chartBodyRef.current
+    if (!chartBody) return
+    measurePlotRect(chartBody) // initial synchronous measurement, before any ResizeObserver callback has fired
+    const observer = new ResizeObserver(() => measurePlotRect(chartBody))
+    observer.observe(chartBody)
+    return () => observer.disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally NOT re-running per hover/data change; see comment above
+  }, [])
   // Moving averages propagate downstream (RPM -> power -> efficiency, RPM -> shift ratio). When an
   // upstream field is being averaged, a chart's own raw trace is redundant -- only the resulting
   // (already-cascaded) value is shown, as a single solid line. The "double" raw+average display is
@@ -1000,7 +1024,7 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   }
   function handlePlotMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
     if (!data.length) return
-    const plotRect = getPlotRect(event.currentTarget)
+    const plotRect = plotRectRef.current
     if (!plotRect || plotRect.width <= 0) return
     if (!isRelationshipChart) {
       const fraction = clamp01((event.clientX - plotRect.left) / plotRect.width)
@@ -1036,9 +1060,10 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     if (!crosshairV || !chartBody) return
     const hide = () => { crosshairV.style.display = 'none'; if (crosshairH) crosshairH.style.display = 'none' }
     if (!hoveredPoint) { hide(); return }
-    const plotRect = getPlotRect(chartBody)
+    const plotRect = plotRectRef.current
     if (!plotRect || plotRect.width <= 0) { hide(); return }
-    const bodyRect = chartBody.getBoundingClientRect()
+    const bodyRect = bodyRectRef.current
+    if (!bodyRect) { hide(); return }
     if (!isRelationshipChart) {
       if (data.length < 2) { hide(); return }
       const domainStart = data[0].seconds
