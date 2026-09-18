@@ -92,11 +92,13 @@ export function radPerSecondToRpm(radPerSecond: number): number {
 // Converts a raw per-tooth inter-edge period (as sent by RPM channels 0/1, see the protocol
 // comment below) into RPM, given the wheel's tooth count. teethPerRevolution is purely a
 // display/reconstruction setting on this side -- the firmware has no concept of it at all -- so
-// changing it here takes effect immediately with no firmware round-trip. Returns 0 for
-// non-physical inputs (period_us <= 0, i.e. the reset/discontinuity marker, or a non-positive
-// tooth count) rather than Infinity/NaN from a division by zero.
+// changing it here takes effect immediately with no firmware round-trip. periodUs === 0 is the
+// firmware's explicit "this channel has stopped" report (see the protocol comment below) and
+// correctly returns a real 0 RPM here, not a skipped/ignored value. Negative/non-physical inputs
+// (a bad tooth count) also return 0 rather than Infinity/NaN from a division by zero.
 export function periodUsToRpm(periodUs: number, teethPerRevolution: number): number {
-  if (periodUs <= 0 || teethPerRevolution <= 0) return 0
+  if (periodUs < 0 || teethPerRevolution <= 0) return 0
+  if (periodUs === 0) return 0
   return 60_000_000 / (periodUs * teethPerRevolution)
 }
 
@@ -112,9 +114,11 @@ export function periodUsToRpm(periodUs: number, teethPerRevolution: number): num
 // Channels 0-1 (RPM1/RPM2) are edge-triggered instead of polled: the firmware sends one packet
 // per physical tooth as soon as it's detected, with `value` = the raw inter-edge period in
 // microseconds since the previous tooth on that channel, NOT an RPM value (see periodUsToRpm()
-// below for the conversion this app applies). `value === 0` is a reset/discontinuity marker (the
-// first edge since firmware boot, or the first edge after an idle gap) rather than a real
-// zero-length period, and is NOT converted to RPM -- see applyChannelUpdate().
+// below for the conversion this app applies). `value === 0` is the firmware's explicit "this
+// channel has stopped" report, pushed once after ~500ms with no real edge -- a real reading meant
+// to be applied as RPM === 0 (via periodUsToRpm), not a marker to be ignored. A period is only
+// ever computed from two actual edges on the firmware side, so `value` is never 0 for "first edge,
+// nothing to diff against yet" the way an earlier version of this protocol used it.
 //
 // Transport: the firmware exposes a WebUSB vendor-class interface (see usbTransport.ts), not a
 // virtual COM port -- there is no baud rate, and Windows binds it to WinUSB automatically via the
@@ -227,28 +231,26 @@ const MIN_RPM2_SAMPLE_INTERVAL_MS = 2
  * For channels 0/1 (RPM), `value` is the raw wire period_us (see the protocol comment above), and
  * `primaryTeeth`/`secondaryTeeth` are this app's own display-side tooth counts used to convert it
  * to RPM via periodUsToRpm() -- the firmware has no concept of spoke/tooth count at all anymore,
- * so this conversion happens entirely here. `value === 0` (the reset/discontinuity marker) is NOT
- * converted or applied -- the channel's RPM is simply forward-filled from its last known value,
- * same as any other channel that hasn't updated on this call.
+ * so this conversion happens entirely here. `value === 0` is the firmware's explicit "stopped"
+ * report and is applied normally (periodUsToRpm(0, ...) correctly yields RPM === 0) rather than
+ * being skipped -- it's a real reading, not a marker to ignore.
  */
 export function applyChannelUpdate(state: LiveDerivationState, channel: ChannelId, value: number, timeMs: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode, inertiaKgM2 = 0.3134, torqueCurve: ReadonlyArray<EngineTorquePoint> = defaultEngineTorqueCurve, primaryTeeth = 1, secondaryTeeth = 1): TelemetrySample {
   if (channel === 0) {
-    if (value > 0) state.rpm1 = periodUsToRpm(value, primaryTeeth)
+    state.rpm1 = periodUsToRpm(value, primaryTeeth)
   } else if (channel === 1) {
-    if (value > 0) {
-      const rpm2Value = periodUsToRpm(value, secondaryTeeth)
-      const elapsedSinceLastRpm2 = timeMs - state.lastRpm2TimeMs
-      const longEnough = !state.hasRpm2Sample || elapsedSinceLastRpm2 >= MIN_RPM2_SAMPLE_INTERVAL_MS
-      if (powerMode === 'inertia' && longEnough) {
-        state.power2 = estimateSecondaryPowerFromInertia(rpm2Value, state.hasRpm2Sample ? state.lastRpm2 : rpm2Value, timeMs, state.hasRpm2Sample ? state.lastRpm2TimeMs : timeMs, inertiaKgM2)
-      }
-      if (longEnough) {
-        state.lastRpm2 = rpm2Value
-        state.lastRpm2TimeMs = timeMs
-        state.hasRpm2Sample = true
-      }
-      state.rpm2 = rpm2Value
+    const rpm2Value = periodUsToRpm(value, secondaryTeeth)
+    const elapsedSinceLastRpm2 = timeMs - state.lastRpm2TimeMs
+    const longEnough = !state.hasRpm2Sample || elapsedSinceLastRpm2 >= MIN_RPM2_SAMPLE_INTERVAL_MS
+    if (powerMode === 'inertia' && longEnough) {
+      state.power2 = estimateSecondaryPowerFromInertia(rpm2Value, state.hasRpm2Sample ? state.lastRpm2 : rpm2Value, timeMs, state.hasRpm2Sample ? state.lastRpm2TimeMs : timeMs, inertiaKgM2)
     }
+    if (longEnough) {
+      state.lastRpm2 = rpm2Value
+      state.lastRpm2TimeMs = timeMs
+      state.hasRpm2Sample = true
+    }
+    state.rpm2 = rpm2Value
   } else if (channel === 2) state.shift = value
   else if (channel === 3) state.torq1 = value
   else if (channel === 4) state.torq2 = value

@@ -77,8 +77,11 @@ describe('firmware protocol', () => {
   it('converts a raw per-tooth period to RPM using the given tooth count', () => {
     // 16 teeth, 1000 RPM -> one tooth every 60e6 / (1000 * 16) = 3750us
     expect(periodUsToRpm(3750, 16)).toBeCloseTo(1000, 6)
-    // Non-physical inputs (the reset marker, or a bad tooth count) must not produce Infinity/NaN.
+    // periodUs === 0 is the firmware's explicit "stopped" report -- a real reading, correctly
+    // converting to a real 0 RPM (not skipped, not Infinity/NaN).
     expect(periodUsToRpm(0, 16)).toBe(0)
+    // Other non-physical inputs (a negative period, or a bad tooth count) must not produce
+    // Infinity/NaN either.
     expect(periodUsToRpm(-5, 16)).toBe(0)
     expect(periodUsToRpm(3750, 0)).toBe(0)
   })
@@ -149,24 +152,22 @@ describe('event-driven live capture', () => {
     expect(second).toMatchObject({ rpm1: 3000, shift: 55 })
   })
 
-  it('treats a raw period_us of 0 (the reset/discontinuity marker) as "no update", forward-filling the RPM channel instead of applying it', () => {
+  it('treats a raw period_us of 0 (the firmware\u2019s explicit "stopped" report) as a real RPM === 0 reading, applied like any other update', () => {
     const state = createLiveDerivationState()
     const primed = applyChannelUpdate(state, 0 as ChannelId, rpmToPeriodUs(3000), 0, 1, 0, 'torque')
     expect(primed.rpm1).toBe(3000)
-    // A reset marker (e.g. the first edge after an idle gap) must not be treated as an actual
-    // zero-length period -- rpm1 should hold its last known value, not drop to some huge or
-    // undefined number from dividing by a near-zero period.
-    const afterReset = applyChannelUpdate(state, 0 as ChannelId, 0, 10, 1, 0, 'torque')
-    expect(afterReset.rpm1).toBe(3000)
+    // The firmware only ever sends periodUs === 0 to explicitly report a channel has stopped (see
+    // RpmCounter::pollStale() in the firmware) -- this must actually zero out rpm1, not hold the
+    // last nonzero reading forever.
+    const afterStop = applyChannelUpdate(state, 0 as ChannelId, 0, 10, 1, 0, 'torque')
+    expect(afterStop.rpm1).toBe(0)
   })
 
   it('in inertia mode, only recomputes secondary power when rpm2 itself updates, holding the last value on other channels', () => {
     const state = createLiveDerivationState()
     // The very first rpm2 sample has no prior baseline to differentiate against (matching
-    // `deriveSample`'s own convention), so it establishes a baseline with zero power regardless of
-    // the specific value -- a low idle-like RPM here, since a real period_us of 0 would instead be
-    // the reset marker (see the test above) rather than an "at rest" reading.
-    applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(50), 0, 1, 0, 'inertia', 0.3134)
+    // `deriveSample`'s own convention), so it establishes a baseline at rest with zero power.
+    applyChannelUpdate(state, 1 as ChannelId, 0, 0, 1, 0, 'inertia', 0.3134)
     // rpm2 then accelerates to 1800 over the next 100ms -- a real acceleration event.
     const rpm2Update = applyChannelUpdate(state, 1 as ChannelId, rpmToPeriodUs(1800), 100, 1, 0, 'inertia', 0.3134)
     expect(rpm2Update.power2).toBeGreaterThan(0)

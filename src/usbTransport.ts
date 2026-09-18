@@ -2,7 +2,7 @@ import { decodePacket, TELEMETRY_PACKET_LEN, TELEMETRY_SYNC0, TELEMETRY_SYNC1, t
 
 export type UsbHandlers = {
   onValue: (channel: ChannelId, value: number, tUs: number, seq: number) => void
-  onPacket?: (raw: Uint8Array, channel: ChannelId, value: number) => void
+  onPacket?: (raw: Uint8Array, channel: ChannelId, value: number, seq: number) => void
   onText: (text: string) => void
 }
 
@@ -26,6 +26,16 @@ const VENDOR_REQUEST_SET_LINE_STATE = 0x22
 // USB bulk packets (up to this many bytes), so this is a throughput/latency tradeoff, not a
 // hard protocol limit -- comfortably above the largest realistic burst between reads.
 const READ_CHUNK_SIZE = 4096
+
+// Must match platformio.ini's board_build.arduino.earlephilhower.usb_vid/usb_pid exactly -- these
+// are what let the browser recognize "this is our device" without the user having to eyeball
+// "CVT Dyno" in a list of similarly-generic-looking USB devices.
+const DEVICE_VENDOR_ID = 0x1209
+const DEVICE_PRODUCT_ID = 0xcd10
+
+function matchesOurDevice(device: USBDevice): boolean {
+  return device.vendorId === DEVICE_VENDOR_ID && device.productId === DEVICE_PRODUCT_ID
+}
 
 function findVendorInterface(device: USBDevice): { interfaceNumber: number; endpointIn: number; endpointOut: number } | null {
   for (const iface of device.configuration?.interfaces ?? []) {
@@ -55,9 +65,20 @@ export class UsbTransport {
 
   async connect() {
     if (!('usb' in navigator)) throw new Error('WebUSB is not supported in this browser.')
-    // Empty filter list shows every USB device the OS/browser will allow raw access to in the
-    // chooser -- we don't hardcode a VID/PID here since the firmware doesn't customize them.
-    const device = await navigator.usb.requestDevice({ filters: [] })
+
+    // Once a user has granted this origin permission for our device (via requestDevice() below,
+    // which always needs a user gesture the first time), the browser remembers that grant --
+    // getDevices() returns previously-authorized devices with NO chooser dialog at all. So every
+    // connect after the first is a single click with no picker, as long as the same device is
+    // plugged in and this origin hasn't had its USB permission revoked.
+    const authorized = await navigator.usb.getDevices()
+    let device = authorized.find(matchesOurDevice)
+    if (!device) {
+      // First-time pairing (or permission was revoked/a different device is plugged in) -- filter
+      // the chooser to our exact vendor/product ID so the user sees "CVT Dyno" alone rather than
+      // having to pick it out of every USB device on the system.
+      device = await navigator.usb.requestDevice({ filters: [{ vendorId: DEVICE_VENDOR_ID, productId: DEVICE_PRODUCT_ID }] })
+    }
     await device.open()
     if (!device.configuration) await device.selectConfiguration(1)
 
@@ -138,7 +159,7 @@ export class UsbTransport {
       if (this.buffer.length < header.length) return
       const packet = decodePacket(this.buffer.slice(0, header.length))
       if (packet) {
-        this.handlers.onPacket?.(this.buffer.slice(0, header.length), packet.channel, packet.value)
+        this.handlers.onPacket?.(this.buffer.slice(0, header.length), packet.channel, packet.value, packet.seq)
         this.handlers.onValue(packet.channel, packet.value, packet.tUs, packet.seq)
         this.buffer = this.buffer.slice(header.length)
       } else {

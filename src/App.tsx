@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceArea, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
-import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
+import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, parseSamplesCsv, periodUsToRpm, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
 import { UsbTransport } from './usbTransport'
+import { downsampleForChart } from './downsample'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { TimeRangeSlider } from './TimeRangeSlider'
 
@@ -31,7 +32,19 @@ const defaultCharts: ChartConfig[] = [
 
 const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
 const SENSOR_RETENTION_MS = 300_000
+// Caps how many points any single chart actually renders (see downsample.ts) -- independent of
+// how many samples are retained/logged. 1500 is comfortably within where Recharts (SVG-based, no
+// built-in decimation) stays smooth on typical hardware, while still showing enough resolution
+// that a downsampled curve is visually indistinguishable from the full-fidelity one at a glance.
+const MAX_CHART_POINTS = 1500
 const MAX_CONSOLE_MESSAGES = 500
+// The raw per-channel log is flushed to disk whichever comes first: this many bytes have piled up
+// in memory, or RAW_LOG_FLUSH_DEBOUNCE_MS has elapsed since the last flush. The byte threshold
+// matters specifically at high RPM edge rates (per-tooth streaming, see downsample.ts's comment)
+// -- without it, a fast burst would still sit in memory for the full debounce window before
+// becoming durable, which is exactly the latency this log is meant to minimize.
+const RAW_LOG_FLUSH_BYTES = 65_536
+const RAW_LOG_FLUSH_DEBOUNCE_MS = 200
 const KW_TO_HP = 1.341022
 // Full-throttle highlighting colors: a translucent band behind time-series charts while the
 // engine is at full throttle, and the same solid color for relationship-chart dots/points
@@ -507,14 +520,21 @@ function App() {
     }
     setNotice(text)
   }
-  function handleUsbPacket(rawPacket: Uint8Array, channel: ChannelId, value: number) {
+  function handleUsbPacket(rawPacket: Uint8Array, channel: ChannelId, value: number, seq: number) {
     // Skip formatting/buffering entirely when the sensor console view is off -- at real telemetry
     // rates (up to 50 Hz now, potentially much higher per-channel later) doing this unconditionally
     // for every single packet would itself become a rendering bottleneck. When it is on, lines are
     // buffered and flushed in a batch (see the display-throttle effect) rather than one React
     // state update per packet.
     if (!showSensorConsoleRef.current) return
-    pendingConsoleLinesRef.current.push(`[RAW SENSOR] ${bytesToHex(rawPacket)} | [DECODED] ${channelNames[channel]} = ${value}`)
+    // RPM channels carry a raw period_us on the wire, not RPM (see protocol.ts) -- show both the
+    // raw value and the translated RPM (using this app's own tooth-count setting) so the console
+    // is actually readable at a glance instead of just a period figure. seq is labeled explicitly
+    // (not a bare number) since it's otherwise ambiguous next to the other figures on the line.
+    const decoded = channel === 0 || channel === 1
+      ? `${channelNames[channel]} = ${value}us (seq #${seq}) -> ${formatNumber(periodUsToRpm(value, channel === 0 ? primarySpokesRef.current : secondarySpokesRef.current), 1)} RPM`
+      : `${channelNames[channel]} = ${value} (seq #${seq})`
+    pendingConsoleLinesRef.current.push(`[RAW SENSOR] ${bytesToHex(rawPacket)} | [DECODED] ${decoded}`)
   }
   function bytesToHex(bytes: Uint8Array) { return [...bytes].map((byte) => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ') }
   async function sendRawCommand(bytes: Uint8Array, description = 'Custom command') {
@@ -531,9 +551,16 @@ function App() {
   async function toggleFirmwareDemo() {
     if (!transport.current) { setNotice('Connect the firmware before enabling bench mode'); return }
     const enabled = !firmwareDemoMode
-    await transport.current.send(encodeCommand(4, 0, enabled ? 1 : 0))
-    setFirmwareDemoMode(enabled)
-    setNotice(enabled ? 'Firmware bench mode enabled' : 'Firmware sensors enabled')
+    // Wrapped in try/catch (unlike a previous version of this function) so a failed send can't
+    // silently leave the button showing the old state with no indication anything went wrong --
+    // matches the pattern already used by the other firmware-toggle functions below.
+    try {
+      await transport.current.send(encodeCommand(4, 0, enabled ? 1 : 0))
+      setFirmwareDemoMode(enabled)
+      setNotice(enabled ? 'Firmware bench mode enabled' : 'Firmware sensors enabled')
+    } catch {
+      setNotice('Could not change bench mode')
+    }
   }
   async function toggleRpmPinTest() {
     if (!transport.current) { setNotice('Connect the firmware before starting the RPM pin test'); return }
@@ -590,6 +617,25 @@ function App() {
     }
     channelSeqRef.current[channel] = seq
 
+    // Raw per-channel logging is the single highest-priority thing this handler does: it's queued
+    // immediately from the packet's own fields (channel/value/tUs/seq), BEFORE the wide-row
+    // derivation below or anything display-related, so it has zero dependency on -- and can never
+    // be delayed by -- applyChannelUpdate()'s computation or the display buffer. It's also flushed
+    // to disk sooner and on a shorter fuse than the derived CSV (see commitRawLog()/
+    // RAW_LOG_FLUSH_BYTES below): this is the lossless source-of-truth capture, so minimizing how
+    // long it sits only in memory (rather than durably on disk) matters more for it than for the
+    // resampled/display-oriented wide CSV.
+    if (loggingRef.current && rawLogWriter.current) {
+      pendingRawLogRows.current += rawLogRow(channel, value, tUs, sampleTimeMs, seq) + '\n'
+      if (pendingRawLogRows.current.length >= RAW_LOG_FLUSH_BYTES) {
+        window.clearTimeout(rawLogCommitTimer.current)
+        rawLogCommitTimer.current = undefined
+        void commitRawLog(true)
+      } else if (rawLogCommitTimer.current === undefined) {
+        rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
+      }
+    }
+
     const sample = applyChannelUpdate(
       liveStateRef.current, channel, value, sampleTimeMs,
       torqueScaleRef.current, torqueOffsetRef.current, powerModeRef.current, inertiaKgM2Ref.current, torqueCurveRef.current,
@@ -598,15 +644,9 @@ function App() {
 
     displayBufferRef.current.push(sample)
 
-    if (loggingRef.current) {
-      if (logWriter.current) {
-        pendingLogRows.current += sampleToCsvRow(sample, torqueScaleRef.current, torqueOffsetRef.current) + '\n'
-        if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
-      }
-      if (rawLogWriter.current) {
-        pendingRawLogRows.current += rawLogRow(channel, value, tUs, sampleTimeMs, seq) + '\n'
-        if (rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, 500)
-      }
+    if (loggingRef.current && logWriter.current) {
+      pendingLogRows.current += sampleToCsvRow(sample, torqueScaleRef.current, torqueOffsetRef.current) + '\n'
+      if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
     }
   }
   // RPM channels (0/1) are edge-triggered now, not polled -- command 0x02 (target frequency) is
@@ -702,7 +742,7 @@ function App() {
     } catch { setNotice('Could not commit the raw log file') }
     finally {
       rawLogCommitInProgress.current = false
-      if (reopen && pendingRawLogRows.current && rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, 500)
+      if (reopen && pendingRawLogRows.current && rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
     }
   }
   async function startLogging() {
@@ -857,7 +897,13 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const domainSpan = Math.max(0, domainEnd - domainStart)
   const windowStartMs = domainStart + rangeStart * domainSpan
   const windowEndMs = domainStart + rangeEnd * domainSpan
-  const chartData = useMemo(() => data.filter((point) => point.time >= windowStartMs && point.time <= windowEndMs), [data, windowStartMs, windowEndMs])
+  // Downsample AFTER windowing (not before): the time-range slider should still see every sample
+  // within its selected window get a fair chance to be rendered, and zooming into a smaller window
+  // naturally reduces the point count below MAX_CHART_POINTS, at which point downsampleForChart()
+  // is a no-op and the view is full-fidelity again. See downsample.ts for why RPM's move to
+  // per-tooth streaming (up to ~1-2 kHz instead of a fixed 20 Hz) made this necessary.
+  const windowedData = useMemo(() => data.filter((point) => point.time >= windowStartMs && point.time <= windowEndMs), [data, windowStartMs, windowEndMs])
+  const chartData = useMemo(() => downsampleForChart(windowedData, MAX_CHART_POINTS), [windowedData])
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const hoverFrameRef = useRef<number | null>(null)
   const pendingHoverRef = useRef<number | null>(null)
