@@ -28,13 +28,17 @@ const VENDOR_INTERFACE_PROTOCOL = 0x00
 const VENDOR_REQUEST_SET_LINE_STATE = 0x22
 const READ_CHUNK_SIZE = 4096
 
-export type WorkerDecodedPacket = { channel: ChannelId; value: number; tUs: number; seq: number; raw: Uint8Array }
+export type WorkerDecodedPacket = { channel: ChannelId; value: number; tUs: number; seq: number; edgeCount: number; raw: Uint8Array }
 
 export type WorkerOutboundMessage =
   | { type: 'connected' }
   | { type: 'connect-error'; message: string }
   | { type: 'disconnected'; reason?: string }
-  | { type: 'chunk'; packets: WorkerDecodedPacket[]; texts: string[] }
+  // overflowDropped is almost always 0 -- see MAX_BUFFERED_PACKETS below -- and is only nonzero
+  // when this specific delivery includes a report of packets dropped from the internal buffer
+  // since the last delivery (an extreme, sustained main-thread stall well beyond what the buffer's
+  // generous cap is sized to absorb).
+  | { type: 'chunk'; packets: WorkerDecodedPacket[]; texts: string[]; overflowDropped: number }
   | { type: 'send-error'; message: string }
 
 export type WorkerInboundMessage =
@@ -43,34 +47,56 @@ export type WorkerInboundMessage =
   | { type: 'disconnect' }
   | { type: 'ack' }
 
-// Backpressure: without this, the read loop below would call transferIn() and postMessage() a
-// decoded chunk as fast as the device provides data, with zero regard for whether the main thread
-// has even finished processing the PREVIOUS chunk yet -- postMessage() never blocks, so if main-
-// thread processing (handleValue's derivation/logging per packet) is ever slower than the
-// incoming data rate, a backlog would build up in the browser's own worker message queue with no
-// upper bound, and -- critically -- never self-correct, since nothing here would ever slow back
-// down once behind. Before this file existed, the single-threaded read loop had this for free:
-// the next transferIn() simply couldn't start until the previous chunk's handler calls returned,
-// which (worst case) let USB-level flow control and the firmware's own TX FIFO absorb the
-// slowdown. This credit gate reproduces that same real-time throttling explicitly: the worker
-// only issues up to CREDIT_WINDOW transferIn() calls ahead of what the main thread has actually
-// finished processing (see the 'ack' message main-thread side, sent once per chunk after its
-// synchronous handler loop returns), stalling readLoop() itself -- not just the postMessage --
-// once exhausted, so a genuinely-too-slow consumer naturally pushes back all the way to the
-// firmware's write() calls instead of piling up invisibly in this thread's memory.
-const CREDIT_WINDOW = 2
-let credits = CREDIT_WINDOW
-let creditWaiters: Array<() => void> = []
+// --- Two decoupled stages: an unthrottled read loop, and a paced delivery loop ------------------
+// Earlier this file had ONE combined loop: transferIn() -> decode -> postMessage(), gated by a
+// small credit window that only refilled once the main thread acked having processed the previous
+// chunk. That tied how fast USB got drained directly to main-thread processing speed -- if the
+// main thread was ever behind, the read loop itself stalled, which (worse) could leave the
+// firmware's own RPM event ring buffer (a comparatively scarce, fixed-size resource -- see
+// EVENT_RING_SIZE in RpmCounter.cpp) filling up and dropping physical edges that the host would
+// never even find out about via a sequence-number gap (see protocol.ts's edgeCount comment).
+//
+// Now: the READ loop (below) never waits on the main thread at all -- it keeps calling
+// transferIn() and decoding as fast as the device provides data, appending into the bounded
+// buffer below. This is what actually keeps the firmware's ring from overflowing during a
+// transient host-side stall: the device's own tiny local FIFO gets drained continuously, so
+// usb_web.write() on the firmware side never blocks waiting for the host. The DELIVERY loop
+// (tryDeliver(), triggered after every buffer push and every 'ack') is the only place backpressure
+// from the main thread still applies -- it hands off bounded batches, gated by a small credit
+// window exactly like before, so the browser's own internal postMessage queue can't grow without
+// bound either. The bounded backlog this whole scheme can ever accumulate now lives in cheap,
+// effectively-unlimited host RAM (see MAX_BUFFERED_PACKETS) instead of the firmware's scarce RAM
+// or the main thread's now-decoupled processing rate.
+const MAX_BUFFERED_PACKETS = 50_000 // a few MB worst case -- comfortably absorbs any realistic stall
+const DELIVERY_BATCH_SIZE = 500 // caps how much a single delivered message asks the main thread to process at once
+const DELIVERY_CREDIT_WINDOW = 2
 
-function takeCredit(): Promise<void> {
-  if (credits > 0) { credits -= 1; return Promise.resolve() }
-  return new Promise((resolve) => creditWaiters.push(resolve))
+let bufferedPackets: WorkerDecodedPacket[] = []
+let bufferedTexts: string[] = []
+let bufferOverflowDropped = 0
+let deliveryCredits = DELIVERY_CREDIT_WINDOW
+
+// Drop-newest on overflow, matching the same policy the firmware's own ring buffer uses (see
+// RpmCounter.cpp's pushEdge()) -- and count it instead of growing without bound or silently
+// discarding without any visibility.
+function bufferPacket(packet: WorkerDecodedPacket) {
+  if (bufferedPackets.length >= MAX_BUFFERED_PACKETS) { bufferOverflowDropped++; return }
+  bufferedPackets.push(packet)
+}
+function bufferText(text: string) {
+  if (bufferedTexts.length >= MAX_BUFFERED_PACKETS) { bufferOverflowDropped++; return }
+  bufferedTexts.push(text)
 }
 
-function grantCredit() {
-  const waiter = creditWaiters.shift()
-  if (waiter) waiter() // handed directly to whoever's waiting -- credits itself stays unchanged
-  else credits += 1
+function tryDeliver() {
+  while (deliveryCredits > 0 && (bufferedPackets.length > 0 || bufferedTexts.length > 0)) {
+    const packets = bufferedPackets.splice(0, DELIVERY_BATCH_SIZE)
+    const texts = bufferedTexts.splice(0, DELIVERY_BATCH_SIZE)
+    deliveryCredits -= 1
+    const overflowDropped = bufferOverflowDropped
+    bufferOverflowDropped = 0
+    post({ type: 'chunk', packets, texts, overflowDropped })
+  }
 }
 
 function matchesDevice(device: USBDevice, vendorId: number, productId: number): boolean {
@@ -126,8 +152,10 @@ async function connect(vendorId: number, productId: number) {
     endpointOut = vendorInterface.endpointOut
     buffer = new Uint8Array()
     reading = true
-    credits = CREDIT_WINDOW
-    creditWaiters = []
+    bufferedPackets = []
+    bufferedTexts = []
+    bufferOverflowDropped = 0
+    deliveryCredits = DELIVERY_CREDIT_WINDOW
     post({ type: 'connected' })
     readLoop()
   } catch (error) {
@@ -161,23 +189,14 @@ async function send(bytes: Uint8Array) {
   }
 }
 
+// Unthrottled: no credit/backpressure of any kind here -- see the top-of-file comment for why.
 async function readLoop() {
   while (reading && device) {
-    await takeCredit()
-    if (!reading || !device) break // disconnect() may have run while we were waiting for credit
     try {
       const result = await device.transferIn(endpointIn, READ_CHUNK_SIZE)
-      let posted = false
       if (result.status === 'ok' && result.data && result.data.byteLength > 0) {
-        posted = consume(new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength))
+        consume(new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength))
       }
-      // No chunk means no corresponding 'ack' will ever arrive from the main thread to return
-      // this credit -- a zero-length read, or a read that only completed a partial packet/line
-      // with nothing yet ready to emit, are both routine and would otherwise leak one credit each
-      // time, eventually stalling the read loop for good even with a main thread that's fully
-      // caught up. Granting it back immediately (rather than waiting on an ack) keeps the credit
-      // count meaning exactly "chunks currently awaiting processing", not "reads issued".
-      if (!posted) grantCredit()
     } catch (error) {
       if (!reading) break // disconnect() already tore this down; not a real failure
       post({ type: 'disconnected', reason: error instanceof Error ? error.message : 'USB read failed' })
@@ -189,24 +208,20 @@ async function readLoop() {
 
 // --- Framing/parsing below is unchanged from the previous main-thread UsbTransport: a stream of
 // bytes in, sync-byte/CRC-framed binary telemetry packets and newline-delimited text interleaved
-// on the same stream out. The only difference is the sink -- instead of calling handler callbacks
-// directly, one chunk's worth of results is collected and posted as a single message so the main
-// thread does one batched postMessage-handling task per transferIn() resolution, same as it did
-// per read before this file existed. ---
+// on the same stream out. The only difference is the sink -- decoded packets/texts are appended to
+// the bounded buffer above (then handed off by the separate, paced delivery loop) instead of being
+// posted directly here. ---
 
-function consume(chunk: Uint8Array): boolean {
+function consume(chunk: Uint8Array) {
   const combined = new Uint8Array(buffer.length + chunk.length)
   combined.set(buffer)
   combined.set(chunk, buffer.length)
   buffer = combined
 
-  const packets: WorkerDecodedPacket[] = []
-  const texts: string[] = []
-
   const emitText = (bytes: Uint8Array) => {
     const text = textDecoder.decode(bytes)
     for (const line of text.split(/\r?\n/)) {
-      if (line.trim()) texts.push(line.trim())
+      if (line.trim()) bufferText(line.trim())
     }
   }
   const findPacketHeader = (): { index: number; length: number } | null => {
@@ -236,7 +251,7 @@ function consume(chunk: Uint8Array): boolean {
     const raw = buffer.slice(0, header.length)
     const packet = decodePacket(raw)
     if (packet) {
-      packets.push({ channel: packet.channel, value: packet.value, tUs: packet.tUs, seq: packet.seq, raw })
+      bufferPacket({ channel: packet.channel, value: packet.value, tUs: packet.tUs, seq: packet.seq, edgeCount: packet.edgeCount, raw })
       buffer = buffer.slice(header.length)
     } else {
       // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop only the
@@ -247,8 +262,7 @@ function consume(chunk: Uint8Array): boolean {
     }
   }
 
-  if (packets.length || texts.length) { post({ type: 'chunk', packets, texts }); return true }
-  return false
+  tryDeliver()
 }
 
 self.onmessage = (event: MessageEvent<WorkerInboundMessage>) => {
@@ -256,5 +270,5 @@ self.onmessage = (event: MessageEvent<WorkerInboundMessage>) => {
   if (message.type === 'connect') void connect(message.vendorId, message.productId)
   else if (message.type === 'send') void send(message.bytes)
   else if (message.type === 'disconnect') void disconnect()
-  else if (message.type === 'ack') grantCredit()
+  else if (message.type === 'ack') { deliveryCredits += 1; tryDeliver() }
 }

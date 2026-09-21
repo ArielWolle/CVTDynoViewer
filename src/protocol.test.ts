@@ -6,9 +6,9 @@ function rpmToPeriodUs(rpm: number, teethPerRevolution = 1): number {
   return rpm > 0 ? 60_000_000 / (rpm * teethPerRevolution) : 0
 }
 
-/** Builds a valid v2 telemetry packet (matching the firmware's framing) for test fixtures. */
-function buildV2Packet(channel: number, value: number, tUs: number, seq: number, corruptCrc = false): Uint8Array {
-  const packet = new Uint8Array(17)
+/** Builds a valid v3 telemetry packet (matching the firmware's framing) for test fixtures. */
+function buildV3Packet(channel: number, value: number, tUs: number, seq: number, edgeCount = 0, corruptCrc = false): Uint8Array {
+  const packet = new Uint8Array(21)
   packet[0] = TELEMETRY_SYNC0
   packet[1] = TELEMETRY_SYNC1
   packet[2] = channel
@@ -17,35 +17,36 @@ function buildV2Packet(channel: number, value: number, tUs: number, seq: number,
   view.setInt32(4, value, true)
   view.setUint32(8, tUs >>> 0, true)
   view.setUint32(12, Math.floor(tUs / 4294967296), true)
-  packet[16] = crc8(packet.slice(2, 16))
-  if (corruptCrc) packet[16] ^= 0xff
+  view.setUint32(16, edgeCount, true)
+  packet[20] = crc8(packet.slice(2, 20))
+  if (corruptCrc) packet[20] ^= 0xff
   return packet
 }
 
 describe('firmware protocol', () => {
-  it('decodes v2 telemetry packets with a firmware timestamp and sequence number', () => {
-    const packet = buildV2Packet(3, 5678, 123456789012, 42)
-    expect(decodePacket(packet)).toEqual({ channel: 3, value: 5678, tUs: 123456789012, seq: 42 })
+  it('decodes v3 telemetry packets with a firmware timestamp, sequence number, and edge counter', () => {
+    const packet = buildV3Packet(3, 5678, 123456789012, 42, 9)
+    expect(decodePacket(packet)).toEqual({ channel: 3, value: 5678, tUs: 123456789012, seq: 42, edgeCount: 9 })
   })
 
-  it('rejects a v2 packet with a corrupted CRC instead of misdecoding it', () => {
-    const packet = buildV2Packet(3, 5678, 1000, 1, true)
+  it('rejects a v3 packet with a corrupted CRC instead of misdecoding it', () => {
+    const packet = buildV3Packet(3, 5678, 1000, 1, 0, true)
     expect(decodePacket(packet)).toBeNull()
   })
 
-  it('rejects a v2-looking packet with an out-of-range channel', () => {
-    const packet = buildV2Packet(9, 1, 1000, 0)
+  it('rejects a v3-looking packet with an out-of-range channel', () => {
+    const packet = buildV3Packet(9, 1, 1000, 0)
     expect(decodePacket(packet)).toBeNull()
   })
 
   it('decodes channel 5 (full throttle), sent on change rather than on a schedule', () => {
-    const packet = buildV2Packet(5, 1, 5000, 0)
-    expect(decodePacket(packet)).toEqual({ channel: 5, value: 1, tUs: 5000, seq: 0 })
+    const packet = buildV3Packet(5, 1, 5000, 0)
+    expect(decodePacket(packet)).toEqual({ channel: 5, value: 1, tUs: 5000, seq: 0, edgeCount: 0 })
   })
 
-  it('still decodes the older 8-byte v1 packets (no CRC/timestamp) for pre-upgrade firmware', () => {
-    expect(decodePacket(new Uint8Array([0xaa, 0xbb, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678, tUs: 0, seq: 0 })
-    expect(decodePacket(new Uint8Array([0xbb, 0xaa, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678, tUs: 0, seq: 0 })
+  it('still decodes the older 8-byte v1 packets (no CRC/timestamp/edge counter) for pre-upgrade firmware', () => {
+    expect(decodePacket(new Uint8Array([0xaa, 0xbb, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678, tUs: 0, seq: 0, edgeCount: 0 })
+    expect(decodePacket(new Uint8Array([0xbb, 0xaa, 3, 0, 0x2e, 0x16, 0, 0]))).toEqual({ channel: 3, value: 5678, tUs: 0, seq: 0, edgeCount: 0 })
   })
 
   it('encodes commands with a leading sync byte and big-endian value', () => {
@@ -222,8 +223,8 @@ describe('event-driven live capture', () => {
     expect(released.fullThrottle).toBe(false)
   })
 
-  it('formats a lossless raw per-channel log row with firmware time, wall time, and sequence', () => {
-    const row = rawLogRow(1 as ChannelId, 4200, 123456789, 1500.25, 7)
-    expect(row).toBe('123456789,1.500250,1,Secondary RPM,7,4200')
+  it('formats a lossless raw per-channel log row with firmware time, wall time, sequence, and edge count', () => {
+    const row = rawLogRow(1 as ChannelId, 4200, 123456789, 1500.25, 7, 99)
+    expect(row).toBe('123456789,1.500250,1,Secondary RPM,7,4200,99')
   })
 })
