@@ -698,33 +698,45 @@ function App() {
       sampleTimeMs = timeOffsetMsRef.current + tUs / 1000
     }
 
-    // Per-channel rolling sequence number (0..255, wraps) lets dropped packets be detected and
-    // surfaced instead of silently vanishing. This ONLY reveals loss AFTER a packet was already
-    // queued for transmission (seq is assigned at transmit time) -- see the edgeCount block right
-    // below for the other, previously-invisible kind of loss.
+    // Per-channel rolling sequence number (0..255, wraps) lets downstream/USB-transmission loss be
+    // detected and surfaced instead of silently vanishing: a gap here means N packets were
+    // successfully built (tx_seq assigned) and written to USB, but never received. This can only
+    // reveal loss AFTER a packet was already queued for transmission -- see the edgeCount block
+    // right below for the other, previously-invisible kind of loss.
     const expectedSeq = channelSeqRef.current[channel]
+    let seqGap = 0
     if (tUs > 0 && expectedSeq !== -1) {
-      const missed = (seq - expectedSeq - 1) & 0xff
-      if (missed > 0) droppedPacketsRef.current += missed
+      seqGap = (seq - expectedSeq - 1) & 0xff
+      if (seqGap > 0) droppedPacketsRef.current += seqGap
     }
     channelSeqRef.current[channel] = seq
 
     // Per-RPM-channel physical edge counter (protocol v3+, see protocol.ts's edgeCount comment)
-    // reveals a DIFFERENT kind of loss: an edge dropped by the firmware's own ring buffer before
-    // it was ever queued for transmission at all. Unlike the sequence number above, tx_seq only
-    // increments on actual transmission, so a ring-dropped edge is completely invisible to seq-gap
-    // detection -- it just never happened as far as seq is concerned, looking identical to "nothing
-    // was lost". Reset whenever this channel reports periodUs===0 (stopped): that's a fresh epoch
-    // on the firmware side (see RpmCounter.cpp's checkStale()), so the edge count right after a
-    // restart can't be meaningfully compared to whatever came before the stop.
+    // additionally reveals loss that happens BEFORE a packet is ever built at all (e.g. the
+    // firmware's ring buffer overflowing) -- edgeCount is assigned at ISR time, strictly before
+    // tx_seq is ever assigned at transmit time, so a ring-dropped edge never reaches tx_seq and is
+    // completely invisible to the seq-gap check above on its own.
+    //
+    // Every edge that DOES get transmitted increments both edgeCount and seq together, so any
+    // downstream/USB loss (a seq gap) inherently ALSO shows up as an edge-count gap of the exact
+    // same size -- edgeCount can never advance less than seq between two received packets.
+    // Subtracting the already-counted seqGap from the raw edge-count gap isolates only the loss
+    // seqGap can't explain (edges that never even reached the point of being assigned a sequence
+    // number), keeping the two metrics mutually exclusive instead of double-counting the same lost
+    // edge under both "dropped" and "lost (device)".
+    //
+    // Reset whenever this channel reports periodUs===0 (stopped): that's a fresh epoch on the
+    // firmware side (see RpmCounter.cpp's checkStale()), so the edge count right after a restart
+    // can't be meaningfully compared to whatever came before the stop.
     if (channel === 0 || channel === 1) {
       if (value === 0) {
         lastEdgeCountRef.current[channel] = -1
       } else {
         const lastEdgeCount = lastEdgeCountRef.current[channel]
         if (lastEdgeCount !== -1) {
-          const lostEdges = (edgeCount - lastEdgeCount - 1) >>> 0
-          if (lostEdges > 0) lostEdgesRef.current[channel] += lostEdges
+          const edgeGap = (edgeCount - lastEdgeCount - 1) >>> 0
+          const deviceOnlyLoss = Math.max(0, edgeGap - seqGap)
+          if (deviceOnlyLoss > 0) lostEdgesRef.current[channel] += deviceOnlyLoss
         }
         lastEdgeCountRef.current[channel] = edgeCount
       }
@@ -783,7 +795,20 @@ function App() {
     await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0))
     if (channel > 1) await transport.current.send(encodeCommand(2, channel, frequency))
   }
-  function updateChannel(channel: number, enabled: boolean) { setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value)); void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration')) }
+  function updateChannel(channel: number, enabled: boolean) {
+    setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value))
+    // The firmware's RpmCounter keeps incrementing edgeCount for real edges even while a channel
+    // is disabled -- disabling only stops the drain loop from building/sending a packet for them
+    // (see RpmCounter.cpp's edgeCount comment and this file's cfg_write_en discussion above), it
+    // doesn't stop the underlying edge from being counted. Without resetting the baseline here,
+    // every edge that occurred during the disabled window would show up as a sudden, spurious
+    // "device-side loss" spike on the very first packet after re-enabling -- edges the firmware
+    // never intended to transmit in the first place, not a real loss. Resetting on EITHER
+    // direction of the toggle (not just re-enabling) keeps this simple and correct regardless of
+    // how long the channel stays disabled.
+    if (channel === 0 || channel === 1) lastEdgeCountRef.current[channel] = -1
+    void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration'))
+  }
   function updateFrequency(channel: number, frequency: number) { setFrequencies((previous) => previous.map((value, index) => index === channel ? frequency : value)); void sendConfig(channel, channels[channel], frequency).catch(() => setNotice('Could not send frequency configuration')) }
   // Local-only display setting now -- see the primarySpokes/secondarySpokes state comment. No
   // firmware command is sent; command 0x06 (the old "set RPM spoke count") is reserved/removed on
