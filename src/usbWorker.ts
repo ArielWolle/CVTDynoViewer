@@ -67,6 +67,10 @@ export type WorkerInboundMessage =
 // bound either. The bounded backlog this whole scheme can ever accumulate now lives in cheap,
 // effectively-unlimited host RAM (see MAX_BUFFERED_PACKETS) instead of the firmware's scarce RAM
 // or the main thread's now-decoupled processing rate.
+// Shared cap for both buffers below (not just packets, despite the name) -- text lines are rare
+// (config dumps, diagnostics) compared to packets and would never realistically approach this on
+// their own, so one generous constant for both keeps this simple without meaningfully changing the
+// worst-case memory bound.
 const MAX_BUFFERED_PACKETS = 50_000 // a few MB worst case -- comfortably absorbs any realistic stall
 const DELIVERY_BATCH_SIZE = 500 // caps how much a single delivered message asks the main thread to process at once
 const DELIVERY_CREDIT_WINDOW = 2

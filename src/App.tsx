@@ -866,7 +866,20 @@ function App() {
       await writer.close()
       logWriter.current = null
       if (reopen && directoryHandle.current) await openLogWriter(directoryHandle.current, logFileName.current)
-    } catch { setNotice('Could not commit the log file') }
+    } catch {
+      // Same class of bug as the reopen-window fix above, different trigger: if write()/close()
+      // itself throws (disk full, permission revoked mid-session, the drive unplugged), `rows` was
+      // already cleared from pendingLogRows before the attempt -- without putting it back, that
+      // whole batch is lost forever instead of just delayed. Prepending (not appending) preserves
+      // chronological order against anything that accumulated in the meantime. The writer is also
+      // left in an unknown state after a failed write/close, so it's nulled out here too --
+      // otherwise every future flush would keep hitting the same broken writer indefinitely instead
+      // of getting a chance to open a fresh one on the next attempt.
+      pendingLogRows.current = rows + pendingLogRows.current
+      logWriter.current = null
+      setNotice('Could not commit the log file')
+      if (reopen && directoryHandle.current) await openLogWriter(directoryHandle.current, logFileName.current).catch(() => undefined)
+    }
     finally {
       logCommitInProgress.current = false
       if (reopen && pendingLogRows.current && logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
@@ -889,7 +902,21 @@ function App() {
       await writer.close()
       rawLogWriter.current = null
       if (reopen && directoryHandle.current) await openRawLogWriter(directoryHandle.current, rawLogFileName.current)
-    } catch { setNotice('Could not commit the raw log file') }
+    } catch {
+      // Same class of bug as the reopen-window fix above (this is the lossless source-of-truth
+      // capture, so it matters most here), different trigger: if write()/close() itself throws
+      // (disk full, permission revoked mid-session, the drive unplugged), `rows` was already
+      // cleared from pendingRawLogRows before the attempt -- without putting it back, that whole
+      // batch is lost forever instead of just delayed. Prepending (not appending) preserves
+      // chronological order against anything that accumulated in the meantime. The writer is also
+      // left in an unknown state after a failed write/close, so it's nulled out here too --
+      // otherwise every future flush would keep hitting the same broken writer indefinitely instead
+      // of getting a chance to open a fresh one on the next attempt.
+      pendingRawLogRows.current = rows + pendingRawLogRows.current
+      rawLogWriter.current = null
+      setNotice('Could not commit the raw log file')
+      if (reopen && directoryHandle.current) await openRawLogWriter(directoryHandle.current, rawLogFileName.current).catch(() => undefined)
+    }
     finally {
       rawLogCommitInProgress.current = false
       if (reopen && pendingRawLogRows.current && rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
@@ -899,6 +926,12 @@ function App() {
     const directory = directoryHandle.current ?? await chooseDirectory()
     if (!directory) return
     try {
+      // Discard anything left over from a previous session's commitLog()/commitRawLog() failure
+      // (see those functions' catch blocks) -- without this, stale rows from a session that ended
+      // with an unrecovered write error would silently bleed into the front of this brand new file
+      // on its first flush.
+      pendingLogRows.current = ''
+      pendingRawLogRows.current = ''
       const name = await nextLogFileName(directory)
       const file = await directory.getFileHandle(name, { create: true })
       const writer = await file.createWritable()
