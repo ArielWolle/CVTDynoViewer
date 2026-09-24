@@ -153,10 +153,17 @@ function App() {
   const [samples, setSamples] = useState<TelemetrySample[]>([])
   // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
   // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
-  // detect gaps with). Surfaced because it's genuinely diagnostic: dropped packets are otherwise
-  // invisible (a real host-side read stall, or the firmware's own ring buffer overflowing on an
-  // undrained RPM channel, would otherwise show no symptom other than gaps in the data).
+  // detect gaps with). This ONLY reveals loss AFTER a packet was already queued for transmission
+  // (downstream/USB loss) -- it can NOT reveal an RPM edge that the firmware's own ring buffer
+  // dropped before ever assigning it a sequence number, which is exactly why edgeCount/lostEdges
+  // below exists as a separate metric (see protocol.ts's EXPECTED_PROTOCOL_VERSION comment for the
+  // full reasoning; this used to be conflated as one thing here, which was incorrect).
   const [droppedPackets, setDroppedPackets] = useState(0)
+  // Mirrors lostEdgesRef -- per-RPM-channel gaps in the firmware's physical edge counter (protocol
+  // v3+ only; always 0 against older firmware). A nonzero value here means an edge was lost BEFORE
+  // it ever reached the ring/USB (e.g. RpmCounter's ring buffer overflowing during a transient host
+  // stall), distinct from droppedPackets above.
+  const [lostEdges, setLostEdges] = useState<[number, number]>([0, 0])
   const [raw, setRaw] = useState<RawValues>(emptyRaw)
   const [chartPlaying, setChartPlaying] = useState(true)
   const [frozenDomainEnd, setFrozenDomainEnd] = useState<number | null>(null)
@@ -232,6 +239,15 @@ function App() {
   const timeOffsetMsRef = useRef<number | null>(null)
   const channelSeqRef = useRef<number[]>([-1, -1, -1, -1, -1])
   const droppedPacketsRef = useRef(0)
+  // Last-seen physical edge counter per RPM channel (index 0/1 only -- see protocol.ts's
+  // edgeCount comment), and the running per-channel lost-edge tally derived from gaps in it. -1
+  // means "no edge counter observed yet this connection" (or since the last reset), matching
+  // channelSeqRef's convention above -- the very first observed value can't be gap-checked against
+  // anything. Reset to -1 whenever a channel reports periodUs===0 (stopped): that's a fresh epoch
+  // on the firmware side (see RpmCounter.cpp's checkStale()), so comparing across it would produce
+  // a spurious "gap" that isn't real loss.
+  const lastEdgeCountRef = useRef<number[]>([-1, -1])
+  const lostEdgesRef = useRef<[number, number]>([0, 0])
   // Only the most recently derived sample matters for the throttled display flush below (it reads
   // the LATEST value every tick, discarding everything else) -- tracked as a single ref instead of
   // an array that gets pushed to on every packet and thrown away every ~33ms. At high edge rates
@@ -423,6 +439,7 @@ function App() {
         appendConsoleLines(consoleLinesToFlush)
       }
       setDroppedPackets(droppedPacketsRef.current)
+      setLostEdges([...lostEdgesRef.current])
     }
     const timer = window.setInterval(flush, 33) // ~30 Hz display refresh
     return () => { window.clearInterval(timer); flush() }
@@ -451,6 +468,8 @@ function App() {
       timeOffsetMsRef.current = null
       channelSeqRef.current = [-1, -1, -1, -1, -1]
       droppedPacketsRef.current = 0
+      lastEdgeCountRef.current = [-1, -1]
+      lostEdgesRef.current = [0, 0]
       latestSampleRef.current = null
       pendingConsoleLinesRef.current = []
       // Cleared on every fresh connect (not just at app startup) so stale info from a previously
@@ -666,7 +685,7 @@ function App() {
   // never actually showed up in captured data). A wide sample row is produced immediately with
   // the other channels' latest known values forward-filled in, logged at full rate, and buffered
   // for the throttled display path -- none of that work is gated on or blocked by rendering.
-  function handleValue(channel: ChannelId, value: number, tUs: number, seq: number) {
+  function handleValue(channel: ChannelId, value: number, tUs: number, seq: number, edgeCount: number) {
     if (isPlaybackActiveRef.current) return
     const receivedAtMs = performance.timeOrigin + performance.now()
 
@@ -679,14 +698,49 @@ function App() {
       sampleTimeMs = timeOffsetMsRef.current + tUs / 1000
     }
 
-    // Per-channel rolling sequence number (0..255, wraps) lets dropped packets be detected and
-    // surfaced instead of silently vanishing.
+    // Per-channel rolling sequence number (0..255, wraps) lets downstream/USB-transmission loss be
+    // detected and surfaced instead of silently vanishing: a gap here means N packets were
+    // successfully built (tx_seq assigned) and written to USB, but never received. This can only
+    // reveal loss AFTER a packet was already queued for transmission -- see the edgeCount block
+    // right below for the other, previously-invisible kind of loss.
     const expectedSeq = channelSeqRef.current[channel]
+    let seqGap = 0
     if (tUs > 0 && expectedSeq !== -1) {
-      const missed = (seq - expectedSeq - 1) & 0xff
-      if (missed > 0) droppedPacketsRef.current += missed
+      seqGap = (seq - expectedSeq - 1) & 0xff
+      if (seqGap > 0) droppedPacketsRef.current += seqGap
     }
     channelSeqRef.current[channel] = seq
+
+    // Per-RPM-channel physical edge counter (protocol v3+, see protocol.ts's edgeCount comment)
+    // additionally reveals loss that happens BEFORE a packet is ever built at all (e.g. the
+    // firmware's ring buffer overflowing) -- edgeCount is assigned at ISR time, strictly before
+    // tx_seq is ever assigned at transmit time, so a ring-dropped edge never reaches tx_seq and is
+    // completely invisible to the seq-gap check above on its own.
+    //
+    // Every edge that DOES get transmitted increments both edgeCount and seq together, so any
+    // downstream/USB loss (a seq gap) inherently ALSO shows up as an edge-count gap of the exact
+    // same size -- edgeCount can never advance less than seq between two received packets.
+    // Subtracting the already-counted seqGap from the raw edge-count gap isolates only the loss
+    // seqGap can't explain (edges that never even reached the point of being assigned a sequence
+    // number), keeping the two metrics mutually exclusive instead of double-counting the same lost
+    // edge under both "dropped" and "lost (device)".
+    //
+    // Reset whenever this channel reports periodUs===0 (stopped): that's a fresh epoch on the
+    // firmware side (see RpmCounter.cpp's checkStale()), so the edge count right after a restart
+    // can't be meaningfully compared to whatever came before the stop.
+    if (channel === 0 || channel === 1) {
+      if (value === 0) {
+        lastEdgeCountRef.current[channel] = -1
+      } else {
+        const lastEdgeCount = lastEdgeCountRef.current[channel]
+        if (lastEdgeCount !== -1) {
+          const edgeGap = (edgeCount - lastEdgeCount - 1) >>> 0
+          const deviceOnlyLoss = Math.max(0, edgeGap - seqGap)
+          if (deviceOnlyLoss > 0) lostEdgesRef.current[channel] += deviceOnlyLoss
+        }
+        lastEdgeCountRef.current[channel] = edgeCount
+      }
+    }
 
     // Raw per-channel logging is the single highest-priority thing this handler does: it's queued
     // immediately from the packet's own fields (channel/value/tUs/seq), BEFORE the wide-row
@@ -696,8 +750,17 @@ function App() {
     // RAW_LOG_FLUSH_BYTES below): this is the lossless source-of-truth capture, so minimizing how
     // long it sits only in memory (rather than durably on disk) matters more for it than for the
     // resampled/display-oriented wide CSV.
-    if (loggingRef.current && rawLogWriter.current) {
-      pendingRawLogRows.current += rawLogRow(channel, value, tUs, sampleTimeMs, seq) + '\n'
+    //
+    // Gated ONLY on loggingRef, deliberately NOT on rawLogWriter.current being non-null:
+    // commitRawLog() sets the writer to null for the entire close()->reopen() async window (several
+    // event-loop turns), and packets arriving during that window used to be silently dropped from
+    // the log even though they were processed normally otherwise -- a real, confirmed source of the
+    // "sequence gaps" seen in captured raw CSVs that were actually just missing rows, not real
+    // device/USB loss. Accumulation now depends only on whether logging is on; the writer's
+    // presence only gates when a flush can actually reach disk (see commitRawLog()), and anything
+    // queued during a reopen gets picked up by the very next flush once the writer comes back.
+    if (loggingRef.current) {
+      pendingRawLogRows.current += rawLogRow(channel, value, tUs, sampleTimeMs, seq, edgeCount) + '\n'
       if (pendingRawLogRows.current.length >= RAW_LOG_FLUSH_BYTES) {
         window.clearTimeout(rawLogCommitTimer.current)
         rawLogCommitTimer.current = undefined
@@ -715,7 +778,10 @@ function App() {
 
     latestSampleRef.current = sample
 
-    if (loggingRef.current && logWriter.current) {
+    // Same reasoning as the raw log above: gated only on loggingRef, not on logWriter.current, so a
+    // row derived while commitLog() has the writer nulled out during its own close/reopen window
+    // still gets queued instead of silently lost.
+    if (loggingRef.current) {
       pendingLogRows.current += sampleToCsvRow(sample, torqueScaleRef.current, torqueOffsetRef.current) + '\n'
       if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
     }
@@ -729,7 +795,20 @@ function App() {
     await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0))
     if (channel > 1) await transport.current.send(encodeCommand(2, channel, frequency))
   }
-  function updateChannel(channel: number, enabled: boolean) { setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value)); void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration')) }
+  function updateChannel(channel: number, enabled: boolean) {
+    setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value))
+    // The firmware's RpmCounter keeps incrementing edgeCount for real edges even while a channel
+    // is disabled -- disabling only stops the drain loop from building/sending a packet for them
+    // (see RpmCounter.cpp's edgeCount comment and this file's cfg_write_en discussion above), it
+    // doesn't stop the underlying edge from being counted. Without resetting the baseline here,
+    // every edge that occurred during the disabled window would show up as a sudden, spurious
+    // "device-side loss" spike on the very first packet after re-enabling -- edges the firmware
+    // never intended to transmit in the first place, not a real loss. Resetting on EITHER
+    // direction of the toggle (not just re-enabling) keeps this simple and correct regardless of
+    // how long the channel stays disabled.
+    if (channel === 0 || channel === 1) lastEdgeCountRef.current[channel] = -1
+    void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration'))
+  }
   function updateFrequency(channel: number, frequency: number) { setFrequencies((previous) => previous.map((value, index) => index === channel ? frequency : value)); void sendConfig(channel, channels[channel], frequency).catch(() => setNotice('Could not send frequency configuration')) }
   // Local-only display setting now -- see the primarySpokes/secondarySpokes state comment. No
   // firmware command is sent; command 0x06 (the old "set RPM spoke count") is reserved/removed on
@@ -787,7 +866,20 @@ function App() {
       await writer.close()
       logWriter.current = null
       if (reopen && directoryHandle.current) await openLogWriter(directoryHandle.current, logFileName.current)
-    } catch { setNotice('Could not commit the log file') }
+    } catch {
+      // Same class of bug as the reopen-window fix above, different trigger: if write()/close()
+      // itself throws (disk full, permission revoked mid-session, the drive unplugged), `rows` was
+      // already cleared from pendingLogRows before the attempt -- without putting it back, that
+      // whole batch is lost forever instead of just delayed. Prepending (not appending) preserves
+      // chronological order against anything that accumulated in the meantime. The writer is also
+      // left in an unknown state after a failed write/close, so it's nulled out here too --
+      // otherwise every future flush would keep hitting the same broken writer indefinitely instead
+      // of getting a chance to open a fresh one on the next attempt.
+      pendingLogRows.current = rows + pendingLogRows.current
+      logWriter.current = null
+      setNotice('Could not commit the log file')
+      if (reopen && directoryHandle.current) await openLogWriter(directoryHandle.current, logFileName.current).catch(() => undefined)
+    }
     finally {
       logCommitInProgress.current = false
       if (reopen && pendingLogRows.current && logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
@@ -810,7 +902,21 @@ function App() {
       await writer.close()
       rawLogWriter.current = null
       if (reopen && directoryHandle.current) await openRawLogWriter(directoryHandle.current, rawLogFileName.current)
-    } catch { setNotice('Could not commit the raw log file') }
+    } catch {
+      // Same class of bug as the reopen-window fix above (this is the lossless source-of-truth
+      // capture, so it matters most here), different trigger: if write()/close() itself throws
+      // (disk full, permission revoked mid-session, the drive unplugged), `rows` was already
+      // cleared from pendingRawLogRows before the attempt -- without putting it back, that whole
+      // batch is lost forever instead of just delayed. Prepending (not appending) preserves
+      // chronological order against anything that accumulated in the meantime. The writer is also
+      // left in an unknown state after a failed write/close, so it's nulled out here too --
+      // otherwise every future flush would keep hitting the same broken writer indefinitely instead
+      // of getting a chance to open a fresh one on the next attempt.
+      pendingRawLogRows.current = rows + pendingRawLogRows.current
+      rawLogWriter.current = null
+      setNotice('Could not commit the raw log file')
+      if (reopen && directoryHandle.current) await openRawLogWriter(directoryHandle.current, rawLogFileName.current).catch(() => undefined)
+    }
     finally {
       rawLogCommitInProgress.current = false
       if (reopen && pendingRawLogRows.current && rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
@@ -820,6 +926,12 @@ function App() {
     const directory = directoryHandle.current ?? await chooseDirectory()
     if (!directory) return
     try {
+      // Discard anything left over from a previous session's commitLog()/commitRawLog() failure
+      // (see those functions' catch blocks) -- without this, stale rows from a session that ended
+      // with an unrecovered write error would silently bleed into the front of this brand new file
+      // on its first flush.
+      pendingLogRows.current = ''
+      pendingRawLogRows.current = ''
       const name = await nextLogFileName(directory)
       const file = await directory.getFileHandle(name, { create: true })
       const writer = await file.createWritable()
@@ -947,6 +1059,7 @@ function App() {
       onLowRatioChange={setLowRatio}
       onHighRatioChange={setHighRatio}
       droppedPackets={droppedPackets}
+      lostEdges={lostEdges}
       highlightFullThrottle={highlightFullThrottle}
       onToggleHighlightFullThrottle={() => setHighlightFullThrottle((value) => !value)}
     />
@@ -961,7 +1074,7 @@ function App() {
  * hover would re-render the whole app (topbar, console, control deck, playback bar, etc.), not
  * just the charts, which is visibly laggy. Keeping it here means only this subtree re-renders.
  */
-function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets, highlightFullThrottle, onToggleHighlightFullThrottle }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number; highlightFullThrottle: boolean; onToggleHighlightFullThrottle: () => void }) {
+function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets, lostEdges, highlightFullThrottle, onToggleHighlightFullThrottle }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number; lostEdges: [number, number]; highlightFullThrottle: boolean; onToggleHighlightFullThrottle: () => void }) {
   // The time-range-slider selection lives here (not in App) so dragging it only re-renders this
   // subtree. The expensive per-field moving-average computation already happened in App over the
   // full `data`; windowing it down to the selected range here is a cheap filter, not a recompute.
@@ -1016,7 +1129,7 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const hoveredPoint = useMemo(() => (hoverTime !== null ? chartData.find((point) => point.time === hoverTime) : undefined), [chartData, hoverTime])
 
   return <>
-    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost at the USB transport, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><label className="ma-toggle" title="Shade time-series chart backgrounds and color relationship-chart points while the full-throttle input is asserted"><input type="checkbox" checked={highlightFullThrottle} onChange={onToggleHighlightFullThrottle} />Highlight full throttle</label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
+    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost after being queued for transmission, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}{(lostEdges[0] + lostEdges[1]) > 0 && <span className="workspace-dropped" title={`Primary RPM: ${lostEdges[0].toLocaleString()} lost | Secondary RPM: ${lostEdges[1].toLocaleString()} lost -- RPM edges lost BEFORE reaching the USB transport (e.g. the firmware's ring buffer overflowing during a host stall), detected via the firmware's per-channel physical edge counter (protocol v3+)`}><X size={13} />{(lostEdges[0] + lostEdges[1]).toLocaleString()} lost (device)</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><label className="ma-toggle" title="Shade time-series chart backgrounds and color relationship-chart points while the full-throttle input is asserted"><input type="checkbox" checked={highlightFullThrottle} onChange={onToggleHighlightFullThrottle} />Highlight full throttle</label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => setManualRange(next)} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => setManualRange({ start: 0, end: 1 })}>Full range</button></section>}
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} highlightFullThrottle={highlightFullThrottle} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>

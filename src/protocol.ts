@@ -102,14 +102,16 @@ export function periodUsToRpm(periodUs: number, teethPerRevolution: number): num
   return 60_000_000 / (periodUs * teethPerRevolution)
 }
 
-// --- USB telemetry protocol v2 --------------------------------------------------------------
-// Telemetry packet (17 bytes). Layout: [0xAA][0x55][channel][seq][int32 value LE][uint64 t_us
+// --- USB telemetry protocol v3 --------------------------------------------------------------
+// Telemetry packet (21 bytes -- widened from 17 in protocol v1, see EXPECTED_PROTOCOL_VERSION
+// below). Layout: [0xAA][0x55][channel][seq][int32 value LE][uint64 t_us LE][uint32 edgeCount
 // LE][crc8]. The CRC (and fixed length) means a value that happens to contain the sync bytes can
 // no longer desync the parser the way the old length-less v1 framing could.
 //
 // Channels 2-4 (shift/torque) are sent independently per channel on their own firmware-configured
 // polling rate -- e.g. torque can run much faster than shift without either one throttling the
-// other -- and `value` is the polled sensor reading directly.
+// other -- and `value` is the polled sensor reading directly. `edgeCount` is always 0 for these
+// (and channel 5) -- there's no physical-edge concept to count.
 //
 // Channels 0-1 (RPM1/RPM2) are edge-triggered instead of polled: the firmware sends one packet
 // per physical tooth as soon as it's detected, with `value` = the raw inter-edge period in
@@ -119,6 +121,17 @@ export function periodUsToRpm(periodUs: number, teethPerRevolution: number): num
 // to be applied as RPM === 0 (via periodUsToRpm), not a marker to be ignored. A period is only
 // ever computed from two actual edges on the firmware side, so `value` is never 0 for "first edge,
 // nothing to diff against yet" the way an earlier version of this protocol used it.
+//
+// `edgeCount` (RPM channels only) is a monotonically increasing per-channel count of physical
+// edges, assigned at ISR capture time on the firmware -- BEFORE the event is queued for
+// transmission, unlike `seq` (assigned at transmit time). A gap in `edgeCount` on consecutive RPM
+// packets means an edge was lost before it ever reached the ring/USB (e.g. the firmware's ring
+// buffer overflowing during a transient host stall) -- distinct from a gap in `seq`, which means a
+// packet WAS queued for transmission but never arrived (downstream/USB loss). Previously these two
+// failure modes were indistinguishable -- and the ring-overflow case was completely invisible,
+// since a dropped edge never got a seq number in the first place, so seq looked perfectly
+// continuous either way. See App.tsx's handleValue() for how both are tracked and surfaced
+// separately, and rawLogRow()'s edge_count column below for offline analysis.
 //
 // Transport: the firmware exposes a WebUSB vendor-class interface (see usbTransport.ts), not a
 // virtual COM port -- there is no baud rate, and Windows binds it to WinUSB automatically via the
@@ -134,11 +147,11 @@ export function periodUsToRpm(periodUs: number, teethPerRevolution: number): num
 // comment on channels 0-1 above) is exactly the kind of change this exists to catch immediately
 // instead of it taking a live debugging session to track down, as happened once before this
 // existed.
-export const EXPECTED_PROTOCOL_VERSION = 1
+export const EXPECTED_PROTOCOL_VERSION = 2
 export const TELEMETRY_SYNC0 = 0xaa
 export const TELEMETRY_SYNC1 = 0x55
-export const TELEMETRY_PACKET_LEN = 17
-const TELEMETRY_CRC_SPAN = 14 // bytes [2..15]: channel, seq, value, t_us
+export const TELEMETRY_PACKET_LEN = 21
+const TELEMETRY_CRC_SPAN = 18 // bytes [2..19]: channel, seq, value, t_us, edgeCount
 
 export const COMMAND_SYNC = 0xc0
 export const COMMAND_PACKET_LEN = 5
@@ -155,30 +168,35 @@ export function crc8(bytes: Uint8Array): number {
   return crc
 }
 
-export type DecodedPacket = { channel: ChannelId; value: number; tUs: number; seq: number }
+export type DecodedPacket = { channel: ChannelId; value: number; tUs: number; seq: number; edgeCount: number }
 
 /**
- * Decodes one telemetry packet. Accepts the current v2 framing (17 bytes, CRC-checked, firmware
- * timestamp + per-channel sequence number) and falls back to the older v1 framing (8 bytes, no
- * CRC, no timestamp) so logs/firmware from before the protocol upgrade still decode -- `tUs`/`seq`
- * are synthesized as 0 in that case since the source data genuinely doesn't have them.
+ * Decodes one telemetry packet. Accepts the current v3 framing (21 bytes, CRC-checked, firmware
+ * timestamp + per-channel sequence number + per-channel physical edge counter) and falls back to
+ * the older v1 framing (8 bytes, no CRC, no timestamp) so logs/firmware from before the protocol
+ * upgrade still decode -- `tUs`/`seq`/`edgeCount` are synthesized as 0 in that case since the
+ * source data genuinely doesn't have them. There is deliberately no fallback for the intermediate
+ * 17-byte v2 framing: a firmware still on that version reports a mismatched protocol version (see
+ * EXPECTED_PROTOCOL_VERSION above) and the resulting banner is a clearer signal than silently
+ * mis-framing every packet would be.
  */
 export function decodePacket(packet: Uint8Array): DecodedPacket | null {
   if (packet.length >= TELEMETRY_PACKET_LEN && packet[0] === TELEMETRY_SYNC0 && packet[1] === TELEMETRY_SYNC1) {
     const channel = packet[2]
     if (channel > 5) return null
     const expectedCrc = crc8(packet.slice(2, 2 + TELEMETRY_CRC_SPAN))
-    if (packet[16] !== expectedCrc) return null
+    if (packet[20] !== expectedCrc) return null
     const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength)
     const value = view.getInt32(4, true)
     const tUsLow = view.getUint32(8, true)
     const tUsHigh = view.getUint32(12, true)
     const tUs = tUsHigh * 4294967296 + tUsLow
-    return { channel: channel as ChannelId, value, tUs, seq: packet[3] }
+    const edgeCount = view.getUint32(16, true)
+    return { channel: channel as ChannelId, value, tUs, seq: packet[3], edgeCount }
   }
   if (packet.length === 8 && ((packet[0] === 0xaa && packet[1] === 0xbb) || (packet[0] === 0xbb && packet[1] === 0xaa)) && packet[2] <= 4) {
     const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength)
-    return { channel: packet[2] as ChannelId, value: view.getInt32(4, true), tUs: 0, seq: 0 }
+    return { channel: packet[2] as ChannelId, value: view.getInt32(4, true), tUs: 0, seq: 0, edgeCount: 0 }
   }
   return null
 }
@@ -288,10 +306,16 @@ export function applyChannelUpdate(state: LiveDerivationState, channel: ChannelI
 // samples between wide rows are lost. This raw, long-format log instead writes exactly one line
 // per received packet with no resampling, so no data is ever discarded regardless of relative
 // channel rates -- intended for archival/re-analysis, not for re-import into the app.
-export const rawLogHeader = 'firmware_t_us,wall_time_s,channel,channel_name,seq,raw_value'
+// edge_count is 0 for non-RPM channels (see the protocol comment above) -- always present so the
+// column count stays uniform regardless of channel, matching the firmware's own uniform packet
+// layout. This is the column that makes device-side (pre-USB) loss detectable in an offline
+// analysis: a gap in edge_count for a given channel between consecutive rows means an edge was
+// dropped before it ever reached the ring/USB, which a gap (or lack of one) in `seq` cannot reveal
+// on its own -- see EXPECTED_PROTOCOL_VERSION's comment above for the full reasoning.
+export const rawLogHeader = 'firmware_t_us,wall_time_s,channel,channel_name,seq,raw_value,edge_count'
 
-export function rawLogRow(channel: ChannelId, value: number, tUs: number, wallTimeMs: number, seq: number): string {
-  return [tUs, (wallTimeMs / 1000).toFixed(6), channel, channelNames[channel], seq, value].map(csvEscape).join(',')
+export function rawLogRow(channel: ChannelId, value: number, tUs: number, wallTimeMs: number, seq: number, edgeCount: number): string {
+  return [tUs, (wallTimeMs / 1000).toFixed(6), channel, channelNames[channel], seq, value, edgeCount].map(csvEscape).join(',')
 }
 
 export function csvEscape(value: string | number): string {

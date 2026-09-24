@@ -2,7 +2,7 @@ import type { ChannelId } from './protocol'
 import type { WorkerInboundMessage, WorkerOutboundMessage } from './usbWorker'
 
 export type UsbHandlers = {
-  onValue: (channel: ChannelId, value: number, tUs: number, seq: number) => void
+  onValue: (channel: ChannelId, value: number, tUs: number, seq: number, edgeCount: number) => void
   onPacket?: (raw: Uint8Array, channel: ChannelId, value: number, seq: number) => void
   onText: (text: string) => void
 }
@@ -90,17 +90,31 @@ export class UsbTransport {
   private handleMessage(event: MessageEvent<WorkerOutboundMessage>) {
     const message = event.data
     if (message.type === 'chunk') {
-      for (const text of message.texts) this.handlers.onText(text)
-      for (const packet of message.packets) {
-        this.handlers.onPacket?.(packet.raw, packet.channel, packet.value, packet.seq)
-        this.handlers.onValue(packet.channel, packet.value, packet.tUs, packet.seq)
+      // The ack below MUST always be sent, even if a handler throws -- see the try/finally.
+      // Without this, an exception anywhere in onPacket()/onValue() (a bug, an unexpected packet
+      // shape, anything) would abort this function before reaching the ack, permanently costing
+      // this chunk's delivery credit. With DELIVERY_CREDIT_WINDOW as small as 2, just two such
+      // exceptions would exhaust all credit forever: the worker keeps draining USB into its own
+      // buffer (per usbWorker.ts's design), but tryDeliver() would never again see
+      // `deliveryCredits > 0`, silently stalling the entire live pipeline until a full
+      // disconnect/reconnect (a fresh worker with fresh credit). A processing exception should
+      // never be able to do that much damage on its own.
+      try {
+        if (message.overflowDropped > 0) this.handlers.onText(`[BUFFER OVERFLOW] ${message.overflowDropped} packet(s) dropped -- worker's internal buffer was full (see usbWorker.ts's MAX_BUFFERED_PACKETS)`)
+        for (const text of message.texts) this.handlers.onText(text)
+        for (const packet of message.packets) {
+          this.handlers.onPacket?.(packet.raw, packet.channel, packet.value, packet.seq)
+          this.handlers.onValue(packet.channel, packet.value, packet.tUs, packet.seq, packet.edgeCount)
+        }
+      } finally {
+        // Returns this chunk's delivery credit only now that all of its synchronous processing
+        // above has actually finished (successfully or not) -- see usbWorker.ts's
+        // DELIVERY_CREDIT_WINDOW comment: this paces how fast the worker hands off buffered data
+        // to the main thread (NOT how fast it drains USB, which is unthrottled -- see that file's
+        // top comment), so a main thread that's genuinely behind naturally slows delivery instead
+        // of an unbounded backlog piling up in the browser's own postMessage queue.
+        if (this.worker) { const ackMessage: WorkerInboundMessage = { type: 'ack' }; this.worker.postMessage(ackMessage) }
       }
-      // Returns this chunk's credit only now that all of its synchronous processing above has
-      // actually finished -- see usbWorker.ts's CREDIT_WINDOW comment for why this is the whole
-      // backpressure mechanism: the worker won't issue another transferIn() past its credit
-      // window until this ack arrives, so a main thread that's genuinely behind naturally stalls
-      // the real USB reads instead of an unbounded backlog piling up invisibly.
-      if (this.worker) { const ackMessage: WorkerInboundMessage = { type: 'ack' }; this.worker.postMessage(ackMessage) }
     } else if (message.type === 'disconnected') {
       this.connectedFlag = false
       this.worker = null
