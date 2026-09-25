@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { channelNames, encodeCommand, EXPECTED_PROTOCOL_VERSION, periodUsToRpm, type ChannelId } from './protocol'
 import { UsbTransport } from './usbTransport'
@@ -6,10 +6,10 @@ import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { AnalysisClient } from './analysis/client'
 import { defaultEngineTorqueCurve } from './analysis/engineCurve'
 import { AnalysisWorkspace, defaultCharts, type ChartConfig } from './analysis/AnalysisWorkspace'
-import { ANALYSIS_WINDOWS_MS, DEFAULT_ANALYSIS_WINDOW_MS, DEFAULT_SECONDARY_INERTIA_KG_M2, type AnalysisConfig, type AnalysisPowerMode, type AnalysisSnapshot, type EngineTorquePoint, type RpmObservationMode } from './analysis/types'
+import { ANALYSIS_WINDOWS_MS, DEFAULT_ANALYSIS_WINDOW_MS, DEFAULT_SECONDARY_INERTIA_KG_M2, type AnalysisConfig, type AnalysisPowerMode, type EngineTorquePoint, type RpmObservationMode } from './analysis/types'
 import { analysisSnapshotToCsv } from './analysis/exportCsv'
 import { isRawLogCsv, parseRawLogCsv } from './analysis/rawCsv'
-import { applyAnalysisUpdate, createEmptyAnalysisSnapshot, currentAnalysisMetrics, latestAnalysisTime } from './analysis/uiStore'
+import { AnalysisStore } from './analysis/store'
 import { RAW_REPLAY_SPEEDS, RawReplayController, type RawReplaySpeed, type RawReplayState } from './replay/rawReplay'
 import { RawSessionLogger, type RawSessionMetadata } from './session/rawSessionLogger'
 
@@ -17,12 +17,33 @@ type ConsoleType = 'RPM1' | 'RPM2' | 'SHIFT' | 'TORQ1' | 'TORQ2' | 'READ CONFIG'
 type ConsoleMessage = { id: number; time: string; type: ConsoleType; data: string }
 type ConsoleSort = 'time' | 'type' | 'data'
 
-const SENSOR_RETENTION_MS = 300_000
-const MAX_CHART_POINTS = 1500
 const MAX_CONSOLE_MESSAGES = 500
 const DEFAULT_LIVE_WINDOW_MS = 10_000
 
 function formatNumber(value: number, decimals = 0) { return Number.isFinite(value) ? value.toLocaleString(undefined, { maximumFractionDigits: decimals, minimumFractionDigits: decimals }) : '—' }
+function useAnalysisStatus(store: AnalysisStore) {
+  return useSyncExternalStore(store.subscribe, store.getStatusSnapshot, store.getStatusSnapshot)
+}
+
+function AnalysisPrimaryRpm({ store }: { store: AnalysisStore }) {
+  const status = useAnalysisStatus(store)
+  return <span className="mono">{formatNumber(status.current.rpm1)} RPM</span>
+}
+
+function AnalysisMetricGrid({ store }: { store: AnalysisStore }) {
+  const status = useAnalysisStatus(store)
+  const current = status.current
+  const metrics: Array<[string, number, string]> = [
+    ['Primary RPM', current.rpm1, 'rpm'],
+    ['Secondary RPM', current.rpm2, 'rpm'],
+    ['Shift position', current.shift, '%'],
+    ['Primary power', current.power1, 'kW'],
+    ['Secondary power', current.power2, 'kW'],
+    ['Efficiency', current.efficiency, '%'],
+  ]
+  return <section className="metric-grid">{metrics.map(([label, value, unit], index) => <article className="metric" key={label}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label}</span><strong>{Number.isFinite(value) ? formatNumber(value, unit === 'kW' || unit === '%' ? 1 : 0) : '—'}</strong><span className="metric-unit">{unit}</span></article>)}</section>
+}
+
 
 function App() {
   const [connected, setConnected] = useState(false)
@@ -76,7 +97,6 @@ function App() {
   const [playbackFileName, setPlaybackFileName] = useState('')
   const [rawPlaybackActive, setRawPlaybackActive] = useState(false)
   const [replayState, setReplayState] = useState<RawReplayState>({ loaded: false, playing: false, speed: 1, loop: true, progress: 0, elapsedMs: 0, durationMs: 0, loopCount: 0 })
-  const [analysis, setAnalysis] = useState<AnalysisSnapshot>(() => createEmptyAnalysisSnapshot())
   // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
   // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
   // detect gaps with). This ONLY reveals loss AFTER a packet was already queued for transmission
@@ -154,8 +174,9 @@ function App() {
   const showSensorConsoleRef = useRef(showSensorConsole)
   const analysisClientRef = useRef<AnalysisClient | null>(null)
   const rawReplayRef = useRef<RawReplayController | null>(null)
+  const analysisStoreRef = useRef<AnalysisStore | null>(null)
+  const analysisStore = analysisStoreRef.current ?? (analysisStoreRef.current = new AnalysisStore())
 
-  const current = currentAnalysisMetrics(analysis)
   const protocolMismatch = connected && firmwareProtocolVersion !== null && firmwareProtocolVersion !== EXPECTED_PROTOCOL_VERSION
   const analysisConfig = useMemo<AnalysisConfig>(() => ({
     windowMs: analysisWindowMs,
@@ -185,11 +206,9 @@ function App() {
   useEffect(() => { showSensorConsoleRef.current = showSensorConsole }, [showSensorConsole])
   useEffect(() => {
     const client = new AnalysisClient(analysisConfig, (update) => {
-      // Worker analysis is already complete before this callback. Mark only the React/UI commit as
-      // non-urgent so pointer interaction can pre-empt a chart paint without dropping any points.
-      startTransition(() => {
-        setAnalysis((currentSnapshot) => applyAnalysisUpdate(currentSnapshot, update, SENSOR_RETENTION_MS))
-      })
+      // The worker already emits append deltas. Keep them append-only on the main thread too:
+      // AnalysisStore owns chunked derived history outside React, so old arrays are not recopied.
+      analysisStore.apply(update)
     })
     analysisClientRef.current = client
     return () => { client.terminate(); if (analysisClientRef.current === client) analysisClientRef.current = null }
@@ -206,14 +225,17 @@ function App() {
       onReset: () => {
         resetPacketHealth()
         analysisClientRef.current?.reset()
-        setAnalysis(createEmptyAnalysisSnapshot())
+        analysisStore.reset()
       },
       onState: (state) => {
         setReplayState(state)
         // Replay is downstream of the raw logger and has no connected-display timer, so refresh
         // its health counters on the controller's throttled (~20 Hz) state updates instead of per packet.
         setDroppedPackets(droppedPacketsRef.current)
-        setLostEdges([...lostEdgesRef.current])
+        setLostEdges((previous) => {
+          const next = lostEdgesRef.current
+          return previous[0] === next[0] && previous[1] === next[1] ? previous : [next[0], next[1]]
+        })
       },
     })
     rawReplayRef.current = controller
@@ -232,7 +254,10 @@ function App() {
         appendConsoleLines(consoleLinesToFlush)
       }
       setDroppedPackets(droppedPacketsRef.current)
-      setLostEdges([...lostEdgesRef.current])
+      setLostEdges((previous) => {
+          const next = lostEdgesRef.current
+          return previous[0] === next[0] && previous[1] === next[1] ? previous : [next[0], next[1]]
+        })
     }
     const timer = window.setInterval(flush, 33)
     return () => { window.clearInterval(timer); flush() }
@@ -262,7 +287,7 @@ function App() {
       // never be mistaken for the currently connected device's actual identity.
       setFirmwareGitSha(null)
       setFirmwareProtocolVersion(null)
-      await next.connect(); transport.current = next; setConnected(true); setFirmwareDemoMode(false); setAnalysis(createEmptyAnalysisSnapshot()); setRawPlaybackActive(false); setPlaybackFileName(''); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
+      await next.connect(); transport.current = next; setConnected(true); setFirmwareDemoMode(false); analysisStore.reset(); setRawPlaybackActive(false); setPlaybackFileName(''); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to USB device') }
   }
   async function disconnect() { if (logging) await stopLogging(); await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setFirmwareGitSha(null); setFirmwareProtocolVersion(null); setNotice('Device disconnected') }
@@ -544,7 +569,7 @@ function App() {
     else setSecondarySpokes(spokes)
   }
   async function downloadProcessedCsv(baseName: string = sessionName || 'cvt-dyno-session') {
-    const csv = analysisSnapshotToCsv(analysis)
+    const csv = analysisSnapshotToCsv(analysisStore.snapshot())
     const name = `${baseName}-processed-${analysisWindowMs}ms.csv`
     if (directoryHandle.current) {
       const file = await directoryHandle.current.getFileHandle(name, { create: true })
@@ -614,32 +639,32 @@ function App() {
     setPlaybackFileName('')
     resetPacketHealth()
     analysisClientRef.current?.reset()
-    setAnalysis(createEmptyAnalysisSnapshot())
+    analysisStore.reset()
     setNotice('Raw replay cleared; live analysis is available again')
   }
-  function toggleChartPlaying() {
+  const toggleChartPlaying = useCallback(() => {
     setChartPlaying((playing) => {
-      setFrozenDomainEnd(playing ? (latestAnalysisTime(analysis) || null) : null)
+      setFrozenDomainEnd(playing ? (analysisStore.latestTime() || null) : null)
       return !playing
     })
-  }
+  }, [analysisStore])
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected || rawPlaybackActive ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : rawPlaybackActive ? replayState.playing ? 'Software raw replay' : 'Replay paused' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span>{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions">{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected || rawPlaybackActive ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : rawPlaybackActive ? replayState.playing ? 'Software raw replay' : 'Replay paused' : 'Offline'}<span className="status-divider" /><AnalysisPrimaryRpm store={analysisStore} />{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions">{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
     {protocolMismatch && <section className="protocol-mismatch-banner" role="alert">
       <strong>Firmware/viewer protocol mismatch.</strong> Connected device reports protocol v{firmwareProtocolVersion}{firmwareGitSha ? ` (build ${firmwareGitSha})` : ''}, this viewer expects v{EXPECTED_PROTOCOL_VERSION}.
       Data may be misinterpreted -- reflash the firmware from the latest build, or use a matching viewer version, before trusting anything shown below.
     </section>}
     {consoleOpen && <UsbConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
     <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 4)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
-        <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${rawLoggerRef.current?.fileName ?? 'raw'}` : 'Start raw log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Export processed CSV" onClick={() => void downloadProcessedCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { analysisClientRef.current?.reset(); setAnalysis(createEmptyAnalysisSnapshot()); setNotice('Analysis view cleared') }}><Trash2 size={17} /></button></div></section>
+        <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${rawLoggerRef.current?.fileName ?? 'raw'}` : 'Start raw log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Export processed CSV" onClick={() => void downloadProcessedCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { analysisClientRef.current?.reset(); analysisStore.reset(); setNotice('Analysis view cleared') }}><Trash2 size={17} /></button></div></section>
     {powerMode === 'inertia' && inertiaSettingsOpen && <section className="inertia-settings"><div className="inertia-settings-header"><span className="section-kicker">INERTIA MODE SETTINGS</span><h3>Shaft inertia and engine curve</h3><button className="icon-button" title="Close" onClick={() => setInertiaSettingsOpen(false)}><X size={15} /></button></div><div className="inertia-settings-body"><div className="control-group compact inertia-input"><label htmlFor="inertia-value">Secondary inertia</label><div className="input-with-unit"><input id="inertia-value" type="number" step="0.0001" min="0" value={inertiaKgM2} onChange={(event) => setInertiaKgM2(Number(event.target.value))} /><span>kg·m²</span></div></div><div className="torque-curve-wrap"><div className="torque-curve-heading"><span>Primary RPM vs. torque curve</span><button className="button button-quiet" onClick={() => setTorqueCurve([...defaultEngineTorqueCurve])}><RotateCcw size={13} />Reset curve</button></div><TorqueCurveEditor points={torqueCurve} onChange={setTorqueCurve} /></div></div></section>}
     <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.slice(0, 5).map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span>{index <= 1 ? <span className="mono" title="RPM channels are edge-triggered (one packet per physical tooth), not polled at a configurable rate">Per-tooth</span> : <select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select>}</div>)}</section>
     <section className="channel-strip"><div className="strip-label"><Gauge size={17} /><span>RPM wheel teeth / spokes</span></div><div className="channel-control"><span>Primary wheel teeth</span><input type="number" min="1" max="999" value={primarySpokes} onChange={(event) => updateSpokes(0, Number(event.target.value))} /></div><div className="channel-control"><span>Secondary wheel teeth</span><input type="number" min="1" max="999" value={secondarySpokes} onChange={(event) => updateSpokes(1, Number(event.target.value))} /></div></section>
     <section className="playback-bar"><div className="strip-label"><Upload size={17} /><span>Software raw replay</span></div><input ref={fileInputRef} type="file" accept=".csv,text/csv" className="visually-hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadPlaybackFile(file); event.target.value = '' }} /><button className="button button-quiet" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load raw replay</button>{rawPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span><button className="icon-button" title={replayState.playing ? 'Pause replay' : 'Play replay'} onClick={togglePlaybackPlaying}>{replayState.playing ? <Pause size={16} /> : <Play size={16} />}</button><button className="button button-quiet" onClick={restartPlayback}>Restart</button><select value={replayState.speed} onChange={(event) => changePlaybackSpeed(Number(event.target.value))}>{RAW_REPLAY_SPEEDS.map((speed) => <option key={speed} value={speed}>{speed}x</option>)}</select><label className="replay-toggle"><input type="checkbox" checked={replayState.loop} onChange={togglePlaybackLoop} />Loop</label><span className="mono replay-progress">{(replayState.elapsedMs / 1000).toFixed(1)}s / {(replayState.durationMs / 1000).toFixed(1)}s · {(replayState.progress * 100).toFixed(0)}%{replayState.loopCount > 0 ? ` · loop ${replayState.loopCount + 1}` : ''}</span><button className="icon-button" title="Export processed CSV" onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear replay" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
-    <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{Number.isFinite(value as number) ? formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0) : '—'}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
+    <AnalysisMetricGrid store={analysisStore} />
     <AnalysisWorkspace
       key={chartResetKey}
-      series={analysis}
+      store={analysisStore}
       chartPlaying={chartPlaying}
       frozenDomainEnd={frozenDomainEnd}
       onToggleChartPlaying={toggleChartPlaying}

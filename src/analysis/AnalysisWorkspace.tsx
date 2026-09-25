@@ -1,10 +1,11 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type Dispatch, type DragEvent, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ChangeEvent, type Dispatch, type DragEvent, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
 import { GripVertical, Pause, Play, RotateCcw, X } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
-import { downsampleForChart } from '../downsample'
 import { TimeRangeSlider } from '../TimeRangeSlider'
-import { ANALYSIS_WINDOWS_MS, type AnalysisSnapshot, type EfficiencyPoint, type PowerPoint, type RatioPoint, type RpmObservationMode, type RpmObservationView, type RpmPoint, type ShiftPoint } from './types'
-import { findNearestTime, firstAnalysisTime, latestAnalysisTime } from './uiStore'
+import { ANALYSIS_WINDOWS_MS, type EfficiencyPoint, type RatioPoint, type RpmObservationMode, type RpmObservationView, type RpmPoint, type ShiftPoint } from './types'
+import { findNearestTime } from './uiStore'
+import { AnalysisStore, type PowerRow, type WithSeconds } from './store'
+import { nearestProjectedPoint, projectToPlot, type PlotRect as RelationshipPlotRect } from './relationshipHover'
 
 export type ChartId = 'scatter' | 'rpm1' | 'rpm2' | 'shift' | 'power' | 'efficiency' | 'shiftRatio' | 'shiftEfficiency'
 export type ChartConfig = { id: ChartId; title: string; subtitle: string; color: string; visible: boolean }
@@ -32,8 +33,6 @@ const analysisDot = { r: 1.8, strokeWidth: 0 }
 function clamp01(value: number) { return Math.min(1, Math.max(0, value)) }
 function formatNumber(value: number, digits = 2) { return Number.isFinite(value) ? value.toFixed(digits) : '—' }
 
-type WithSeconds<T> = T & { seconds: number }
-type PowerRow = { time: number; seconds: number; power1?: number; power2?: number }
 const EMPTY_TIME_DATA: readonly { time: number; seconds: number }[] = []
 const EMPTY_RELATIONSHIP_DATA: readonly (WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>)[] = []
 const EMPTY_RPM_OBSERVATIONS: WithSeconds<RpmPoint>[] = []
@@ -86,53 +85,10 @@ class HoverBus {
   }
 }
 
-function lowerBoundTime<T extends { time: number }>(values: readonly T[], target: number): number {
-  let low = 0
-  let high = values.length
-  while (low < high) {
-    const mid = (low + high) >> 1
-    if (values[mid].time < target) low = mid + 1
-    else high = mid
-  }
-  return low
-}
-
-function upperBoundTime<T extends { time: number }>(values: readonly T[], target: number): number {
-  let low = 0
-  let high = values.length
-  while (low < high) {
-    const mid = (low + high) >> 1
-    if (values[mid].time <= target) low = mid + 1
-    else high = mid
-  }
-  return low
-}
-
-function sliceTimeRange<T extends { time: number }>(values: readonly T[], start: number, end: number): readonly T[] {
-  if (!values.length || end < start) return []
-  return values.slice(lowerBoundTime(values, start), upperBoundTime(values, end))
-}
-
-function windowed<T extends { time: number }>(values: readonly T[], start: number, end: number, origin: number): WithSeconds<T>[] {
-  const visible = sliceTimeRange(values, start, end)
-  return downsampleForChart(visible, MAX_CHART_POINTS).map((point) => ({ ...point, seconds: (point.time - origin) / 1000 }))
-}
-
-function windowedDots<T extends { time: number }>(values: readonly T[], start: number, end: number, origin: number): WithSeconds<T>[] {
-  return sliceTimeRange(values, start, end).map((point) => ({ ...point, seconds: (point.time - origin) / 1000 }))
-}
-
-function mergePower(primary: readonly PowerPoint[], secondary: readonly PowerPoint[], start: number, end: number, origin: number): PowerRow[] {
-  const rows = new Map<number, PowerRow>()
-  for (const point of sliceTimeRange(primary, start, end)) {
-    rows.set(point.time, { time: point.time, seconds: (point.time - origin) / 1000, power1: point.powerKw })
-  }
-  for (const point of sliceTimeRange(secondary, start, end)) {
-    const row = rows.get(point.time) ?? { time: point.time, seconds: (point.time - origin) / 1000 }
-    row.power2 = point.powerKw
-    rows.set(point.time, row)
-  }
-  return downsampleForChart([...rows.values()].sort((a, b) => a.time - b.time), MAX_CHART_POINTS)
+function observationDots(values: readonly RpmPoint[], start: number, end: number, origin: number): WithSeconds<RpmPoint>[] {
+  return values
+    .filter((point) => point.time >= start && point.time <= end)
+    .map((point) => ({ ...point, seconds: (point.time - origin) / 1000 }))
 }
 
 function timeDecimals(visibleSpanMs: number): number {
@@ -194,12 +150,17 @@ function niceRpmCeiling(value: number): number {
   return Math.ceil(padded / step) * step
 }
 
-export function AnalysisWorkspace({
-  series, chartPlaying, frozenDomainEnd, onToggleChartPlaying, analysisWindowMs, onAnalysisWindowChange,
+function AnalysisPointCount({ store }: { store: AnalysisStore }) {
+  const status = useSyncExternalStore(store.subscribe, store.getStatusSnapshot, store.getStatusSnapshot)
+  return <span><span className="status-dot is-live" />{status.totalCount.toLocaleString()} derived points</span>
+}
+
+function AnalysisWorkspaceComponent({
+  store, chartPlaying, frozenDomainEnd, onToggleChartPlaying, analysisWindowMs, onAnalysisWindowChange,
   observationMode, onObservationModeChange, charts, setCharts, lowRatio, highRatio, onLowRatioChange,
   onHighRatioChange, droppedPackets, lostEdges, sourceLabel, requestObservations,
 }: {
-  series: AnalysisSnapshot
+  store: AnalysisStore
   chartPlaying: boolean
   frozenDomainEnd: number | null
   onToggleChartPlaying: () => void
@@ -219,9 +180,21 @@ export function AnalysisWorkspace({
   requestObservations: (mode: RpmObservationMode, startMs: number, endMs: number, maxPoints: number) => Promise<RpmObservationView>
 }) {
   const [manualRange, setManualRange] = useState<{ start: number; end: number } | null>(null)
-  const liveStart = firstAnalysisTime(series)
-  const liveEnd = latestAnalysisTime(series)
+  // Live charts subscribe to every derived-data revision. Frozen charts subscribe only to
+  // replace/reset generations, so appends after the frozen end do not wake the chart tree at all.
+  const workspaceSnapshot = chartPlaying ? store.getStatusSnapshot : store.getStructuralSnapshot
+  const subscribedStatus = useSyncExternalStore(store.subscribe, workspaceSnapshot, workspaceSnapshot)
+  const frozenStatusRef = useRef(subscribedStatus)
+  if (chartPlaying || subscribedStatus.generation !== frozenStatusRef.current.generation) frozenStatusRef.current = subscribedStatus
+  const status = frozenStatusRef.current
+  const liveStart = status.firstTime
+  const liveEnd = status.latestTime
   const timeOriginRef = useRef<number | null>(null)
+  const generationRef = useRef(status.generation)
+  if (generationRef.current !== status.generation) {
+    generationRef.current = status.generation
+    timeOriginRef.current = liveStart > 0 ? liveStart : null
+  }
   if (timeOriginRef.current === null && liveStart > 0) timeOriginRef.current = liveStart
   const timeOrigin = timeOriginRef.current ?? liveStart
   const domainEnd = chartPlaying || frozenDomainEnd === null ? liveEnd : Math.min(liveEnd, frozenDomainEnd)
@@ -254,17 +227,14 @@ export function AnalysisWorkspace({
     })
   }, [observationMode, observationQueryStart, observationQueryEnd, requestObservations])
 
-  const primaryRpm = useMemo(() => windowed(series.primaryRpm, windowStartMs, windowEndMs, timeOrigin), [series.primaryRpm, windowStartMs, windowEndMs, timeOrigin])
-  const secondaryRpm = useMemo(() => windowed(series.secondaryRpm, windowStartMs, windowEndMs, timeOrigin), [series.secondaryRpm, windowStartMs, windowEndMs, timeOrigin])
-  const primaryObs = useMemo(() => windowedDots(observationView.primary, windowStartMs, windowEndMs, timeOrigin), [observationView.primary, windowStartMs, windowEndMs, timeOrigin])
-  const secondaryObs = useMemo(() => windowedDots(observationView.secondary, windowStartMs, windowEndMs, timeOrigin), [observationView.secondary, windowStartMs, windowEndMs, timeOrigin])
-  const shift = useMemo(() => windowed(series.shift, windowStartMs, windowEndMs, timeOrigin), [series.shift, windowStartMs, windowEndMs, timeOrigin])
-  const ratioDots = useMemo(() => windowedDots(series.ratio, windowStartMs, windowEndMs, timeOrigin), [series.ratio, windowStartMs, windowEndMs, timeOrigin])
-  const ratioTime = useMemo(() => windowed(series.ratio, windowStartMs, windowEndMs, timeOrigin), [series.ratio, windowStartMs, windowEndMs, timeOrigin])
-  const efficiencyDots = useMemo(() => windowedDots(series.efficiency, windowStartMs, windowEndMs, timeOrigin), [series.efficiency, windowStartMs, windowEndMs, timeOrigin])
-  const efficiencyTime = useMemo(() => windowed(series.efficiency, windowStartMs, windowEndMs, timeOrigin), [series.efficiency, windowStartMs, windowEndMs, timeOrigin])
-  const power = useMemo(() => mergePower(series.primaryPower, series.secondaryPower, windowStartMs, windowEndMs, timeOrigin), [series.primaryPower, series.secondaryPower, windowStartMs, windowEndMs, timeOrigin])
-  const view = useMemo<ViewData>(() => ({ primaryRpm, secondaryRpm, primaryObs, secondaryObs, shift, ratioDots, ratioTime, efficiencyDots, efficiencyTime, power }), [primaryRpm, secondaryRpm, primaryObs, secondaryObs, shift, ratioDots, ratioTime, efficiencyDots, efficiencyTime, power])
+  const storedView = useMemo(
+    () => store.viewport(windowStartMs, windowEndMs, timeOrigin, MAX_CHART_POINTS),
+    [store, status.revision, windowStartMs, windowEndMs, timeOrigin],
+  )
+  const primaryObs = useMemo(() => observationDots(observationView.primary, windowStartMs, windowEndMs, timeOrigin), [observationView.primary, windowStartMs, windowEndMs, timeOrigin])
+  const secondaryObs = useMemo(() => observationDots(observationView.secondary, windowStartMs, windowEndMs, timeOrigin), [observationView.secondary, windowStartMs, windowEndMs, timeOrigin])
+  const { primaryRpm, secondaryRpm, shift, ratioDots, ratioTime, efficiencyDots, efficiencyTime, power } = storedView
+  const view = useMemo<ViewData>(() => ({ ...storedView, primaryObs, secondaryObs }), [storedView, primaryObs, secondaryObs])
 
   const scatterMax = useMemo(() => {
     let max = 10
@@ -302,13 +272,11 @@ export function AnalysisWorkspace({
     setDragged(null)
   }
 
-  const pointCount = series.primaryRpm.length + series.secondaryRpm.length + series.primaryPower.length + series.secondaryPower.length + series.ratio.length + series.efficiency.length + series.shift.length
-
   return <>
     <section className="workspace-heading">
       <div><span className="section-kicker">02 / TELEMETRY</span><h2>Analysis workspace</h2></div>
       <div className="workspace-tools">
-        <span><span className="status-dot is-live" />{pointCount.toLocaleString()} derived points</span>
+        <AnalysisPointCount store={store} />
         {droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost after device queueing, detected via sequence numbers"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}
         {(lostEdges[0] + lostEdges[1]) > 0 && <span className="workspace-dropped" title={`Primary RPM: ${lostEdges[0].toLocaleString()} lost | Secondary RPM: ${lostEdges[1].toLocaleString()} lost`}><X size={13} />{(lostEdges[0] + lostEdges[1]).toLocaleString()} lost (device)</span>}
         <button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Freeze the displayed view; capture and analysis continue' : 'Resume following the latest analysis'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Freeze view' : 'View frozen'}</button>
@@ -327,6 +295,8 @@ export function AnalysisWorkspace({
     />)}</section>
   </>
 }
+
+export const AnalysisWorkspace = memo(AnalysisWorkspaceComponent)
 
 function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, windowEnd, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, analysisWindowMs, scatterMax, efficiencyMax, powerDomain, sourceLabel, onDragStart, onDrop, onHide }: {
   config: ChartConfig
@@ -354,7 +324,6 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   const readoutRef = useRef<HTMLSpanElement | null>(null)
   const plotRectRef = useRef<DOMRect | null>(null)
   const bodyRectRef = useRef<DOMRect | null>(null)
-  const relationshipHitsRef = useRef<RelationshipSnap[]>([])
   const relationship = config.id === 'scatter' || config.id === 'shiftEfficiency'
   const visibleSpanMs = Math.max(0, windowEnd - windowStart)
   const visibleStartSeconds = (windowStart - timeOrigin) / 1000
@@ -379,103 +348,102 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   const plotLowRatio = config.id === 'scatter' ? lowRatio : 0
   const plotHighRatio = config.id === 'scatter' ? highRatio : 0
 
-  const refreshRelationshipHits = useCallback(() => {
-    if (!relationship) {
-      relationshipHitsRef.current = []
-      return
+  const relationshipDomains = useMemo<{ x: [number, number]; y: [number, number] }>(() => (
+    config.id === 'scatter'
+      ? { x: [0, scatterMax], y: [0, scatterMax] }
+      : { x: [0.5, 6], y: [0, efficiencyMax] }
+  ), [config.id, scatterMax, efficiencyMax])
+
+  const relationshipX = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>) => (
+    config.id === 'scatter' ? (point as RatioPoint).rpm2 : (point as EfficiencyPoint).ratio
+  ), [config.id])
+
+  const relationshipY = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>) => (
+    config.id === 'scatter' ? (point as RatioPoint).rpm1 : (point as EfficiencyPoint).efficiencyPct
+  ), [config.id])
+
+  const relationshipReadout = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>) => (
+    config.id === 'scatter'
+      ? `Sec ${formatNumber((point as RatioPoint).rpm2)} / Pri ${formatNumber((point as RatioPoint).rpm1)}`
+      : `Ratio ${formatNumber((point as EfficiencyPoint).ratio, 2)} / Eff ${formatNumber((point as EfficiencyPoint).efficiencyPct, 2)}%`
+  ), [config.id])
+
+  const localRelationshipPlot = useCallback((): RelationshipPlotRect | null => {
+    const plotRect = plotRectRef.current
+    const measuredBodyRect = bodyRectRef.current
+    if (!plotRect || !measuredBodyRect || !(plotRect.width > 0) || !(plotRect.height > 0)) return null
+    return {
+      left: plotRect.left - measuredBodyRect.left,
+      top: plotRect.top - measuredBodyRect.top,
+      width: plotRect.width,
+      height: plotRect.height,
     }
-    const body = chartBodyRef.current
-    if (!body) return
+  }, [])
 
-    const points = config.id === 'scatter' ? view.ratioDots : view.efficiencyDots
-    if (!points.length) {
-      relationshipHitsRef.current = []
-      return
+  const relationshipSnapForPoint = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>): RelationshipSnap | undefined => {
+    const plot = localRelationshipPlot()
+    if (!plot) return undefined
+    const projected = projectToPlot(relationshipX(point), relationshipY(point), relationshipDomains.x, relationshipDomains.y, plot)
+    if (!projected) return undefined
+    return {
+      time: point.time,
+      xPx: projected.xPx,
+      yPx: projected.yPx,
+      readout: relationshipReadout(point),
     }
+  }, [localRelationshipPlot, relationshipDomains, relationshipReadout, relationshipX, relationshipY])
 
-    // Recharts renders line dots as SVG circles inside .recharts-line-dots.  The low/high-ratio
-    // guide lines have dots disabled, so the circles here correspond to the actual relationship
-    // samples.  Slice from the end as a defensive fallback if another dotted line is added later.
-    let dots = Array.from(body.querySelectorAll<SVGCircleElement>('.recharts-line-dots .recharts-line-dot'))
-    if (!dots.length) dots = Array.from(body.querySelectorAll<SVGCircleElement>('.recharts-line-dots circle'))
-    if (dots.length > points.length) dots = dots.slice(-points.length)
-
-    const count = Math.min(dots.length, points.length)
-    if (!count) {
-      relationshipHitsRef.current = []
-      return
-    }
-
-    const bodyRect = body.getBoundingClientRect()
-    bodyRectRef.current = bodyRect
-    const hits: RelationshipSnap[] = []
-    for (let index = 0; index < count; index += 1) {
-      const dotRect = dots[index].getBoundingClientRect()
-      const point = points[index]
-      const xPx = dotRect.left + dotRect.width / 2 - bodyRect.left
-      const yPx = dotRect.top + dotRect.height / 2 - bodyRect.top
-      const readout = config.id === 'scatter'
-        ? `Sec ${formatNumber((point as RatioPoint).rpm2)} / Pri ${formatNumber((point as RatioPoint).rpm1)}`
-        : `Ratio ${formatNumber((point as EfficiencyPoint).ratio, 2)} / Eff ${formatNumber((point as EfficiencyPoint).efficiencyPct, 2)}%`
-      hits.push({ time: point.time, xPx, yPx, readout })
-    }
-    relationshipHitsRef.current = hits
-  // The hit cache stores rendered SVG-circle centers in pixels. Any axis-domain change moves
-  // those circles even when the data arrays and outer chart size are unchanged (for example the
-  // rounded RPM ceiling added by the axis/readability patch). Include the relationship-axis
-  // domains here so the post-render measurement effect rebuilds the cache whenever the mapping
-  // from data coordinates to screen pixels changes.
-  }, [config.id, relationship, view.ratioDots, view.efficiencyDots, scatterMax, efficiencyMax])
-
-  function measurePlotRect(chartBody: HTMLDivElement) {
+  const measurePlotRect = useCallback((chartBody: HTMLDivElement) => {
     plotRectRef.current = chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
     bodyRectRef.current = chartBody.getBoundingClientRect()
-  }
+  }, [])
 
   useEffect(() => {
     const body = chartBodyRef.current
     if (!body) return
-    let frame: number | null = null
-    const refresh = () => {
-      measurePlotRect(body)
-      if (frame !== null) cancelAnimationFrame(frame)
-      // Wait one frame so ResponsiveContainer/Recharts has committed the final circle geometry.
-      frame = requestAnimationFrame(() => {
-        frame = null
-        refreshRelationshipHits()
-      })
-    }
-    refresh()
-    const observer = new ResizeObserver(refresh)
+    measurePlotRect(body)
+    const observer = new ResizeObserver(() => measurePlotRect(body))
     observer.observe(body)
-    return () => {
-      observer.disconnect()
-      if (frame !== null) cancelAnimationFrame(frame)
-    }
-  }, [refreshRelationshipHits])
+    return () => observer.disconnect()
+  }, [measurePlotRect])
 
-  const nearestRelationship = useCallback((clientX: number, clientY: number): RelationshipSnap | undefined => {
+  const nearestRelationship = useCallback((mouseX: number, mouseY: number): RelationshipSnap | undefined => {
+    if (!relationship) return undefined
     const body = chartBodyRef.current
-    if (!body) return undefined
-    if (!relationshipHitsRef.current.length) refreshRelationshipHits()
-    const bodyRect = bodyRectRef.current ?? body.getBoundingClientRect()
-    bodyRectRef.current = bodyRect
-    const mouseX = clientX - bodyRect.left
-    const mouseY = clientY - bodyRect.top
+    if ((!plotRectRef.current || !bodyRectRef.current) && body) measurePlotRect(body)
 
-    let best: RelationshipSnap | undefined
-    let bestDistancePx2 = Infinity
-    for (const hit of relationshipHitsRef.current) {
-      const dx = hit.xPx - mouseX
-      const dy = hit.yPx - mouseY
-      const d2 = dx * dx + dy * dy
-      if (d2 < bestDistancePx2) {
-        bestDistancePx2 = d2
-        best = hit
-      }
+    const plot = localRelationshipPlot()
+    if (!plot) return undefined
+
+    // Pure arithmetic over the visible data. No SVG querySelector and no per-dot layout reads.
+    const nearest = nearestProjectedPoint(
+      relationshipData,
+      mouseX,
+      mouseY,
+      relationshipDomains.x,
+      relationshipDomains.y,
+      plot,
+      relationshipX,
+      relationshipY,
+    )
+    if (!nearest) return undefined
+
+    return {
+      time: nearest.point.time,
+      xPx: nearest.xPx,
+      yPx: nearest.yPx,
+      readout: relationshipReadout(nearest.point),
     }
-    return best
-  }, [refreshRelationshipHits])
+  }, [
+    localRelationshipPlot,
+    measurePlotRect,
+    relationship,
+    relationshipData,
+    relationshipDomains,
+    relationshipReadout,
+    relationshipX,
+    relationshipY,
+  ])
 
   const hideHover = useCallback(() => {
     if (crosshairRef.current) crosshairRef.current.style.display = 'none'
@@ -494,14 +462,8 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
 
     let relationshipSnap = relationship && hoverEvent.sourceChartId === config.id ? hoverEvent.relationshipSnap : undefined
     if (relationship && !relationshipSnap) {
-      let bestDelta = Infinity
-      for (const hit of relationshipHitsRef.current) {
-        const delta = Math.abs(hit.time - hoverTime)
-        if (delta < bestDelta) {
-          bestDelta = delta
-          relationshipSnap = hit
-        }
-      }
+      const point = findNearestTime(relationshipData, hoverTime)
+      if (point) relationshipSnap = relationshipSnapForPoint(point)
     }
 
     let hovered: RpmPoint | ShiftPoint | RatioPoint | EfficiencyPoint | PowerRow | undefined
@@ -521,7 +483,7 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
       if (horizontal) horizontal.style.display = 'none'
     } else {
       if (!relationshipSnap) { hideHover(); return }
-      // These are the real rendered SVG-circle centers measured from the chart body.
+      // The snap is projected into the exact plot rectangle from the chart's linear domains.
       vertical.style.display = 'block'
       vertical.style.transform = `translate3d(${relationshipSnap.xPx}px,0,0)`
       if (horizontal) {
@@ -559,7 +521,8 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
       hoverBus.publish({ time: windowStart + fx * Math.max(0, windowEnd - windowStart), sourceChartId: config.id })
       return
     }
-    const nearest = nearestRelationship(event.clientX, event.clientY)
+    const bodyRect = event.currentTarget.getBoundingClientRect()
+    const nearest = nearestRelationship(event.clientX - bodyRect.left, event.clientY - bodyRect.top)
     if (nearest) hoverBus.publish({ time: nearest.time, sourceChartId: config.id, relationshipSnap: nearest })
   }
 
