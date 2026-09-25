@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { channelNames, encodeCommand, EXPECTED_PROTOCOL_VERSION, periodUsToRpm, type ChannelId } from './protocol'
 import { UsbTransport } from './usbTransport'
@@ -100,7 +100,10 @@ function App() {
     const stored = Number(localStorage.getItem('cvt-dyno-analysis-window-ms'))
     return ANALYSIS_WINDOWS_MS.includes(stored as typeof ANALYSIS_WINDOWS_MS[number]) ? stored : DEFAULT_ANALYSIS_WINDOW_MS
   })
-  const [rpmObservationMode, setRpmObservationMode] = useState<RpmObservationMode>(() => localStorage.getItem('cvt-dyno-rpm-observation-mode') === 'tooth' ? 'tooth' : 'revolution')
+  const [rpmObservationMode, setRpmObservationMode] = useState<RpmObservationMode>(() => {
+    const stored = localStorage.getItem('cvt-dyno-rpm-observation-mode')
+    return stored === 'none' || stored === 'tooth' ? stored : 'revolution'
+  })
   const [charts, setCharts] = useState<ChartConfig[]>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('cvt-dyno-layout') ?? 'null') as ChartConfig[] | null
@@ -165,6 +168,10 @@ function App() {
     torqueOffset,
   }), [analysisWindowMs, primarySpokes, secondarySpokes, inertiaKgM2, torqueCurve, powerMode, torqueScale, torqueOffset])
 
+  const requestObservations = useCallback((mode: RpmObservationMode, startMs: number, endMs: number, maxPoints: number) => {
+    return analysisClientRef.current?.requestObservations(mode, startMs, endMs, maxPoints) ?? Promise.resolve({ primary: [], secondary: [] })
+  }, [])
+
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
   useEffect(() => { localStorage.setItem('cvt-dyno-torque-curve', JSON.stringify(torqueCurve)) }, [torqueCurve])
   useEffect(() => { localStorage.setItem('cvt-dyno-analysis-window-ms', String(analysisWindowMs)) }, [analysisWindowMs])
@@ -181,15 +188,11 @@ function App() {
       setAnalysis((currentSnapshot) => applyAnalysisUpdate(currentSnapshot, update, SENSOR_RETENTION_MS))
     })
     analysisClientRef.current = client
-    client.setObservationMode(rpmObservationMode)
     return () => { client.terminate(); if (analysisClientRef.current === client) analysisClientRef.current = null }
     // Initial worker creation only. Configuration changes use the effect below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   useEffect(() => { analysisClientRef.current?.configure(analysisConfig) }, [analysisConfig])
-  // Observation mode is display-only: swapping one-revolution dots for per-tooth dots does not
-  // rebuild RPM, power, ratio, or efficiency history.
-  useEffect(() => { analysisClientRef.current?.setObservationMode(rpmObservationMode) }, [rpmObservationMode])
   useEffect(() => {
     const controller = new RawReplayController({
       onBatch: (packets) => {
@@ -649,6 +652,7 @@ function App() {
       droppedPackets={droppedPackets}
       lostEdges={lostEdges}
       sourceLabel={connected ? 'LIVE' : rawPlaybackActive ? 'REPLAY' : 'VIEW'}
+      requestObservations={requestObservations}
     />
     <footer className="footer"><span><Wifi size={14} /> Browser WebUSB requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>

@@ -1,22 +1,40 @@
-import type { AnalysisConfig, AnalysisPacket, AnalysisUpdate, RpmObservationMode } from './types'
+import type { AnalysisConfig, AnalysisPacket, AnalysisUpdate, RpmObservationMode, RpmObservationView } from './types'
 import type { AnalysisWorkerInbound, AnalysisWorkerOutbound } from './analysisWorker'
 
 export class AnalysisClient {
   private worker: Worker
   private packetQueue: AnalysisPacket[] = []
   private queueScheduled = false
+  private nextRequestId = 1
+  private observationResolvers = new Map<number, (view: RpmObservationView) => void>()
 
   constructor(config: AnalysisConfig, onUpdate: (update: AnalysisUpdate) => void) {
     this.worker = new Worker(new URL('./analysisWorker.ts', import.meta.url), { type: 'module' })
     this.worker.onmessage = (event: MessageEvent<AnalysisWorkerOutbound>) => {
-      if (event.data.type === 'update') onUpdate(event.data.update)
+      if (event.data.type === 'update') {
+        onUpdate(event.data.update)
+        return
+      }
+      const resolve = this.observationResolvers.get(event.data.requestId)
+      if (!resolve) return
+      this.observationResolvers.delete(event.data.requestId)
+      resolve(event.data.view)
     }
     this.post({ type: 'configure', config })
   }
 
   configure(config: AnalysisConfig) { this.flushQueue(); this.post({ type: 'configure', config }) }
-  setObservationMode(mode: RpmObservationMode) { this.post({ type: 'observation-mode', mode }) }
   reset() { this.packetQueue = []; this.queueScheduled = false; this.post({ type: 'reset' }) }
+
+  requestObservations(mode: RpmObservationMode, startMs: number, endMs: number, maxPoints: number): Promise<RpmObservationView> {
+    if (mode === 'none' || !(endMs >= startMs) || maxPoints <= 0) return Promise.resolve({ primary: [], secondary: [] })
+    this.flushQueue()
+    const requestId = this.nextRequestId++
+    return new Promise((resolve) => {
+      this.observationResolvers.set(requestId, resolve)
+      this.post({ type: 'observation-view', mode, startMs, endMs, maxPoints, requestId })
+    })
+  }
 
   push(packet: AnalysisPacket) {
     this.packetQueue.push(packet)
@@ -31,7 +49,11 @@ export class AnalysisClient {
     this.post({ type: 'packets', packets })
   }
 
-  terminate() { this.worker.terminate() }
+  terminate() {
+    this.worker.terminate()
+    for (const resolve of this.observationResolvers.values()) resolve({ primary: [], secondary: [] })
+    this.observationResolvers.clear()
+  }
 
   private flushQueue() {
     if (!this.packetQueue.length) return

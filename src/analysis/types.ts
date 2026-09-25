@@ -1,6 +1,7 @@
 export type AnalysisChannelId = 0 | 1 | 2 | 3 | 4 | 5
 export type AnalysisPowerMode = 'inertia' | 'torque'
-export type RpmObservationMode = 'revolution' | 'tooth'
+// Display-only choice. The analysis engine always retains both observation families.
+export type RpmObservationMode = 'none' | 'revolution' | 'tooth'
 
 export type EngineTorquePoint = { rpm: number; torque: number }
 
@@ -27,6 +28,11 @@ export type RpmObservation = {
   time: number
   rpm: number
   sigmaRpm: number
+}
+
+export type RpmObservationView = {
+  primary: RpmObservation[]
+  secondary: RpmObservation[]
 }
 
 export type RpmPoint = {
@@ -68,8 +74,6 @@ export type AnalysisSnapshot = {
   ratio: RatioPoint[]
   efficiency: EfficiencyPoint[]
   shift: ShiftPoint[]
-  primaryObservations: RpmObservation[]
-  secondaryObservations: RpmObservation[]
 }
 
 export type AnalysisCounts = {
@@ -80,8 +84,6 @@ export type AnalysisCounts = {
   ratio: number
   efficiency: number
   shift: number
-  primaryObservations: number
-  secondaryObservations: number
 }
 
 export const ANALYSIS_WINDOWS_MS = [5, 10, 20, 50, 100, 250] as const
@@ -91,4 +93,3 @@ export const DEFAULT_SECONDARY_INERTIA_KG_M2 = 0.3134
 export type AnalysisUpdate =
   | { type: 'replace'; snapshot: AnalysisSnapshot }
   | { type: 'append'; snapshot: AnalysisSnapshot }
-  | { type: 'observations-replace'; primaryObservations: RpmObservation[]; secondaryObservations: RpmObservation[] }

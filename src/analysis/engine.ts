@@ -9,6 +9,7 @@ import type {
   RatioPoint,
   RpmObservation,
   RpmObservationMode,
+  RpmObservationView,
   RpmPoint,
   ShiftPoint,
 } from './types'
@@ -195,11 +196,44 @@ function externalObservation(sample: RpmSampleUs): RpmObservation {
   return { time: sample.tUs / 1000, rpm: sample.rpm, sigmaRpm: sample.sigmaRpm }
 }
 
-function emptySnapshot(): AnalysisSnapshot {
-  return {
-    primaryRpm: [], secondaryRpm: [], primaryPower: [], secondaryPower: [], ratio: [], efficiency: [], shift: [],
-    primaryObservations: [], secondaryObservations: [],
+function lowerBoundSampleTime(values: readonly RpmSampleUs[], targetUs: number): number {
+  let low = 0
+  let high = values.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (values[mid].tUs < targetUs) low = mid + 1
+    else high = mid
   }
+  return low
+}
+
+function upperBoundSampleTime(values: readonly RpmSampleUs[], targetUs: number): number {
+  let low = 0
+  let high = values.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (values[mid].tUs <= targetUs) low = mid + 1
+    else high = mid
+  }
+  return low
+}
+
+function sliceRpmSamples(values: readonly RpmSampleUs[], startUs: number, endUs: number): readonly RpmSampleUs[] {
+  if (!values.length || endUs < startUs) return []
+  return values.slice(lowerBoundSampleTime(values, startUs), upperBoundSampleTime(values, endUs))
+}
+
+function downsampleObservationSamples(values: readonly RpmSampleUs[], maxPoints: number): RpmSampleUs[] {
+  if (values.length <= maxPoints) return [...values]
+  if (maxPoints <= 1) return [values[0]]
+  const result: RpmSampleUs[] = []
+  const scale = (values.length - 1) / (maxPoints - 1)
+  for (let index = 0; index < maxPoints; index += 1) result.push(values[Math.round(index * scale)])
+  return result
+}
+
+function emptySnapshot(): AnalysisSnapshot {
+  return { primaryRpm: [], secondaryRpm: [], primaryPower: [], secondaryPower: [], ratio: [], efficiency: [], shift: [] }
 }
 
 export class AnalysisEngine {
@@ -253,12 +287,11 @@ export class AnalysisEngine {
     for (const packet of packets) this.ingest(packet)
   }
 
-  snapshot(observationMode: RpmObservationMode = 'revolution'): AnalysisSnapshot {
-    return this.snapshotFrom(this.zeroCounts(), observationMode)
+  snapshot(): AnalysisSnapshot {
+    return this.snapshotFrom(this.zeroCounts())
   }
 
-  counts(observationMode: RpmObservationMode = 'revolution'): AnalysisCounts {
-    const observations = observationMode === 'tooth' ? this.toothObservations : this.revolutionObservations
+  counts(): AnalysisCounts {
     return {
       primaryRpm: this.primaryRpm.length,
       secondaryRpm: this.secondaryRpm.length,
@@ -267,13 +300,10 @@ export class AnalysisEngine {
       ratio: this.ratio.length,
       efficiency: this.efficiency.length,
       shift: this.shiftPoints.length,
-      primaryObservations: observations[0].length,
-      secondaryObservations: observations[1].length,
     }
   }
 
-  snapshotFrom(counts: AnalysisCounts, observationMode: RpmObservationMode = 'revolution'): AnalysisSnapshot {
-    const observations = observationMode === 'tooth' ? this.toothObservations : this.revolutionObservations
+  snapshotFrom(counts: AnalysisCounts): AnalysisSnapshot {
     return {
       primaryRpm: this.primaryRpm.slice(counts.primaryRpm),
       secondaryRpm: this.secondaryRpm.slice(counts.secondaryRpm),
@@ -282,17 +312,19 @@ export class AnalysisEngine {
       ratio: this.ratio.slice(counts.ratio),
       efficiency: this.efficiency.slice(counts.efficiency),
       shift: this.shiftPoints.slice(counts.shift),
-      primaryObservations: observations[0].slice(counts.primaryObservations).map(externalObservation),
-      secondaryObservations: observations[1].slice(counts.secondaryObservations).map(externalObservation),
     }
   }
 
-  observationSnapshot(mode: RpmObservationMode): Pick<AnalysisSnapshot, 'primaryObservations' | 'secondaryObservations'> {
+  observationView(mode: RpmObservationMode, startMs: number, endMs: number, maxPoints: number): RpmObservationView {
+    if (mode === 'none' || !(endMs >= startMs) || maxPoints <= 0) return { primary: [], secondary: [] }
     const observations = mode === 'tooth' ? this.toothObservations : this.revolutionObservations
-    return {
-      primaryObservations: observations[0].map(externalObservation),
-      secondaryObservations: observations[1].map(externalObservation),
+    const startUs = startMs * 1000
+    const endUs = endMs * 1000
+    const slice = (values: readonly RpmSampleUs[]) => {
+      const visible = sliceRpmSamples(values, startUs, endUs)
+      return downsampleObservationSamples(visible, maxPoints).map(externalObservation)
     }
+    return { primary: slice(observations[0]), secondary: slice(observations[1]) }
   }
 
   private process(packet: AnalysisPacket) {
@@ -457,10 +489,7 @@ export class AnalysisEngine {
   }
 
   private zeroCounts(): AnalysisCounts {
-    return {
-      primaryRpm: 0, secondaryRpm: 0, primaryPower: 0, secondaryPower: 0, ratio: 0, efficiency: 0,
-      shift: 0, primaryObservations: 0, secondaryObservations: 0,
-    }
+    return { primaryRpm: 0, secondaryRpm: 0, primaryPower: 0, secondaryPower: 0, ratio: 0, efficiency: 0, shift: 0 }
   }
 
   private resetDerived() {

@@ -90,18 +90,33 @@ describe('AnalysisEngine independent streaming series', () => {
     for (let i = 30; i < packets.length; i += 1) packets[i] = { ...packets[i], seq: (packets[i].seq + 1) & 0xff }
     const engine = new AnalysisEngine(config({ windowMs: 20 }))
     engine.ingestMany(packets)
-    const observations = engine.snapshot().primaryObservations
+    const observations = engine.observationView('revolution', 0, 2_000, 10_000).primary
     expect(observations.length).toBeLessThan(packets.length - 16)
   })
 
-  it('switching observation display mode does not rebuild derived series', () => {
+  it('serves either observation family as a viewer-only window query', () => {
     const engine = new AnalysisEngine(config())
     engine.ingestMany(constantRpmPackets(0, 16, 3000, 1.2))
-    const before = engine.snapshot('revolution')
-    const tooth = engine.observationSnapshot('tooth')
-    const after = engine.snapshot('revolution')
+    const before = engine.snapshot()
+    const revolution = engine.observationView('revolution', 200, 1_000, 10_000).primary
+    const tooth = engine.observationView('tooth', 200, 1_000, 10_000).primary
+    const none = engine.observationView('none', 200, 1_000, 10_000).primary
+    const after = engine.snapshot()
     expect(after.primaryRpm).toEqual(before.primaryRpm)
     expect(after.primaryPower).toEqual(before.primaryPower)
-    expect(tooth.primaryObservations.length).toBeGreaterThan(before.primaryObservations.length)
+    expect(revolution.length).toBeGreaterThan(0)
+    expect(tooth.length).toBeGreaterThan(0)
+    expect(tooth[0].sigmaRpm).toBeGreaterThan(revolution[0].sigmaRpm)
+    expect(tooth[0].sigmaRpm / revolution[0].sigmaRpm).toBeCloseTo(16, 6)
+    expect(none).toEqual([])
+  })
+
+  it('caps observation queries without changing the stored analysis', () => {
+    const engine = new AnalysisEngine(config())
+    engine.ingestMany(constantRpmPackets(0, 16, 3000, 2.0))
+    const before = engine.snapshot()
+    const view = engine.observationView('tooth', 0, 2_000, 100)
+    expect(view.primary).toHaveLength(100)
+    expect(engine.snapshot()).toEqual(before)
   })
 })
