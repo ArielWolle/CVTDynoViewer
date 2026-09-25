@@ -21,35 +21,67 @@ export type AnalysisConfig = {
   powerMode: AnalysisPowerMode
   torqueScale: number
   torqueOffset: number
-  observationMode: RpmObservationMode
 }
 
 export type RpmObservation = {
-  time: number // firmware time in milliseconds
+  time: number
   rpm: number
   sigmaRpm: number
 }
 
-export type AnalysisFrame = {
-  time: number // firmware time in milliseconds, at the end of the analysis interval
+export type RpmPoint = {
+  time: number
+  rpm: number
+  sigmaRpm: number
+}
+
+export type PowerPoint = {
+  time: number
+  powerKw: number
+}
+
+export type ShiftPoint = {
+  time: number
+  value: number
+}
+
+export type RatioPoint = {
+  time: number
   rpm1: number
   rpm2: number
-  rpm1Sigma: number
-  rpm2Sigma: number
-  shift: number
-  torq1: number
-  torq2: number
-  power1: number // kW, interval-averaged
-  power2: number // kW, interval-averaged; signed outside efficiency use
-  efficiency: number // NaN when the interval is not valid for an efficiency estimate
-  shiftRatio: number
-  fullThrottle: boolean // true only when the ENTIRE analysis interval was WOT
+  ratio: number
+}
+
+export type EfficiencyPoint = {
+  time: number
+  power1Kw: number
+  power2Kw: number
+  efficiencyPct: number
+  ratio: number
 }
 
 export type AnalysisSnapshot = {
-  frames: AnalysisFrame[]
+  primaryRpm: RpmPoint[]
+  secondaryRpm: RpmPoint[]
+  primaryPower: PowerPoint[]
+  secondaryPower: PowerPoint[]
+  ratio: RatioPoint[]
+  efficiency: EfficiencyPoint[]
+  shift: ShiftPoint[]
   primaryObservations: RpmObservation[]
   secondaryObservations: RpmObservation[]
+}
+
+export type AnalysisCounts = {
+  primaryRpm: number
+  secondaryRpm: number
+  primaryPower: number
+  secondaryPower: number
+  ratio: number
+  efficiency: number
+  shift: number
+  primaryObservations: number
+  secondaryObservations: number
 }
 
 export const ANALYSIS_WINDOWS_MS = [5, 10, 20, 50, 100, 250] as const
@@ -59,3 +91,4 @@ export const DEFAULT_SECONDARY_INERTIA_KG_M2 = 0.3134
 export type AnalysisUpdate =
   | { type: 'replace'; snapshot: AnalysisSnapshot }
   | { type: 'append'; snapshot: AnalysisSnapshot }
+  | { type: 'observations-replace'; primaryObservations: RpmObservation[]; secondaryObservations: RpmObservation[] }

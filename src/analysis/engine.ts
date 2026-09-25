@@ -1,133 +1,132 @@
 import { enginePowerKwFromRpm } from './engineCurve'
-import type { AnalysisConfig, AnalysisFrame, AnalysisPacket, AnalysisSnapshot, RpmObservation } from './types'
+import type {
+  AnalysisConfig,
+  AnalysisCounts,
+  AnalysisPacket,
+  AnalysisSnapshot,
+  EfficiencyPoint,
+  PowerPoint,
+  RatioPoint,
+  RpmObservation,
+  RpmObservationMode,
+  RpmPoint,
+  ShiftPoint,
+} from './types'
 
 const US_PER_MINUTE = 60_000_000
 const RPM_TO_RAD_S = (2 * Math.PI) / 60
-// Conservative measurement model used in the offline audit: one captured edge timestamp is treated
-// as having 1 us (1 sigma) uncertainty. A difference between two edge timestamps therefore has
-// sqrt(2) us uncertainty.
 const EDGE_TIMESTAMP_SIGMA_US = 1
 const DELTA_TIMESTAMP_SIGMA_US = Math.SQRT2 * EDGE_TIMESTAMP_SIGMA_US
 
 type EdgeSample = { tUs: number; edgeCount: number; periodUs: number; epoch: number }
 type ScalarSample = { tUs: number; value: number }
-type BoolSample = { tUs: number; value: boolean }
 type RpmSampleUs = { tUs: number; rpm: number; sigmaRpm: number; epoch: number }
+type InternalShaft = 0 | 1
 
-function interpolateScalar(samples: readonly ScalarSample[], tUs: number): number | null {
-  if (samples.length === 0 || tUs < samples[0].tUs || tUs > samples[samples.length - 1].tUs) return null
-  let low = 0
-  let high = samples.length - 1
-  while (low < high) {
-    const mid = (low + high) >> 1
-    if (samples[mid].tUs < tUs) low = mid + 1
-    else high = mid
-  }
-  if (samples[low].tUs === tUs || low === 0) return samples[low].value
-  const right = samples[low]
-  const left = samples[low - 1]
-  const span = right.tUs - left.tUs
-  if (span <= 0) return right.value
-  return left.value + (right.value - left.value) * ((tUs - left.tUs) / span)
+type SeriesMaps = {
+  rpm: [Map<number, RpmPoint>, Map<number, RpmPoint>]
+  power: [Map<number, PowerPoint>, Map<number, PowerPoint>]
+  ratio: Map<number, RatioPoint>
+  efficiency: Map<number, EfficiencyPoint>
 }
 
-function interpolateRpm(samples: readonly RpmSampleUs[], tUs: number): { rpm: number; sigmaRpm: number; epoch: number } | null {
-  if (samples.length === 0 || tUs < samples[0].tUs || tUs > samples[samples.length - 1].tUs) return null
+function lowerBound<T extends { tUs: number }>(samples: readonly T[], tUs: number): number {
   let low = 0
-  let high = samples.length - 1
+  let high = samples.length
   while (low < high) {
     const mid = (low + high) >> 1
     if (samples[mid].tUs < tUs) low = mid + 1
     else high = mid
   }
-  if (samples[low].tUs === tUs || low === 0) return { rpm: samples[low].rpm, sigmaRpm: samples[low].sigmaRpm, epoch: samples[low].epoch }
-  const right = samples[low]
-  const left = samples[low - 1]
-  const span = right.tUs - left.tUs
-  if (span <= 0) return { rpm: right.rpm, sigmaRpm: right.sigmaRpm, epoch: right.epoch }
+  return low
+}
+
+function upperBound<T extends { tUs: number }>(samples: readonly T[], tUs: number): number {
+  let low = 0
+  let high = samples.length
+  while (low < high) {
+    const mid = (low + high) >> 1
+    if (samples[mid].tUs <= tUs) low = mid + 1
+    else high = mid
+  }
+  return low
+}
+
+function interpolateRpm(samples: readonly RpmSampleUs[], tUs: number): RpmSampleUs | null {
+  if (!samples.length || tUs < samples[0].tUs || tUs > samples[samples.length - 1].tUs) return null
+  const rightIndex = lowerBound(samples, tUs)
+  if (rightIndex >= samples.length) return null
+  const right = samples[rightIndex]
+  if (right.tUs === tUs) return { ...right, tUs }
+  if (rightIndex === 0) return null
+  const left = samples[rightIndex - 1]
   if (left.epoch !== right.epoch) return null
-  const fraction = (tUs - left.tUs) / span
-  const rpm = left.rpm + (right.rpm - left.rpm) * fraction
-  const sigmaRpm = Math.sqrt((1 - fraction) ** 2 * left.sigmaRpm ** 2 + fraction ** 2 * right.sigmaRpm ** 2)
-  return { rpm, sigmaRpm, epoch: left.epoch }
+  const dt = right.tUs - left.tUs
+  if (dt <= 0) return null
+  const f = (tUs - left.tUs) / dt
+  return {
+    tUs,
+    rpm: left.rpm + (right.rpm - left.rpm) * f,
+    sigmaRpm: Math.sqrt((1 - f) ** 2 * left.sigmaRpm ** 2 + f ** 2 * right.sigmaRpm ** 2),
+    epoch: left.epoch,
+  }
 }
 
-function timeAverageRpm(samples: readonly RpmSampleUs[], startUs: number, endUs: number): { rpm: number; sigmaRpm: number } | null {
+function intervalRpmPoints(samples: readonly RpmSampleUs[], startUs: number, endUs: number): RpmSampleUs[] | null {
   if (endUs <= startUs) return null
-  const left = interpolateRpm(samples, startUs)
-  const right = interpolateRpm(samples, endUs)
-  if (!left || !right) return null
-
-  if (left.epoch !== right.epoch) return null
-  const points: { tUs: number; rpm: number; sigmaRpm: number; epoch: number }[] = [{ tUs: startUs, ...left }]
-  for (const sample of samples) if (sample.tUs > startUs && sample.tUs < endUs) points.push(sample)
-  points.push({ tUs: endUs, ...right })
-  if (points.some((point) => point.epoch !== left.epoch)) return null
-
-  let integral = 0
-  let varianceIntegral = 0
-  for (let index = 1; index < points.length; index += 1) {
-    const a = points[index - 1]
-    const b = points[index]
-    const dt = b.tUs - a.tUs
-    integral += 0.5 * (a.rpm + b.rpm) * dt
-    // Conservative propagation for the trapezoidal average: treat adjacent point errors as independent.
-    varianceIntegral += (0.5 * dt) ** 2 * (a.sigmaRpm ** 2 + b.sigmaRpm ** 2)
-  }
-  const width = endUs - startUs
-  return { rpm: integral / width, sigmaRpm: Math.sqrt(varianceIntegral) / width }
+  const start = interpolateRpm(samples, startUs)
+  const end = interpolateRpm(samples, endUs)
+  if (!start || !end || start.epoch !== end.epoch) return null
+  const firstInside = upperBound(samples, startUs)
+  const afterInside = lowerBound(samples, endUs)
+  for (let i = firstInside; i < afterInside; i += 1) if (samples[i].epoch !== start.epoch) return null
+  return [start, ...samples.slice(firstInside, afterInside), end]
 }
 
 function timeAverageFunction(samples: readonly RpmSampleUs[], startUs: number, endUs: number, fn: (rpm: number) => number): number | null {
-  if (endUs <= startUs) return null
-  const left = interpolateRpm(samples, startUs)
-  const right = interpolateRpm(samples, endUs)
-  if (!left || !right) return null
-
-  if (left.epoch !== right.epoch) return null
-  const inside = samples.filter((sample) => sample.tUs > startUs && sample.tUs < endUs)
-  if (inside.some((sample) => sample.epoch !== left.epoch)) return null
-  const points: { tUs: number; value: number }[] = [{ tUs: startUs, value: fn(left.rpm) }]
-  for (const sample of inside) points.push({ tUs: sample.tUs, value: fn(sample.rpm) })
-  points.push({ tUs: endUs, value: fn(right.rpm) })
-
+  const points = intervalRpmPoints(samples, startUs, endUs)
+  if (!points) return null
   let integral = 0
-  for (let index = 1; index < points.length; index += 1) {
-    const a = points[index - 1]
-    const b = points[index]
-    integral += 0.5 * (a.value + b.value) * (b.tUs - a.tUs)
+  for (let i = 1; i < points.length; i += 1) {
+    const a = points[i - 1]
+    const b = points[i]
+    integral += 0.5 * (fn(a.rpm) + fn(b.rpm)) * (b.tUs - a.tUs)
   }
   return integral / (endUs - startUs)
 }
 
-function latestHeld(samples: readonly ScalarSample[], tUs: number): number {
-  if (samples.length === 0 || tUs < samples[0].tUs) return 0
-  let low = 0
-  let high = samples.length - 1
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2)
-    if (samples[mid].tUs <= tUs) low = mid
-    else high = mid - 1
+function timeAverageRatio(primary: readonly RpmSampleUs[], secondary: readonly RpmSampleUs[], startUs: number, endUs: number): number | null {
+  const pInterval = intervalRpmPoints(primary, startUs, endUs)
+  const sInterval = intervalRpmPoints(secondary, startUs, endUs)
+  if (!pInterval || !sInterval) return null
+
+  const times = new Set<number>([startUs, endUs])
+  for (const point of pInterval) if (point.tUs > startUs && point.tUs < endUs) times.add(point.tUs)
+  for (const point of sInterval) if (point.tUs > startUs && point.tUs < endUs) times.add(point.tUs)
+  const sorted = [...times].sort((a, b) => a - b)
+
+  const ratioAt = (tUs: number): number | null => {
+    const p = interpolateRpm(primary, tUs)
+    const s = interpolateRpm(secondary, tUs)
+    if (!p || !s || !(s.rpm > 0)) return null
+    return p.rpm / s.rpm
   }
-  return samples[low].value
+
+  let previous = ratioAt(sorted[0])
+  if (previous === null) return null
+  let integral = 0
+  for (let i = 1; i < sorted.length; i += 1) {
+    const current = ratioAt(sorted[i])
+    if (current === null) return null
+    integral += 0.5 * (previous + current) * (sorted[i] - sorted[i - 1])
+    previous = current
+  }
+  return integral / (endUs - startUs)
 }
 
-function boolAt(samples: readonly BoolSample[], tUs: number): boolean {
-  if (samples.length === 0 || tUs < samples[0].tUs) return false
-  let low = 0
-  let high = samples.length - 1
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2)
-    if (samples[mid].tUs <= tUs) low = mid
-    else high = mid - 1
-  }
-  return samples[low].value
-}
-
-function entireIntervalTrue(samples: readonly BoolSample[], startUs: number, endUs: number): boolean {
-  if (!boolAt(samples, startUs)) return false
-  for (const sample of samples) if (sample.tUs > startUs && sample.tUs <= endUs && !sample.value) return false
-  return true
+function latestHeld(samples: readonly ScalarSample[], tUs: number): number | null {
+  const index = upperBound(samples, tUs) - 1
+  return index >= 0 ? samples[index].value : null
 }
 
 function averageMeasuredPowerKw(
@@ -138,243 +137,349 @@ function averageMeasuredPowerKw(
   torqueScale: number,
   torqueOffset: number,
 ): number | null {
-  if (endUs <= startUs || torqueSamples.length === 0) return null
-  const startRpm = interpolateRpm(rpmSamples, startUs)
-  const endRpm = interpolateRpm(rpmSamples, endUs)
-  if (!startRpm || !endRpm || startRpm.epoch !== endRpm.epoch) return null
-  if (rpmSamples.some((sample) => sample.tUs > startUs && sample.tUs < endUs && sample.epoch !== startRpm.epoch)) return null
+  if (endUs <= startUs || !torqueSamples.length || torqueSamples[torqueSamples.length - 1].tUs < endUs) return null
+  const rpmPoints = intervalRpmPoints(rpmSamples, startUs, endUs)
+  if (!rpmPoints || latestHeld(torqueSamples, startUs) === null) return null
 
   const times = new Set<number>([startUs, endUs])
-  for (const sample of rpmSamples) if (sample.tUs > startUs && sample.tUs < endUs) times.add(sample.tUs)
-  for (const sample of torqueSamples) if (sample.tUs > startUs && sample.tUs < endUs) times.add(sample.tUs)
+  for (const point of rpmPoints) if (point.tUs > startUs && point.tUs < endUs) times.add(point.tUs)
+  const torqueStart = upperBound(torqueSamples, startUs)
+  const torqueEnd = upperBound(torqueSamples, endUs)
+  for (let i = torqueStart; i < torqueEnd; i += 1) times.add(torqueSamples[i].tUs)
   const sorted = [...times].sort((a, b) => a - b)
 
-  const powerAt = (tUs: number) => {
+  const powerAt = (tUs: number): number | null => {
     const rpm = interpolateRpm(rpmSamples, tUs)?.rpm
-    if (rpm === undefined) return null
     const rawTorque = latestHeld(torqueSamples, tUs)
+    if (rpm === undefined || rawTorque === null) return null
     const torqueNm = (rawTorque - torqueOffset) * torqueScale
-    return torqueNm * (rpm * RPM_TO_RAD_S) / 1000
+    return torqueNm * rpm * RPM_TO_RAD_S / 1000
   }
 
   let integral = 0
-  let previousPower = powerAt(sorted[0])
-  if (previousPower === null) return null
-  for (let index = 1; index < sorted.length; index += 1) {
-    const currentPower = powerAt(sorted[index])
-    if (currentPower === null) return null
-    integral += 0.5 * (previousPower + currentPower) * (sorted[index] - sorted[index - 1])
-    previousPower = currentPower
+  let previous = powerAt(sorted[0])
+  if (previous === null) return null
+  for (let i = 1; i < sorted.length; i += 1) {
+    const current = powerAt(sorted[i])
+    if (current === null) return null
+    integral += 0.5 * (previous + current) * (sorted[i] - sorted[i - 1])
+    previous = current
   }
   return integral / (endUs - startUs)
 }
 
-function observationFromTooth(edge: EdgeSample, teeth: number): RpmSampleUs | null {
+function toothObservation(edge: EdgeSample, teeth: number): RpmSampleUs | null {
   if (edge.periodUs <= 0 || teeth <= 0) return null
   const rpm = US_PER_MINUTE / (edge.periodUs * teeth)
-  const sigmaRpm = rpm * DELTA_TIMESTAMP_SIGMA_US / edge.periodUs
-  return { tUs: edge.tUs, rpm, sigmaRpm, epoch: edge.epoch }
+  return { tUs: edge.tUs, rpm, sigmaRpm: rpm * DELTA_TIMESTAMP_SIGMA_US / edge.periodUs, epoch: edge.epoch }
 }
 
-function observationFromRevolution(edges: readonly EdgeSample[], index: number, teeth: number): RpmSampleUs | null {
+function revolutionObservation(edges: readonly EdgeSample[], index: number, teeth: number): RpmSampleUs | null {
   if (teeth <= 0 || index < teeth) return null
   const current = edges[index]
   const previous = edges[index - teeth]
-  // The physical edge counter is the source of truth. Do not bridge a missing physical edge with a
-  // plausible-looking RPM estimate; leave a gap instead.
-  const edgeDelta = (current.edgeCount - previous.edgeCount) >>> 0
-  if (edgeDelta !== teeth || current.epoch !== previous.epoch) return null
+  if (current.epoch !== previous.epoch) return null
+  if ((((current.edgeCount >>> 0) - (previous.edgeCount >>> 0)) >>> 0) !== teeth) return null
   const dtUs = current.tUs - previous.tUs
   if (dtUs <= 0) return null
   const rpm = US_PER_MINUTE / dtUs
-  const sigmaRpm = rpm * DELTA_TIMESTAMP_SIGMA_US / dtUs
-  return { tUs: 0.5 * (current.tUs + previous.tUs), rpm, sigmaRpm, epoch: current.epoch }
+  return {
+    tUs: 0.5 * (current.tUs + previous.tUs),
+    rpm,
+    sigmaRpm: rpm * DELTA_TIMESTAMP_SIGMA_US / dtUs,
+    epoch: current.epoch,
+  }
 }
 
 function externalObservation(sample: RpmSampleUs): RpmObservation {
   return { time: sample.tUs / 1000, rpm: sample.rpm, sigmaRpm: sample.sigmaRpm }
 }
 
+function emptySnapshot(): AnalysisSnapshot {
+  return {
+    primaryRpm: [], secondaryRpm: [], primaryPower: [], secondaryPower: [], ratio: [], efficiency: [], shift: [],
+    primaryObservations: [], secondaryObservations: [],
+  }
+}
+
 export class AnalysisEngine {
   private config: AnalysisConfig
+  private packetHistory: AnalysisPacket[] = []
   private edges: [EdgeSample[], EdgeSample[]] = [[], []]
   private revolutionObservations: [RpmSampleUs[], RpmSampleUs[]] = [[], []]
   private toothObservations: [RpmSampleUs[], RpmSampleUs[]] = [[], []]
-  private shiftSamples: ScalarSample[] = []
-  private torque1Samples: ScalarSample[] = []
-  private torque2Samples: ScalarSample[] = []
-  private wotSamples: BoolSample[] = []
-  private frames: AnalysisFrame[] = []
+  private torqueSamples: [ScalarSample[], ScalarSample[]] = [[], []]
+  private shiftPoints: ShiftPoint[] = []
   private rpmEpochBreakPending: [boolean, boolean] = [false, false]
-  private nextFrameEndUs: number | null = null
+  private nextGridUs: [number | null, number | null] = [null, null]
+  private pendingTorquePower: [Set<number>, Set<number>] = [new Set(), new Set()]
+
+  private primaryRpm: RpmPoint[] = []
+  private secondaryRpm: RpmPoint[] = []
+  private primaryPower: PowerPoint[] = []
+  private secondaryPower: PowerPoint[] = []
+  private ratio: RatioPoint[] = []
+  private efficiency: EfficiencyPoint[] = []
+  private maps: SeriesMaps = {
+    rpm: [new Map(), new Map()],
+    power: [new Map(), new Map()],
+    ratio: new Map(),
+    efficiency: new Map(),
+  }
 
   constructor(config: AnalysisConfig) {
-    this.config = { ...config, torqueCurve: [...config.torqueCurve] }
+    this.config = this.copyConfig(config)
   }
 
   reset() {
-    this.edges = [[], []]
-    this.revolutionObservations = [[], []]
-    this.toothObservations = [[], []]
-    this.shiftSamples = []
-    this.torque1Samples = []
-    this.torque2Samples = []
-    this.wotSamples = []
-    this.frames = []
-    this.rpmEpochBreakPending = [false, false]
-    this.nextFrameEndUs = null
+    this.packetHistory = []
+    this.resetDerived()
   }
 
   setConfig(config: AnalysisConfig) {
-    const teethChanged = config.primaryTeeth !== this.config.primaryTeeth || config.secondaryTeeth !== this.config.secondaryTeeth
-    this.config = { ...config, torqueCurve: [...config.torqueCurve] }
-    if (teethChanged) this.rebuildObservations()
-    this.rebuildFrames()
+    this.config = this.copyConfig(config)
+    const history = this.packetHistory
+    this.resetDerived()
+    for (const packet of history) this.process(packet)
   }
 
   ingest(packet: AnalysisPacket) {
     if (!Number.isFinite(packet.tUs) || packet.tUs <= 0) return
-    if (packet.channel === 0 || packet.channel === 1) this.ingestRpm(packet.channel, packet)
-    else if (packet.channel === 2) this.shiftSamples.push({ tUs: packet.tUs, value: packet.value })
-    else if (packet.channel === 3) this.torque1Samples.push({ tUs: packet.tUs, value: packet.value })
-    else if (packet.channel === 4) this.torque2Samples.push({ tUs: packet.tUs, value: packet.value })
-    else if (packet.channel === 5) this.wotSamples.push({ tUs: packet.tUs, value: packet.value !== 0 })
-    this.extendFrames()
+    this.packetHistory.push(packet)
+    this.process(packet)
   }
 
   ingestMany(packets: readonly AnalysisPacket[]) {
     for (const packet of packets) this.ingest(packet)
   }
 
-  snapshot(): AnalysisSnapshot { return this.snapshotFrom(0, 0, 0) }
-
-  counts() {
-    const observations = this.config.observationMode === 'tooth' ? this.toothObservations : this.revolutionObservations
-    return { frames: this.frames.length, primaryObservations: observations[0].length, secondaryObservations: observations[1].length }
+  snapshot(observationMode: RpmObservationMode = 'revolution'): AnalysisSnapshot {
+    return this.snapshotFrom(this.zeroCounts(), observationMode)
   }
 
-  snapshotFrom(frameIndex: number, primaryObservationIndex: number, secondaryObservationIndex: number): AnalysisSnapshot {
-    const observations = this.config.observationMode === 'tooth' ? this.toothObservations : this.revolutionObservations
+  counts(observationMode: RpmObservationMode = 'revolution'): AnalysisCounts {
+    const observations = observationMode === 'tooth' ? this.toothObservations : this.revolutionObservations
     return {
-      frames: this.frames.slice(frameIndex),
-      primaryObservations: observations[0].slice(primaryObservationIndex).map(externalObservation),
-      secondaryObservations: observations[1].slice(secondaryObservationIndex).map(externalObservation),
+      primaryRpm: this.primaryRpm.length,
+      secondaryRpm: this.secondaryRpm.length,
+      primaryPower: this.primaryPower.length,
+      secondaryPower: this.secondaryPower.length,
+      ratio: this.ratio.length,
+      efficiency: this.efficiency.length,
+      shift: this.shiftPoints.length,
+      primaryObservations: observations[0].length,
+      secondaryObservations: observations[1].length,
     }
   }
 
-  private ingestRpm(channel: 0 | 1, packet: AnalysisPacket) {
-    // value === 0 is the firmware's explicit stale/stopped report, not a physical edge. It should
-    // not enter the edge sequence used for RPM reconstruction.
-    if (packet.value <= 0) { this.rpmEpochBreakPending[channel] = true; return }
-    const list = this.edges[channel]
-    const previous = list[list.length - 1]
-    const contiguous = previous && !this.rpmEpochBreakPending[channel] && (((packet.edgeCount >>> 0) - previous.edgeCount) >>> 0) === 1
+  snapshotFrom(counts: AnalysisCounts, observationMode: RpmObservationMode = 'revolution'): AnalysisSnapshot {
+    const observations = observationMode === 'tooth' ? this.toothObservations : this.revolutionObservations
+    return {
+      primaryRpm: this.primaryRpm.slice(counts.primaryRpm),
+      secondaryRpm: this.secondaryRpm.slice(counts.secondaryRpm),
+      primaryPower: this.primaryPower.slice(counts.primaryPower),
+      secondaryPower: this.secondaryPower.slice(counts.secondaryPower),
+      ratio: this.ratio.slice(counts.ratio),
+      efficiency: this.efficiency.slice(counts.efficiency),
+      shift: this.shiftPoints.slice(counts.shift),
+      primaryObservations: observations[0].slice(counts.primaryObservations).map(externalObservation),
+      secondaryObservations: observations[1].slice(counts.secondaryObservations).map(externalObservation),
+    }
+  }
+
+  observationSnapshot(mode: RpmObservationMode): Pick<AnalysisSnapshot, 'primaryObservations' | 'secondaryObservations'> {
+    const observations = mode === 'tooth' ? this.toothObservations : this.revolutionObservations
+    return {
+      primaryObservations: observations[0].map(externalObservation),
+      secondaryObservations: observations[1].map(externalObservation),
+    }
+  }
+
+  private process(packet: AnalysisPacket) {
+    if (packet.channel === 0 || packet.channel === 1) this.ingestRpm(packet.channel, packet)
+    else if (packet.channel === 2) this.shiftPoints.push({ time: packet.tUs / 1000, value: packet.value })
+    else if (packet.channel === 3) this.ingestTorque(0, packet)
+    else if (packet.channel === 4) this.ingestTorque(1, packet)
+    // Channel 5 is intentionally preserved in the raw stream but has no analysis role at present.
+  }
+
+  private ingestRpm(channel: InternalShaft, packet: AnalysisPacket) {
+    if (packet.value <= 0) {
+      this.rpmEpochBreakPending[channel] = true
+      return
+    }
+    const edges = this.edges[channel]
+    const previous = edges[edges.length - 1]
+    const contiguous = previous && !this.rpmEpochBreakPending[channel]
+      && ((((packet.edgeCount >>> 0) - (previous.edgeCount >>> 0)) >>> 0) === 1)
+      && packet.tUs > previous.tUs
     const epoch = previous ? (contiguous ? previous.epoch : previous.epoch + 1) : 0
     const edge: EdgeSample = { tUs: packet.tUs, edgeCount: packet.edgeCount >>> 0, periodUs: packet.value, epoch }
     this.rpmEpochBreakPending[channel] = false
-    list.push(edge)
+    edges.push(edge)
+
     const teeth = channel === 0 ? this.config.primaryTeeth : this.config.secondaryTeeth
-    const tooth = observationFromTooth(edge, teeth)
+    const tooth = toothObservation(edge, teeth)
     if (tooth) this.toothObservations[channel].push(tooth)
-    const revolution = observationFromRevolution(list, list.length - 1, teeth)
-    if (revolution) this.revolutionObservations[channel].push(revolution)
-  }
-
-  private rebuildObservations() {
-    this.revolutionObservations = [[], []]
-    this.toothObservations = [[], []]
-    for (const channel of [0, 1] as const) {
-      const teeth = channel === 0 ? this.config.primaryTeeth : this.config.secondaryTeeth
-      const list = this.edges[channel]
-      for (let index = 0; index < list.length; index += 1) {
-        const tooth = observationFromTooth(list[index], teeth)
-        if (tooth) this.toothObservations[channel].push(tooth)
-        const revolution = observationFromRevolution(list, index, teeth)
-        if (revolution) this.revolutionObservations[channel].push(revolution)
-      }
+    const revolution = revolutionObservation(edges, edges.length - 1, teeth)
+    if (revolution) {
+      this.revolutionObservations[channel].push(revolution)
+      this.advanceShaft(channel)
     }
   }
 
-  private rebuildFrames() {
-    this.frames = []
-    this.nextFrameEndUs = null
-    this.extendFrames()
+  private ingestTorque(channel: InternalShaft, packet: AnalysisPacket) {
+    this.torqueSamples[channel].push({ tUs: packet.tUs, value: packet.value })
+    if (this.config.powerMode !== 'torque') return
+    this.retryPendingTorquePower(channel)
   }
 
-  private extendFrames() {
-    const primary = this.revolutionObservations[0]
-    const secondary = this.revolutionObservations[1]
-    // Each shaft is independently useful. Do not hold primary RPM hostage to a disconnected
-    // secondary (or vice versa); only coupled quantities such as ratio/efficiency require both.
-    const available = [primary, secondary].filter((samples) => samples.length >= 2)
-    if (!available.length) return
-
-    const windowUs = this.config.windowMs * 1000
+  private advanceShaft(channel: InternalShaft) {
+    const observations = this.revolutionObservations[channel]
+    if (!observations.length) return
+    const windowUs = this.windowUs()
     if (!(windowUs > 0)) return
-    const firstObservationUs = Math.min(...available.map((samples) => samples[0].tUs))
-    const lastUs = Math.max(...available.map((samples) => samples[samples.length - 1].tUs))
-    const firstUs = firstObservationUs + windowUs
-    if (this.nextFrameEndUs === null) this.nextFrameEndUs = Math.ceil(firstUs / windowUs) * windowUs
 
-    while (this.nextFrameEndUs <= lastUs) {
-      const frame = this.makeFrame(this.nextFrameEndUs)
-      if (frame) this.frames.push(frame)
-      this.nextFrameEndUs += windowUs
+    if (this.nextGridUs[channel] === null) {
+      this.nextGridUs[channel] = Math.ceil(observations[0].tUs / windowUs) * windowUs
+    }
+    const latestUs = observations[observations.length - 1].tUs
+    while (this.nextGridUs[channel] !== null && this.nextGridUs[channel]! <= latestUs) {
+      const endUs: number = this.nextGridUs[channel]!
+      const rpm = interpolateRpm(observations, endUs)
+      if (rpm) this.storeRpm(channel, endUs, rpm)
+      this.tryFinalizePower(channel, endUs)
+      this.nextGridUs[channel] = endUs + windowUs
     }
   }
 
-  private makeFrame(endUs: number): AnalysisFrame | null {
-    const windowUs = this.config.windowMs * 1000
-    const startUs = endUs - windowUs
-    const primary = this.revolutionObservations[0]
-    const secondary = this.revolutionObservations[1]
-    const rpm1 = timeAverageRpm(primary, startUs, endUs)
-    const rpm2 = timeAverageRpm(secondary, startUs, endUs)
-    if (!rpm1 && !rpm2) return null
+  private storeRpm(channel: InternalShaft, endUs: number, sample: RpmSampleUs) {
+    if (this.maps.rpm[channel].has(endUs)) return
+    const point: RpmPoint = { time: endUs / 1000, rpm: sample.rpm, sigmaRpm: sample.sigmaRpm }
+    this.maps.rpm[channel].set(endUs, point)
+    ;(channel === 0 ? this.primaryRpm : this.secondaryRpm).push(point)
+    this.tryRatio(endUs)
+  }
 
-    const secondaryStart = rpm2 ? interpolateRpm(secondary, startUs) : null
-    const secondaryEnd = rpm2 ? interpolateRpm(secondary, endUs) : null
-    const fullThrottle = entireIntervalTrue(this.wotSamples, startUs, endUs)
-
-    let power1 = Number.NaN
-    let power2 = Number.NaN
+  private tryFinalizePower(channel: InternalShaft, endUs: number) {
+    if (this.maps.power[channel].has(endUs)) return
+    const startUs = endUs - this.windowUs()
+    const rpmSamples = this.revolutionObservations[channel]
+    let powerKw: number | null = null
 
     if (this.config.powerMode === 'inertia') {
-      if (rpm1) power1 = timeAverageFunction(primary, startUs, endUs, (rpm) => enginePowerKwFromRpm(rpm, this.config.torqueCurve)) ?? Number.NaN
-      if (secondaryStart && secondaryEnd) {
-        const omegaStart = secondaryStart.rpm * RPM_TO_RAD_S
-        const omegaEnd = secondaryEnd.rpm * RPM_TO_RAD_S
-        power2 = this.config.secondaryInertiaKgM2 * (omegaEnd * omegaEnd - omegaStart * omegaStart) / (2 * (windowUs / 1_000_000)) / 1000
+      if (channel === 0) {
+        powerKw = timeAverageFunction(rpmSamples, startUs, endUs, (rpm) => enginePowerKwFromRpm(rpm, this.config.torqueCurve))
+      } else {
+        const start = interpolateRpm(rpmSamples, startUs)
+        const end = interpolateRpm(rpmSamples, endUs)
+        if (start && end && start.epoch === end.epoch) {
+          const dtSeconds = (endUs - startUs) / 1_000_000
+          const w0 = start.rpm * RPM_TO_RAD_S
+          const w1 = end.rpm * RPM_TO_RAD_S
+          powerKw = this.config.secondaryInertiaKgM2 * (w1 * w1 - w0 * w0) / (2 * dtSeconds) / 1000
+        }
       }
     } else {
-      if (rpm1) power1 = averageMeasuredPowerKw(primary, this.torque1Samples, startUs, endUs, this.config.torqueScale, this.config.torqueOffset) ?? Number.NaN
-      if (rpm2) power2 = averageMeasuredPowerKw(secondary, this.torque2Samples, startUs, endUs, this.config.torqueScale, this.config.torqueOffset) ?? Number.NaN
+      const torque = this.torqueSamples[channel]
+      if (!torque.length || torque[torque.length - 1].tUs < endUs) {
+        this.pendingTorquePower[channel].add(endUs)
+        return
+      }
+      powerKw = averageMeasuredPowerKw(rpmSamples, torque, startUs, endUs, this.config.torqueScale, this.config.torqueOffset)
     }
 
-    const rpm1Value = rpm1?.rpm ?? Number.NaN
-    const rpm2Value = rpm2?.rpm ?? Number.NaN
-    const efficiencyValid = this.config.powerMode === 'torque' || fullThrottle
-    const efficiency = efficiencyValid && Number.isFinite(power1) && Number.isFinite(power2) && power1 > 0 && power2 > 0
-      ? 100 * power2 / power1
-      : Number.NaN
-    const shiftRatio = Number.isFinite(rpm1Value) && Number.isFinite(rpm2Value) && rpm2Value > 0
-      ? rpm1Value / rpm2Value
-      : Number.NaN
+    if (powerKw === null || !Number.isFinite(powerKw)) return
+    const point: PowerPoint = { time: endUs / 1000, powerKw }
+    this.maps.power[channel].set(endUs, point)
+    ;(channel === 0 ? this.primaryPower : this.secondaryPower).push(point)
+    this.pendingTorquePower[channel].delete(endUs)
+    this.tryEfficiency(endUs)
+  }
 
-    return {
-      time: endUs / 1000,
-      rpm1: rpm1Value,
-      rpm2: rpm2Value,
-      rpm1Sigma: rpm1?.sigmaRpm ?? Number.NaN,
-      rpm2Sigma: rpm2?.sigmaRpm ?? Number.NaN,
-      shift: latestHeld(this.shiftSamples, endUs),
-      torq1: latestHeld(this.torque1Samples, endUs),
-      torq2: latestHeld(this.torque2Samples, endUs),
-      power1,
-      power2,
-      efficiency,
-      shiftRatio,
-      fullThrottle,
+  private retryPendingTorquePower(channel: InternalShaft) {
+    const torque = this.torqueSamples[channel]
+    const rpm = this.revolutionObservations[channel]
+    if (!torque.length || !rpm.length) return
+    const maxReady = Math.min(torque[torque.length - 1].tUs, rpm[rpm.length - 1].tUs)
+    for (const endUs of [...this.pendingTorquePower[channel]]) {
+      if (endUs > maxReady) continue
+      this.tryFinalizePower(channel, endUs)
+      // Once both input streams have progressed past an interval it can never become newly valid.
+      if (!this.maps.power[channel].has(endUs)) this.pendingTorquePower[channel].delete(endUs)
     }
   }
+
+  private tryRatio(endUs: number) {
+    if (this.maps.ratio.has(endUs)) return
+    const primary = this.maps.rpm[0].get(endUs)
+    const secondary = this.maps.rpm[1].get(endUs)
+    if (!primary || !secondary || secondary.rpm === 0) return
+    const point: RatioPoint = { time: endUs / 1000, rpm1: primary.rpm, rpm2: secondary.rpm, ratio: primary.rpm / secondary.rpm }
+    this.maps.ratio.set(endUs, point)
+    this.ratio.push(point)
+    // Efficiency may already exist in an unusual torque arrival ordering; enrich it only by creating
+    // the point when both power inputs exist, never by rewriting older RPM/power series.
+    this.tryEfficiency(endUs)
+  }
+
+  private tryEfficiency(endUs: number) {
+    if (this.maps.efficiency.has(endUs)) return
+    const primary = this.maps.power[0].get(endUs)
+    const secondary = this.maps.power[1].get(endUs)
+    if (!primary || !secondary) return
+    if (!(primary.powerKw > 0) || !(secondary.powerKw >= 0)) return
+
+    // Pair interval efficiency with the average speed ratio over the exact same physical interval.
+    // ratio-vs-time remains a synchronized point ratio at endUs; this interval ratio is specifically
+    // for the efficiency-vs-ratio relationship.
+    const startUs = endUs - this.windowUs()
+    const ratio = timeAverageRatio(this.revolutionObservations[0], this.revolutionObservations[1], startUs, endUs)
+    if (ratio === null) return
+
+    const efficiencyPct = 100 * secondary.powerKw / primary.powerKw
+    if (!Number.isFinite(efficiencyPct)) return
+    const point: EfficiencyPoint = {
+      time: endUs / 1000,
+      power1Kw: primary.powerKw,
+      power2Kw: secondary.powerKw,
+      efficiencyPct,
+      ratio,
+    }
+    this.maps.efficiency.set(endUs, point)
+    this.efficiency.push(point)
+  }
+
+  private windowUs() { return this.config.windowMs * 1000 }
+
+  private copyConfig(config: AnalysisConfig): AnalysisConfig {
+    return { ...config, torqueCurve: [...config.torqueCurve] }
+  }
+
+  private zeroCounts(): AnalysisCounts {
+    return {
+      primaryRpm: 0, secondaryRpm: 0, primaryPower: 0, secondaryPower: 0, ratio: 0, efficiency: 0,
+      shift: 0, primaryObservations: 0, secondaryObservations: 0,
+    }
+  }
+
+  private resetDerived() {
+    this.edges = [[], []]
+    this.revolutionObservations = [[], []]
+    this.toothObservations = [[], []]
+    this.torqueSamples = [[], []]
+    this.shiftPoints = []
+    this.rpmEpochBreakPending = [false, false]
+    this.nextGridUs = [null, null]
+    this.pendingTorquePower = [new Set(), new Set()]
+    this.primaryRpm = []
+    this.secondaryRpm = []
+    this.primaryPower = []
+    this.secondaryPower = []
+    this.ratio = []
+    this.efficiency = []
+    this.maps = { rpm: [new Map(), new Map()], power: [new Map(), new Map()], ratio: new Map(), efficiency: new Map() }
+  }
 }
+
+export { emptySnapshot }

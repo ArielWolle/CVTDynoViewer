@@ -29,7 +29,6 @@ export function interpolateEngineTorqueFtLb(rpm: number, curve: ReadonlyArray<En
     if (curve[mid].rpm <= rpm) low = mid
     else high = mid
   }
-
   const left = curve[low]
   const right = curve[high]
   const span = right.rpm - left.rpm
@@ -40,6 +39,5 @@ export function interpolateEngineTorqueFtLb(rpm: number, curve: ReadonlyArray<En
 
 export function enginePowerKwFromRpm(rpm: number, curve: ReadonlyArray<EngineTorquePoint>): number {
   const torqueNm = interpolateEngineTorqueFtLb(rpm, curve) * FTLB_TO_NM
-  const omega = rpm * RAD_PER_SEC_PER_RPM
-  return Math.max(0, torqueNm * omega / 1000)
+  return Math.max(0, torqueNm * rpm * RAD_PER_SEC_PER_RPM / 1000)
 }

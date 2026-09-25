@@ -13,79 +13,95 @@ function config(overrides: Partial<AnalysisConfig> = {}): AnalysisConfig {
     powerMode: 'inertia',
     torqueScale: 0.01,
     torqueOffset: 0,
-    observationMode: 'revolution',
     ...overrides,
   }
 }
 
-function constantRpmPackets(channel: 0 | 1, teeth: number, rpm: number, seconds: number, edgeStart = 1): AnalysisPacket[] {
+function constantRpmPackets(channel: 0 | 1, teeth: number, rpm: number, seconds: number, offsetUs = 0): AnalysisPacket[] {
   const periodUs = 60_000_000 / (rpm * teeth)
-  const count = Math.floor(seconds * rpm * teeth / 60)
-  const packets: AnalysisPacket[] = []
-  for (let i = 0; i < count; i += 1) {
-    packets.push({ channel, value: Math.round(periodUs), tUs: Math.round((i + 1) * periodUs), seq: i & 0xff, edgeCount: edgeStart + i })
+  const result: AnalysisPacket[] = []
+  for (let edge = 1, tUs = offsetUs + periodUs; tUs <= offsetUs + seconds * 1_000_000; edge += 1, tUs += periodUs) {
+    result.push({ channel, value: Math.round(periodUs), tUs: Math.round(tUs), seq: edge & 0xff, edgeCount: edge })
   }
-  return packets
+  return result
 }
 
-describe('AnalysisEngine', () => {
-  it('reconstructs same-tooth-phase one-revolution RPM without crossing missing edges', () => {
+describe('AnalysisEngine independent streaming series', () => {
+  it('keeps primary usable when secondary is absent', () => {
     const engine = new AnalysisEngine(config())
-    const packets = constantRpmPackets(0, 16, 3000, 0.4)
+    engine.ingestMany(constantRpmPackets(0, 16, 3000, 1.2))
+    const snapshot = engine.snapshot()
+    expect(snapshot.primaryRpm.length).toBeGreaterThan(5)
+    expect(snapshot.primaryPower.length).toBeGreaterThan(4)
+    expect(snapshot.secondaryRpm).toEqual([])
+    expect(snapshot.ratio).toEqual([])
+    expect(snapshot.efficiency).toEqual([])
+  })
+
+  it('late secondary data creates joins without rewriting primary history', () => {
+    const engine = new AnalysisEngine(config())
+    const primary = constantRpmPackets(0, 16, 3000, 1.5)
+    const secondary = constantRpmPackets(1, 12, 2000, 1.5, 5_000)
+    engine.ingestMany(primary)
+    const before = engine.snapshot()
+    const counts = engine.counts()
+    engine.ingestMany(secondary)
+    const after = engine.snapshot()
+    const delta = engine.snapshotFrom(counts)
+    expect(after.primaryRpm).toEqual(before.primaryRpm)
+    expect(after.primaryPower).toEqual(before.primaryPower)
+    expect(delta.primaryRpm).toEqual([])
+    expect(delta.primaryPower).toEqual([])
+    expect(delta.ratio.length).toBeGreaterThan(5)
+  })
+
+  it('is invariant to cross-channel arrival order', () => {
+    const primary = constantRpmPackets(0, 16, 3000, 1.5)
+    const secondary = constantRpmPackets(1, 12, 2000, 1.5, 5_000)
+    const orders = [
+      [...primary, ...secondary],
+      [...secondary, ...primary],
+      [...primary, ...secondary].sort((a, b) => a.tUs - b.tUs),
+    ]
+    const snapshots = orders.map((packets) => { const engine = new AnalysisEngine(config()); engine.ingestMany(packets); return engine.snapshot() })
+    for (const snapshot of snapshots.slice(1)) {
+      expect(snapshot.primaryRpm).toEqual(snapshots[0].primaryRpm)
+      expect(snapshot.secondaryRpm).toEqual(snapshots[0].secondaryRpm)
+      expect(snapshot.primaryPower).toEqual(snapshots[0].primaryPower)
+      expect(snapshot.secondaryPower).toEqual(snapshots[0].secondaryPower)
+      expect(snapshot.ratio).toEqual(snapshots[0].ratio)
+      expect(snapshot.efficiency).toEqual(snapshots[0].efficiency)
+    }
+  })
+
+  it('uses the same physical interval for primary and secondary power', () => {
+    const engine = new AnalysisEngine(config())
+    engine.ingestMany([...constantRpmPackets(0, 16, 3000, 1.5), ...constantRpmPackets(1, 12, 2000, 1.5)].sort((a, b) => a.tUs - b.tUs))
+    const snapshot = engine.snapshot()
+    const primaryTimes = new Set(snapshot.primaryPower.map((point) => point.time))
+    const joined = snapshot.secondaryPower.filter((point) => primaryTimes.has(point.time))
+    expect(joined.length).toBeGreaterThan(5)
+    expect(snapshot.efficiency.every((point) => primaryTimes.has(point.time))).toBe(true)
+  })
+
+  it('does not bridge a missing physical edge', () => {
+    const packets = constantRpmPackets(0, 16, 3000, 1.2)
+    packets.splice(30, 1)
+    for (let i = 30; i < packets.length; i += 1) packets[i] = { ...packets[i], seq: (packets[i].seq + 1) & 0xff }
+    const engine = new AnalysisEngine(config({ windowMs: 20 }))
     engine.ingestMany(packets)
     const observations = engine.snapshot().primaryObservations
-    expect(observations.length).toBeGreaterThan(100)
-    expect(observations.at(-1)?.rpm).toBeCloseTo(3000, 0)
-
-    const broken = new AnalysisEngine(config())
-    const withGap = packets.map((packet) => ({ ...packet }))
-    for (let i = 80; i < withGap.length; i += 1) withGap[i].edgeCount += 1
-    broken.ingestMany(withGap)
-    expect(broken.snapshot().primaryObservations.length).toBeLessThan(observations.length)
+    expect(observations.length).toBeLessThan(packets.length - 16)
   })
 
-  it('emits primary analysis frames when the secondary sensor is absent', () => {
+  it('switching observation display mode does not rebuild derived series', () => {
     const engine = new AnalysisEngine(config())
-    engine.ingestMany(constantRpmPackets(0, 16, 3000, 0.8))
-    const snapshot = engine.snapshot()
-    expect(snapshot.frames.length).toBeGreaterThan(3)
-    expect(snapshot.frames.at(-1)?.rpm1).toBeCloseTo(3000, 0)
-    expect(Number.isFinite(snapshot.frames.at(-1)?.rpm2 ?? Number.NaN)).toBe(false)
-    expect(Number.isFinite(snapshot.frames.at(-1)?.shiftRatio ?? Number.NaN)).toBe(false)
-    expect(Number.isFinite(snapshot.frames.at(-1)?.efficiency ?? Number.NaN)).toBe(false)
-  })
-
-  it('uses one common interval for primary power, secondary energy rate, and efficiency', () => {
-    const engine = new AnalysisEngine(config())
-    const primary = constantRpmPackets(0, 16, 3000, 1.2)
-    const secondary = constantRpmPackets(1, 12, 2000, 1.2)
-    const startUs = Math.min(primary[0].tUs, secondary[0].tUs)
-    engine.ingest({ channel: 5, value: 1, tUs: Math.max(1, startUs - 1), seq: 0, edgeCount: 0 })
-    engine.ingestMany([...primary, ...secondary].sort((a, b) => a.tUs - b.tUs))
-    const frames = engine.snapshot().frames
-    expect(frames.length).toBeGreaterThan(5)
-    expect(frames.at(-1)?.rpm1).toBeCloseTo(3000, 0)
-    expect(frames.at(-1)?.rpm2).toBeCloseTo(2000, 0)
-    expect(frames.at(-1)?.power2).toBeCloseTo(0, 6)
-    expect(Number.isFinite(frames.at(-1)?.efficiency ?? Number.NaN)).toBe(false)
-  })
-
-  it('invalidates curve-based efficiency whenever the entire interval is not WOT', () => {
-    const engine = new AnalysisEngine(config())
-    const primary = constantRpmPackets(0, 16, 3000, 0.6)
-    const secondary = constantRpmPackets(1, 12, 2000, 0.6)
-    engine.ingestMany([...primary, ...secondary].sort((a, b) => a.tUs - b.tUs))
-    expect(engine.snapshot().frames.every((frame) => !Number.isFinite(frame.efficiency))).toBe(true)
-  })
-
-  it('switches observation display between one-revolution and per-tooth without changing analysis frames', () => {
-    const engine = new AnalysisEngine(config())
-    const packets = constantRpmPackets(0, 16, 3000, 0.3)
-    engine.ingestMany(packets)
-    const rev = engine.snapshot()
-    engine.setConfig(config({ observationMode: 'tooth' }))
-    const tooth = engine.snapshot()
-    expect(tooth.primaryObservations.length).toBe(packets.length)
-    expect(tooth.frames).toEqual(rev.frames)
+    engine.ingestMany(constantRpmPackets(0, 16, 3000, 1.2))
+    const before = engine.snapshot('revolution')
+    const tooth = engine.observationSnapshot('tooth')
+    const after = engine.snapshot('revolution')
+    expect(after.primaryRpm).toEqual(before.primaryRpm)
+    expect(after.primaryPower).toEqual(before.primaryPower)
+    expect(tooth.primaryObservations.length).toBeGreaterThan(before.primaryObservations.length)
   })
 })

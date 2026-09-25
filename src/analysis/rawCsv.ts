@@ -49,5 +49,7 @@ export function parseRawLogCsv(text: string): AnalysisPacket[] {
     if (!Number.isFinite(tUs) || !Number.isInteger(channel) || channel < 0 || channel > 5 || !Number.isFinite(seq) || !Number.isFinite(value) || !Number.isFinite(edgeCount)) continue
     packets.push({ channel: channel as AnalysisChannelId, value, tUs, seq, edgeCount })
   }
-  return packets.sort((a, b) => a.tUs - b.tUs)
+  // Preserve the exact file/host arrival order. The analysis engine is deliberately channel-local
+  // and must not require a globally timestamp-sorted stream.
+  return packets
 }

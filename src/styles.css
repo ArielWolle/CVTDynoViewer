@@ -60,3 +60,7 @@ button { cursor: pointer; }
 
 .analysis-select { display: flex; align-items: center; gap: 6px; color: var(--muted); font: 500 9px 'DM Mono', monospace; white-space: nowrap; }
 .analysis-select select { border: 1px solid var(--line); border-radius: 2px; padding: 5px 7px; background: var(--paper); color: var(--ink); font: 10px 'DM Mono', monospace; }
+
+.replay-toggle { display: flex; align-items: center; gap: 5px; color: #67655e; font: 500 10px 'DM Mono', monospace; white-space: nowrap; }
+.replay-toggle input { margin: 0; }
+.replay-progress { min-width: 150px; color: var(--muted); }
