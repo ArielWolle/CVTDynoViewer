@@ -147,6 +147,53 @@ function formatTimeSeconds(valueSeconds: number, visibleSpanMs: number): string 
   return valueSeconds.toFixed(timeDecimals(visibleSpanMs))
 }
 
+function niceStep(span: number, targetIntervals = 5): number {
+  if (!Number.isFinite(span) || span <= 0) return 1
+  const raw = span / Math.max(1, targetIntervals)
+  const magnitude = 10 ** Math.floor(Math.log10(raw))
+  const normalized = raw / magnitude
+  const multiplier = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 2.5 ? 2.5 : normalized <= 5 ? 5 : 10
+  return multiplier * magnitude
+}
+
+function niceDomain(min: number, max: number, targetIntervals = 5): [number, number] {
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return [0, 1]
+  const step = niceStep(max - min, targetIntervals)
+  const lower = Math.floor(min / step) * step
+  const upper = Math.ceil(max / step) * step
+  return [Math.abs(lower) < step * 1e-9 ? 0 : lower, Math.abs(upper) < step * 1e-9 ? 0 : upper]
+}
+
+function ticksForDomain(domain: [number, number], targetIntervals = 5): number[] {
+  const [min, max] = domain
+  const step = niceStep(max - min, targetIntervals)
+  const first = Math.ceil((min - step * 1e-9) / step) * step
+  const ticks: number[] = []
+  for (let value = first, guard = 0; value <= max + step * 1e-9 && guard < 32; value += step, guard += 1) {
+    ticks.push(Math.abs(value) < step * 1e-9 ? 0 : Number(value.toPrecision(12)))
+  }
+  return ticks
+}
+
+function axisDecimals(step: number): number {
+  if (!Number.isFinite(step) || step <= 0) return 0
+  if (step >= 1) return Math.abs(step - Math.round(step)) < 1e-9 ? 0 : 1
+  if (step >= 0.1) return 1
+  if (step >= 0.01) return 2
+  return 3
+}
+
+function formatAxisTick(value: number, step: number): string {
+  if (!Number.isFinite(value)) return '—'
+  return value.toFixed(axisDecimals(step))
+}
+
+function niceRpmCeiling(value: number): number {
+  const padded = Math.max(100, value * 1.05)
+  const step = niceStep(padded, 8)
+  return Math.ceil(padded / step) * step
+}
+
 export function AnalysisWorkspace({
   series, chartPlaying, frozenDomainEnd, onToggleChartPlaying, analysisWindowMs, onAnalysisWindowChange,
   observationMode, onObservationModeChange, charts, setCharts, lowRatio, highRatio, onLowRatioChange,
@@ -222,7 +269,7 @@ export function AnalysisWorkspace({
   const scatterMax = useMemo(() => {
     let max = 10
     for (const point of ratioDots) max = Math.max(max, point.rpm1, point.rpm2)
-    return max * 1.05
+    return niceRpmCeiling(max)
   }, [ratioDots])
   const efficiencyMax = useMemo(() => {
     let max = 0
@@ -230,14 +277,18 @@ export function AnalysisWorkspace({
     return Math.max(110, Math.ceil((max + 1) / 10) * 10)
   }, [efficiencyDots])
   const powerDomain = useMemo<[number, number]>(() => {
-    let min = 0
-    let max = 1
+    let min = Infinity
+    let max = -Infinity
     for (const point of power) {
       if (Number.isFinite(point.power1)) { min = Math.min(min, point.power1 as number); max = Math.max(max, point.power1 as number) }
       if (Number.isFinite(point.power2)) { min = Math.min(min, point.power2 as number); max = Math.max(max, point.power2 as number) }
     }
-    const pad = Math.max(0.25, 0.08 * (max - min || 1))
-    return [min - pad, max + pad]
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1]
+    const span = Math.max(0.5, max - min)
+    const pad = Math.max(0.25, 0.08 * span)
+    const paddedMin = min < 0 ? min - pad : 0
+    const paddedMax = max + pad
+    return niceDomain(paddedMin, paddedMax, 5)
   }, [power])
 
   function reorder(target: ChartId) {
@@ -369,7 +420,12 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
       hits.push({ time: point.time, xPx, yPx, readout })
     }
     relationshipHitsRef.current = hits
-  }, [config.id, relationship, view.ratioDots, view.efficiencyDots])
+  // The hit cache stores rendered SVG-circle centers in pixels. Any axis-domain change moves
+  // those circles even when the data arrays and outer chart size are unchanged (for example the
+  // rounded RPM ceiling added by the axis/readability patch). Include the relationship-axis
+  // domains here so the post-render measurement effect rebuilds the cache whenever the mapping
+  // from data coordinates to screen pixels changes.
+  }, [config.id, relationship, view.ratioDots, view.efficiencyDots, scatterMax, efficiencyMax])
 
   function measurePlotRect(chartBody: HTMLDivElement) {
     plotRectRef.current = chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
@@ -536,21 +592,34 @@ const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationship
 }) {
   const xTick = useCallback((value: number) => `${formatTimeSeconds(value, visibleSpanMs)}s`, [visibleSpanMs])
   const chartData = (config.id === 'scatter' || config.id === 'shiftEfficiency') ? relationshipData : timeData
+  const powerTicks = useMemo(() => ticksForDomain(powerDomain, 5), [powerDomain])
+  const powerStep = powerTicks.length >= 2 ? powerTicks[1] - powerTicks[0] : niceStep(powerDomain[1] - powerDomain[0], 5)
+  const hpTicks = useMemo(() => powerTicks.map((value) => value * KW_TO_HP), [powerTicks])
+  const hpStep = powerStep * KW_TO_HP
+  const scatterTicks = useMemo(() => {
+    const step = niceStep(scatterMax, 8)
+    const ticks: number[] = []
+    for (let value = 0, guard = 0; value <= scatterMax + step * 1e-9 && guard < 24; value += step, guard += 1) ticks.push(Math.round(value))
+    if (ticks[ticks.length - 1] !== Math.round(scatterMax)) ticks.push(Math.round(scatterMax))
+    return ticks
+  }, [scatterMax])
+  const ratioTicks = useMemo(() => [0, 1, 2, 3, 4, 5, 6], [])
+  const ratioRelationshipTicks = useMemo(() => [0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6], [])
   const lowRatioLine = useMemo(() => [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * lowRatio }], [scatterMax, lowRatio])
   const highRatioLine = useMemo(() => [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * highRatio }], [scatterMax, highRatio])
   const powerPadDomain: [number, number] = powerDomain
-  const timeAxis = (unit: string, domain?: [number, number]) => <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={xDomain} allowDataOverflow tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={xTick} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={domain} allowDataOverflow={domain !== undefined} label={{ value: unit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
-  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={xDomain} allowDataOverflow tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={xTick} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={42} domain={powerPadDomain} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={42} domain={[powerPadDomain[0] * KW_TO_HP, powerPadDomain[1] * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /></>
+  const timeAxis = (unit: string, domain?: [number, number], ticks?: number[]) => <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={xDomain} allowDataOverflow tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={xTick} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={domain} ticks={ticks} allowDataOverflow={domain !== undefined} label={{ value: unit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
+  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={xDomain} allowDataOverflow tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={xTick} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => formatAxisTick(value, powerStep)} ticks={powerTicks} width={46} domain={powerPadDomain} allowDataOverflow label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => formatAxisTick(value, hpStep)} ticks={hpTicks} width={46} domain={[powerPadDomain[0] * KW_TO_HP, powerPadDomain[1] * KW_TO_HP]} allowDataOverflow label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /></>
 
   return <ResponsiveContainer width="100%" height="100%"><LineChart data={chartData as never[]} margin={{ top: 8, right: config.id === 'power' ? 4 : 14, left: 4, bottom: 14 }}>
-    {config.id === 'power' ? powerAxis : config.id === 'scatter' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="rpm2" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : config.id === 'shiftEfficiency' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="ratio" domain={[0.5, 6]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Speed ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="efficiencyPct" domain={[0, efficiencyMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : config.id === 'rpm1' || config.id === 'rpm2' ? timeAxis('RPM') : config.id === 'shift' ? timeAxis('%') : config.id === 'efficiency' ? timeAxis('%', [0, efficiencyMax]) : timeAxis('Ratio', [0, 6])}
+    {config.id === 'power' ? powerAxis : config.id === 'scatter' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="rpm2" domain={[0, scatterMax]} ticks={scatterTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Math.round(value).toString()} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" domain={[0, scatterMax]} ticks={scatterTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Math.round(value).toString()} width={50} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : config.id === 'shiftEfficiency' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="ratio" domain={[0.5, 6]} ticks={ratioRelationshipTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)} label={{ value: 'Speed ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="efficiencyPct" domain={[0, efficiencyMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : config.id === 'rpm1' || config.id === 'rpm2' ? timeAxis('RPM') : config.id === 'shift' ? timeAxis('%') : config.id === 'efficiency' ? timeAxis('%', [0, efficiencyMax]) : timeAxis('Ratio', [0, 6], ratioTicks)}
     {config.id === 'scatter' && <><Line data={lowRatioLine} type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" {...lineProps} /><Line data={highRatioLine} type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" {...lineProps} /><Line type="linear" dataKey="rpm1" stroke="transparent" {...lineProps} dot={{ r: 2.2, fill: config.color, stroke: 'none' }} /></>}
-    {config.id === 'shiftEfficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /><Line type="linear" dataKey="efficiencyPct" stroke="transparent" {...lineProps} dot={{ r: 2.5, fill: config.color, fillOpacity: .62, stroke: 'none' }} /></>}
+    {config.id === 'shiftEfficiency' && <><ReferenceLine x={1} stroke="#8b8982" strokeDasharray="3 4" strokeWidth={1} /><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /><Line type="linear" dataKey="efficiencyPct" stroke="transparent" {...lineProps} dot={{ r: 2.5, fill: config.color, fillOpacity: .62, stroke: 'none' }} /></>}
     {config.id === 'rpm1' && <><Line data={primaryObs} type="linear" dataKey="rpm" stroke="transparent" {...lineProps} dot={{ r: 1.5, fill: config.color, fillOpacity: .24, stroke: 'none' }} /><Line type="linear" dataKey="rpm" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
     {config.id === 'rpm2' && <><Line data={secondaryObs} type="linear" dataKey="rpm" stroke="transparent" {...lineProps} dot={{ r: 1.5, fill: config.color, fillOpacity: .24, stroke: 'none' }} /><Line type="linear" dataKey="rpm" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
     {config.id === 'shift' && <Line type="linear" dataKey="value" stroke={config.color} strokeWidth={2} {...lineProps} />}
     {config.id === 'power' && <><Line type="linear" dataKey="power1" yAxisId="kw" stroke="#f05d3b" strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: '#f05d3b' }} /><Line type="linear" dataKey="power2" yAxisId="kw" stroke="#3c8f88" strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: '#3c8f88' }} /></>}
     {config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /><Line type="linear" dataKey="efficiencyPct" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
-    {config.id === 'shiftRatio' && <Line type="linear" dataKey="ratio" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} />}
+    {config.id === 'shiftRatio' && <><ReferenceLine y={1} stroke="#8b8982" strokeDasharray="3 4" strokeWidth={1} /><Line type="linear" dataKey="ratio" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
   </LineChart></ResponsiveContainer>
 })
