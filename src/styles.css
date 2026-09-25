@@ -75,3 +75,23 @@ button { cursor: pointer; }
 .chart-canvas-layer { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
 .chart-crosshair-line { top: 0; bottom: auto; height: 0; z-index: 2; }
 .chart-crosshair-line-h { left: 0; right: auto; width: 0; z-index: 2; }
+
+/* consolidated non-modal warnings */
+.warning-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 14px 0 0;
+  padding: 13px 16px;
+  color: #6f4d00;
+  background: #fff3d6;
+  border: 1px solid #ddb85b;
+  border-left: 4px solid #c98b13;
+  border-radius: 2px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.warning-banner > svg { flex: 0 0 auto; margin-top: 1px; color: #a97000; }
+.warning-banner p { margin: 0; }
+.warning-banner p + p { margin-top: 5px; }
+

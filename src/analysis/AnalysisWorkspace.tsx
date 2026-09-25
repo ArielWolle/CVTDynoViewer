@@ -167,7 +167,7 @@ function AnalysisPointCount({ store }: { store: AnalysisStore }) {
 function AnalysisWorkspaceComponent({
   store, chartPlaying, frozenDomainEnd, onToggleChartPlaying, analysisWindowMs, onAnalysisWindowChange,
   observationMode, onObservationModeChange, charts, setCharts, lowRatio, highRatio, onLowRatioChange,
-  onHighRatioChange, droppedPackets, lostEdges, sourceLabel, requestObservations,
+  onHighRatioChange, sourceLabel, requestObservations, initialFullRange = false,
 }: {
   store: AnalysisStore
   chartPlaying: boolean
@@ -183,12 +183,13 @@ function AnalysisWorkspaceComponent({
   highRatio: number
   onLowRatioChange: (value: number) => void
   onHighRatioChange: (value: number) => void
-  droppedPackets: number
-  lostEdges: [number, number]
   sourceLabel: string
   requestObservations: (mode: RpmObservationMode, startMs: number, endMs: number, maxPoints: number) => Promise<RpmObservationView>
+  initialFullRange?: boolean
 }) {
-  const [manualRange, setManualRange] = useState<{ start: number; end: number } | null>(null)
+  const [manualRange, setManualRange] = useState<{ start: number; end: number } | null>(
+    () => initialFullRange ? { start: 0, end: 1 } : null,
+  )
   // Live charts subscribe to every derived-data revision. Frozen charts subscribe only to
   // replace/reset generations, so appends after the frozen end do not wake the chart tree at all.
   const workspaceSnapshot = chartPlaying ? store.getStatusSnapshot : store.getStructuralSnapshot
@@ -285,8 +286,6 @@ function AnalysisWorkspaceComponent({
       <div><span className="section-kicker">02 / TELEMETRY</span><h2>Analysis workspace</h2></div>
       <div className="workspace-tools">
         <AnalysisPointCount store={store} />
-        {droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost after device queueing, detected via sequence numbers"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}
-        {(lostEdges[0] + lostEdges[1]) > 0 && <span className="workspace-dropped" title={`Primary RPM: ${lostEdges[0].toLocaleString()} lost | Secondary RPM: ${lostEdges[1].toLocaleString()} lost`}><X size={13} />{(lostEdges[0] + lostEdges[1]).toLocaleString()} lost (device)</span>}
         <button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Freeze the displayed view; capture and analysis continue' : 'Resume following the latest analysis'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Freeze view' : 'View frozen'}</button>
         <label className="analysis-select"><span>Analysis interval</span><select value={analysisWindowMs} onChange={(event: ChangeEvent<HTMLSelectElement>) => onAnalysisWindowChange(Number(event.target.value))}>{ANALYSIS_WINDOWS_MS.map((value) => <option value={value} key={value}>{value} ms</option>)}</select></label>
         <label className="analysis-select"><span>RPM observations</span><select value={observationMode} onChange={(event: ChangeEvent<HTMLSelectElement>) => onObservationModeChange(event.target.value as RpmObservationMode)}><option value="none">None</option><option value="revolution">1-rev estimate</option><option value="tooth">Per tooth</option></select></label>

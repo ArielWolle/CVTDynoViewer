@@ -83,6 +83,27 @@ export class RawReplayController {
     this.emitState(undefined, true)
   }
 
+  showAll() {
+    if (!this.packets.length) return
+    this.stopTimer()
+    this.cursor = 0
+    this.basePositionMs = 0
+    this.playing = false
+    this.loopCount = 0
+
+    // A complete-view load is a fresh analysis pass over the saved source data, not a timed replay.
+    // Reset first so this method is safe even after a partial replay, then publish the raw packets
+    // once in their recorded arrival order. The worker receives one batch, so this is intentionally
+    // cheap compared with accelerating the replay clock just to reach the end.
+    this.callbacks.onReset(this.firstUs, this.loopCount)
+    this.callbacks.onBatch([...this.packets])
+
+    this.cursor = this.packets.length
+    this.basePositionMs = this.durationMs
+    this.playStartedMs = this.clock.now()
+    this.emitState(this.durationMs, true)
+  }
+
   clear() {
     this.stopTimer()
     this.packets = []

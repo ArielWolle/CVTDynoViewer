@@ -57,4 +57,32 @@ describe('RawReplayController', () => {
     expect(delivered).toEqual(packets)
     expect(delivered.map((packet) => packet.tUs)).toEqual([1_000_000, 1_020_000, 1_010_000])
   })
+  it('shows the complete saved run immediately and replays from the beginning', () => {
+    const clock = new FakeClock()
+    const delivered: AnalysisPacket[] = []
+    const states: Array<{ playing: boolean; progress: number }> = []
+    let resets = 0
+    const controller = new RawReplayController({
+      onBatch: (batch) => delivered.push(...batch),
+      onReset: () => { resets += 1 },
+      onState: (state) => states.push({ playing: state.playing, progress: state.progress }),
+    }, clock)
+
+    controller.setLoop(false)
+    controller.load(packets)
+    controller.showAll()
+
+    expect(delivered).toEqual(packets)
+    expect(states.at(-1)).toEqual({ playing: false, progress: 1 })
+
+    // Playback from the complete-view state must reset first and then start from packet zero.
+    delivered.length = 0
+    const resetsBeforePlay = resets
+    controller.play()
+    clock.advance(0)
+
+    expect(resets).toBe(resetsBeforePlay + 1)
+    expect(delivered[0]).toEqual(packets[0])
+  })
+
 })
