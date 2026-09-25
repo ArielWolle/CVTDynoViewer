@@ -1,14 +1,17 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ChangeEvent, type Dispatch, type DragEvent, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
 import { GripVertical, Pause, Play, RotateCcw, X } from 'lucide-react'
-import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
+import { CartesianGrid, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
 import { TimeRangeSlider } from '../TimeRangeSlider'
 import { ANALYSIS_WINDOWS_MS, type EfficiencyPoint, type RatioPoint, type RpmObservationMode, type RpmObservationView, type RpmPoint, type ShiftPoint } from './types'
 import { findNearestTime } from './uiStore'
 import { AnalysisStore, type PowerRow, type WithSeconds } from './store'
-import { nearestProjectedPoint, projectToPlot, type PlotRect as RelationshipPlotRect } from './relationshipHover'
+import { nearestProjectedPoint, projectToPlot } from './relationshipHover'
+import { TelemetryCanvas } from './TelemetryCanvas'
+import { usePlotGeometry } from './usePlotGeometry'
+import type { NumericDomain, PlotGeometry } from './plotGeometry'
+import type { ChartConfig, ChartId } from './chartTypes'
 
-export type ChartId = 'scatter' | 'rpm1' | 'rpm2' | 'shift' | 'power' | 'efficiency' | 'shiftRatio' | 'shiftEfficiency'
-export type ChartConfig = { id: ChartId; title: string; subtitle: string; color: string; visible: boolean }
+export type { ChartConfig, ChartId } from './chartTypes'
 
 export const defaultCharts: ChartConfig[] = [
   { id: 'scatter', title: 'Primary vs secondary RPM', subtitle: 'Speed relationship', color: '#f05d3b', visible: true },
@@ -27,15 +30,15 @@ const OBSERVATION_QUERY_GRANULARITY_MS = 100
 const DEFAULT_LIVE_WINDOW_MS = 10_000
 const KW_TO_HP = 1.341022
 const axisLabelStyle = { fill: '#8b8982', fontSize: 10 }
-const lineProps = { isAnimationActive: false, animationDuration: 0, dot: false, activeDot: false, connectNulls: false }
-const analysisDot = { r: 1.8, strokeWidth: 0 }
 
 function clamp01(value: number) { return Math.min(1, Math.max(0, value)) }
 function formatNumber(value: number, digits = 2) { return Number.isFinite(value) ? value.toFixed(digits) : '—' }
 
-const EMPTY_TIME_DATA: readonly { time: number; seconds: number }[] = []
-const EMPTY_RELATIONSHIP_DATA: readonly (WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>)[] = []
-const EMPTY_RPM_OBSERVATIONS: WithSeconds<RpmPoint>[] = []
+type TimeChartDatum = WithSeconds<RpmPoint> | WithSeconds<ShiftPoint> | WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint> | PowerRow
+type RelationshipDatum = WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>
+const EMPTY_TIME_DATA: readonly TimeChartDatum[] = []
+const EMPTY_RELATIONSHIP_DATA: readonly RelationshipDatum[] = []
+const EMPTY_RPM_OBSERVATIONS: readonly WithSeconds<RpmPoint>[] = []
 const DEFAULT_POWER_DOMAIN: [number, number] = [0, 1]
 type ViewData = {
   primaryRpm: WithSeconds<RpmPoint>[]
@@ -150,6 +153,12 @@ function niceRpmCeiling(value: number): number {
   return Math.ceil(padded / step) * step
 }
 
+function useStableDomain(domain: [number, number]): [number, number] {
+  const stable = useRef<[number, number]>(domain)
+  if (stable.current[0] !== domain[0] || stable.current[1] !== domain[1]) stable.current = domain
+  return stable.current
+}
+
 function AnalysisPointCount({ store }: { store: AnalysisStore }) {
   const status = useSyncExternalStore(store.subscribe, store.getStatusSnapshot, store.getStatusSnapshot)
   return <span><span className="status-dot is-live" />{status.totalCount.toLocaleString()} derived points</span>
@@ -222,8 +231,8 @@ function AnalysisWorkspaceComponent({
       setObservationView({ primary: [], secondary: [] })
       return
     }
-    void requestObservations(observationMode, observationQueryStart, observationQueryEnd, MAX_OBSERVATION_POINTS).then((view) => {
-      if (observationRequestRef.current === requestId) setObservationView(view)
+    void requestObservations(observationMode, observationQueryStart, observationQueryEnd, MAX_OBSERVATION_POINTS).then((nextView) => {
+      if (observationRequestRef.current === requestId) setObservationView(nextView)
     })
   }, [observationMode, observationQueryStart, observationQueryEnd, requestObservations])
 
@@ -233,7 +242,7 @@ function AnalysisWorkspaceComponent({
   )
   const primaryObs = useMemo(() => observationDots(observationView.primary, windowStartMs, windowEndMs, timeOrigin), [observationView.primary, windowStartMs, windowEndMs, timeOrigin])
   const secondaryObs = useMemo(() => observationDots(observationView.secondary, windowStartMs, windowEndMs, timeOrigin), [observationView.secondary, windowStartMs, windowEndMs, timeOrigin])
-  const { primaryRpm, secondaryRpm, shift, ratioDots, ratioTime, efficiencyDots, efficiencyTime, power } = storedView
+  const { ratioDots, efficiencyDots, power } = storedView
   const view = useMemo<ViewData>(() => ({ ...storedView, primaryObs, secondaryObs }), [storedView, primaryObs, secondaryObs])
 
   const scatterMax = useMemo(() => {
@@ -257,8 +266,7 @@ function AnalysisWorkspaceComponent({
     const span = Math.max(0.5, max - min)
     const pad = Math.max(0.25, 0.08 * span)
     const paddedMin = min < 0 ? min - pad : 0
-    const paddedMax = max + pad
-    return niceDomain(paddedMin, paddedMax, 5)
+    return niceDomain(paddedMin, max + pad, 5)
   }, [power])
 
   function reorder(target: ChartId) {
@@ -287,7 +295,7 @@ function AnalysisWorkspaceComponent({
     </section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next: { start: number; end: number }) => setManualRange(next)} formatValue={(fraction: number) => `${formatTimeSeconds((domainStart + fraction * domainSpan - timeOrigin) / 1000, domainSpan)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => setManualRange({ start: 0, end: 1 })}>Full range</button></section>}
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <AnalysisChartCard
-      key={chart.id} config={chart} view={view} hoverBus={hoverBus} timeOrigin={timeOrigin} windowStart={windowStartMs} windowEnd={windowEndMs}
+      key={chart.id} config={chart} view={view} store={store} hoverBus={hoverBus} timeOrigin={timeOrigin} windowStart={windowStartMs} windowEnd={windowEndMs}
       lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange}
       analysisWindowMs={analysisWindowMs} scatterMax={scatterMax} efficiencyMax={efficiencyMax} powerDomain={powerDomain}
       sourceLabel={sourceLabel} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)}
@@ -298,9 +306,10 @@ function AnalysisWorkspaceComponent({
 
 export const AnalysisWorkspace = memo(AnalysisWorkspaceComponent)
 
-function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, windowEnd, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, analysisWindowMs, scatterMax, efficiencyMax, powerDomain, sourceLabel, onDragStart, onDrop, onHide }: {
+function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowStart, windowEnd, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, analysisWindowMs, scatterMax, efficiencyMax, powerDomain, sourceLabel, onDragStart, onDrop, onHide }: {
   config: ChartConfig
   view: ViewData
+  store: AnalysisStore
   hoverBus: HoverBus
   timeOrigin: number
   windowStart: number
@@ -322,18 +331,17 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   const crosshairRef = useRef<HTMLDivElement | null>(null)
   const crosshairHRef = useRef<HTMLDivElement | null>(null)
   const readoutRef = useRef<HTMLSpanElement | null>(null)
-  const plotRectRef = useRef<DOMRect | null>(null)
-  const bodyRectRef = useRef<DOMRect | null>(null)
+  const plotGeometry = usePlotGeometry(chartBodyRef)
   const relationship = config.id === 'scatter' || config.id === 'shiftEfficiency'
   const visibleSpanMs = Math.max(0, windowEnd - windowStart)
   const visibleStartSeconds = (windowStart - timeOrigin) / 1000
   const visibleEndSeconds = (windowEnd - timeOrigin) / 1000
   const xDomain = useMemo<[number, number]>(() => visibleEndSeconds > visibleStartSeconds ? [visibleStartSeconds, visibleEndSeconds] : [visibleStartSeconds, visibleStartSeconds + 1], [visibleStartSeconds, visibleEndSeconds])
 
-  const relationshipData = config.id === 'scatter' ? view.ratioDots
+  const relationshipData: readonly RelationshipDatum[] = config.id === 'scatter' ? view.ratioDots
     : config.id === 'shiftEfficiency' ? view.efficiencyDots
     : EMPTY_RELATIONSHIP_DATA
-  const timeData = config.id === 'rpm1' ? view.primaryRpm
+  const timeData: readonly TimeChartDatum[] = config.id === 'rpm1' ? view.primaryRpm
     : config.id === 'rpm2' ? view.secondaryRpm
     : config.id === 'shift' ? view.shift
     : config.id === 'power' ? view.power
@@ -354,96 +362,52 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
       : { x: [0.5, 6], y: [0, efficiencyMax] }
   ), [config.id, scatterMax, efficiencyMax])
 
-  const relationshipX = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>) => (
+  const relationshipX = useCallback((point: RelationshipDatum) => (
     config.id === 'scatter' ? (point as RatioPoint).rpm2 : (point as EfficiencyPoint).ratio
   ), [config.id])
 
-  const relationshipY = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>) => (
+  const relationshipY = useCallback((point: RelationshipDatum) => (
     config.id === 'scatter' ? (point as RatioPoint).rpm1 : (point as EfficiencyPoint).efficiencyPct
   ), [config.id])
 
-  const relationshipReadout = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>) => (
+  const relationshipReadout = useCallback((point: RelationshipDatum) => (
     config.id === 'scatter'
       ? `Sec ${formatNumber((point as RatioPoint).rpm2)} / Pri ${formatNumber((point as RatioPoint).rpm1)}`
       : `Ratio ${formatNumber((point as EfficiencyPoint).ratio, 2)} / Eff ${formatNumber((point as EfficiencyPoint).efficiencyPct, 2)}%`
   ), [config.id])
 
-  const localRelationshipPlot = useCallback((): RelationshipPlotRect | null => {
-    const plotRect = plotRectRef.current
-    const measuredBodyRect = bodyRectRef.current
-    if (!plotRect || !measuredBodyRect || !(plotRect.width > 0) || !(plotRect.height > 0)) return null
-    return {
-      left: plotRect.left - measuredBodyRect.left,
-      top: plotRect.top - measuredBodyRect.top,
-      width: plotRect.width,
-      height: plotRect.height,
-    }
-  }, [])
-
-  const relationshipSnapForPoint = useCallback((point: WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>): RelationshipSnap | undefined => {
-    const plot = localRelationshipPlot()
-    if (!plot) return undefined
-    const projected = projectToPlot(relationshipX(point), relationshipY(point), relationshipDomains.x, relationshipDomains.y, plot)
-    if (!projected) return undefined
+  const relationshipSnapForPoint = useCallback((point: RelationshipDatum): RelationshipSnap | undefined => {
+    if (!plotGeometry) return undefined
+    const projectedPoint = projectToPlot(relationshipX(point), relationshipY(point), relationshipDomains.x, relationshipDomains.y, plotGeometry)
+    if (!projectedPoint) return undefined
     return {
       time: point.time,
-      xPx: projected.xPx,
-      yPx: projected.yPx,
+      xPx: projectedPoint.xPx,
+      yPx: projectedPoint.yPx,
       readout: relationshipReadout(point),
     }
-  }, [localRelationshipPlot, relationshipDomains, relationshipReadout, relationshipX, relationshipY])
-
-  const measurePlotRect = useCallback((chartBody: HTMLDivElement) => {
-    plotRectRef.current = chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
-    bodyRectRef.current = chartBody.getBoundingClientRect()
-  }, [])
-
-  useEffect(() => {
-    const body = chartBodyRef.current
-    if (!body) return
-    measurePlotRect(body)
-    const observer = new ResizeObserver(() => measurePlotRect(body))
-    observer.observe(body)
-    return () => observer.disconnect()
-  }, [measurePlotRect])
+  }, [plotGeometry, relationshipDomains, relationshipReadout, relationshipX, relationshipY])
 
   const nearestRelationship = useCallback((mouseX: number, mouseY: number): RelationshipSnap | undefined => {
-    if (!relationship) return undefined
-    const body = chartBodyRef.current
-    if ((!plotRectRef.current || !bodyRectRef.current) && body) measurePlotRect(body)
-
-    const plot = localRelationshipPlot()
-    if (!plot) return undefined
-
-    // Pure arithmetic over the visible data. No SVG querySelector and no per-dot layout reads.
+    if (!relationship || !plotGeometry) return undefined
     const nearest = nearestProjectedPoint(
       relationshipData,
       mouseX,
       mouseY,
       relationshipDomains.x,
       relationshipDomains.y,
-      plot,
+      plotGeometry,
       relationshipX,
       relationshipY,
     )
     if (!nearest) return undefined
-
     return {
       time: nearest.point.time,
       xPx: nearest.xPx,
       yPx: nearest.yPx,
       readout: relationshipReadout(nearest.point),
     }
-  }, [
-    localRelationshipPlot,
-    measurePlotRect,
-    relationship,
-    relationshipData,
-    relationshipDomains,
-    relationshipReadout,
-    relationshipX,
-    relationshipY,
-  ])
+  }, [plotGeometry, relationship, relationshipData, relationshipDomains, relationshipReadout, relationshipX, relationshipY])
 
   const hideHover = useCallback(() => {
     if (crosshairRef.current) crosshairRef.current.style.display = 'none'
@@ -456,9 +420,7 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
     const vertical = crosshairRef.current
     const horizontal = crosshairHRef.current
     const readout = readoutRef.current
-    const bodyRect = bodyRectRef.current
-    const plotRect = plotRectRef.current
-    if (!vertical || !bodyRect || !plotRect || hoverTime === null || windowEnd <= windowStart) { hideHover(); return }
+    if (!vertical || !plotGeometry || hoverTime === null || windowEnd <= windowStart) { hideHover(); return }
 
     let relationshipSnap = relationship && hoverEvent.sourceChartId === config.id ? hoverEvent.relationshipSnap : undefined
     if (relationship && !relationshipSnap) {
@@ -466,29 +428,21 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
       if (point) relationshipSnap = relationshipSnapForPoint(point)
     }
 
-    let hovered: RpmPoint | ShiftPoint | RatioPoint | EfficiencyPoint | PowerRow | undefined
-    if (!relationship) {
-      if (config.id === 'rpm1') hovered = findNearestTime(view.primaryRpm, hoverTime)
-      else if (config.id === 'rpm2') hovered = findNearestTime(view.secondaryRpm, hoverTime)
-      else if (config.id === 'shift') hovered = findNearestTime(view.shift, hoverTime)
-      else if (config.id === 'power') hovered = findNearestTime(view.power, hoverTime)
-      else if (config.id === 'efficiency') hovered = findNearestTime(view.efficiencyTime, hoverTime)
-      else if (config.id === 'shiftRatio') hovered = findNearestTime(view.ratioTime, hoverTime)
-    }
-
     if (!relationship) {
       const f = clamp01((hoverTime - windowStart) / (windowEnd - windowStart))
       vertical.style.display = 'block'
-      vertical.style.transform = `translate3d(${plotRect.left - bodyRect.left + f * plotRect.width}px,0,0)`
+      vertical.style.height = `${plotGeometry.height}px`
+      vertical.style.transform = `translate3d(${plotGeometry.left + f * plotGeometry.width}px,${plotGeometry.top}px,0)`
       if (horizontal) horizontal.style.display = 'none'
     } else {
       if (!relationshipSnap) { hideHover(); return }
-      // The snap is projected into the exact plot rectangle from the chart's linear domains.
       vertical.style.display = 'block'
-      vertical.style.transform = `translate3d(${relationshipSnap.xPx}px,0,0)`
+      vertical.style.height = `${plotGeometry.height}px`
+      vertical.style.transform = `translate3d(${relationshipSnap.xPx}px,${plotGeometry.top}px,0)`
       if (horizontal) {
         horizontal.style.display = 'block'
-        horizontal.style.transform = `translate3d(0,${relationshipSnap.yPx}px,0)`
+        horizontal.style.width = `${plotGeometry.width}px`
+        horizontal.style.transform = `translate3d(${plotGeometry.left}px,${relationshipSnap.yPx}px,0)`
       }
     }
 
@@ -498,31 +452,36 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
       readout.style.display = ''
       return
     }
-    if (!hovered) { readout.style.display = 'none'; return }
+
+    // Hover interrogates the full-resolution derived store, never the decimated Canvas view.
     let text = ''
-    if (config.id === 'rpm1' || config.id === 'rpm2') text = `${formatNumber((hovered as RpmPoint).rpm)} RPM`
-    else if (config.id === 'shift') text = `${formatNumber((hovered as ShiftPoint).value)}%`
+    if (config.id === 'rpm1') text = `${formatNumber(store.nearest('primaryRpm', hoverTime)?.rpm ?? Number.NaN)} RPM`
+    else if (config.id === 'rpm2') text = `${formatNumber(store.nearest('secondaryRpm', hoverTime)?.rpm ?? Number.NaN)} RPM`
+    else if (config.id === 'shift') text = `${formatNumber(store.nearest('shift', hoverTime)?.value ?? Number.NaN)}%`
+    else if (config.id === 'shiftRatio') text = formatNumber(store.nearest('ratio', hoverTime)?.ratio ?? Number.NaN, 3)
+    else if (config.id === 'efficiency') text = `${formatNumber(store.nearest('efficiency', hoverTime)?.efficiencyPct ?? Number.NaN)}%`
     else if (config.id === 'power') {
-      const p = hovered as PowerRow
-      text = `Pri ${formatNumber(p.power1 ?? Number.NaN)} kW / Sec ${formatNumber(p.power2 ?? Number.NaN)} kW`
-    } else if (config.id === 'shiftRatio') text = formatNumber((hovered as RatioPoint).ratio, 3)
-    else if (config.id === 'efficiency') text = `${formatNumber((hovered as EfficiencyPoint).efficiencyPct)}%`
+      const primary = store.nearest('primaryPower', hoverTime)?.powerKw ?? Number.NaN
+      const secondary = store.nearest('secondaryPower', hoverTime)?.powerKw ?? Number.NaN
+      text = `Pri ${formatNumber(primary)} kW / Sec ${formatNumber(secondary)} kW`
+    }
     if (text) { readout.textContent = text; readout.style.display = '' }
     else readout.style.display = 'none'
-  }, [config.id, hideHover, relationship, view, windowEnd, windowStart])
+  }, [config.id, hideHover, plotGeometry, relationship, relationshipData, relationshipSnapForPoint, store, windowEnd, windowStart])
 
   useEffect(() => hoverBus.subscribe(updateHover), [hoverBus, updateHover])
 
   function handleMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
-    const rect = plotRectRef.current
-    if (!rect || rect.width <= 0) return
-    const fx = clamp01((event.clientX - rect.left) / rect.width)
+    if (!plotGeometry || plotGeometry.width <= 0) return
+    const bodyRect = event.currentTarget.getBoundingClientRect()
+    const mouseX = event.clientX - bodyRect.left
+    const mouseY = event.clientY - bodyRect.top
     if (!relationship) {
+      const fx = clamp01((mouseX - plotGeometry.left) / plotGeometry.width)
       hoverBus.publish({ time: windowStart + fx * Math.max(0, windowEnd - windowStart), sourceChartId: config.id })
       return
     }
-    const bodyRect = event.currentTarget.getBoundingClientRect()
-    const nearest = nearestRelationship(event.clientX - bodyRect.left, event.clientY - bodyRect.top)
+    const nearest = nearestRelationship(mouseX, mouseY)
     if (nearest) hoverBus.publish({ time: nearest.time, sourceChartId: config.id, relationshipSnap: nearest })
   }
 
@@ -531,7 +490,7 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   return <article className="chart-card" onDragOver={(event: DragEvent<HTMLElement>) => event.preventDefault()} onDrop={onDrop}>
     <header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{headerControls}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header>
     <div className="chart-body" ref={chartBodyRef} onMouseMove={handleMouseMove} onMouseLeave={() => hoverBus.publish({ time: null, sourceChartId: null })}>
-      <AnalysisPlot config={config} timeData={timeData} relationshipData={relationshipData} primaryObs={plotPrimaryObs} secondaryObs={plotSecondaryObs} xDomain={xDomain} visibleSpanMs={visibleSpanMs} scatterMax={plotScatterMax} efficiencyMax={plotEfficiencyMax} powerDomain={plotPowerDomain} lowRatio={plotLowRatio} highRatio={plotHighRatio} />
+      <AnalysisPlot config={config} timeData={timeData} relationshipData={relationshipData} primaryObs={plotPrimaryObs} secondaryObs={plotSecondaryObs} plotGeometry={plotGeometry} xDomain={xDomain} visibleSpanMs={visibleSpanMs} scatterMax={plotScatterMax} efficiencyMax={plotEfficiencyMax} powerDomain={plotPowerDomain} lowRatio={plotLowRatio} highRatio={plotHighRatio} />
       <div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />
       {relationship && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}
     </div>
@@ -539,12 +498,43 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   </article>
 }
 
-const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationshipData, primaryObs, secondaryObs, xDomain, visibleSpanMs, scatterMax, efficiencyMax, powerDomain, lowRatio, highRatio }: {
+function maxFinite<T>(values: readonly T[], getValue: (point: T) => number, minimum = 0): number {
+  let max = minimum
+  for (const point of values) {
+    const value = getValue(point)
+    if (Number.isFinite(value)) max = Math.max(max, value)
+  }
+  return max
+}
+
+function timeSeriesYDomain(config: ChartConfig, timeData: readonly TimeChartDatum[], primaryObs: readonly WithSeconds<RpmPoint>[], secondaryObs: readonly WithSeconds<RpmPoint>[], efficiencyMax: number, powerDomain: [number, number]): [number, number] {
+  if (config.id === 'rpm1' || config.id === 'rpm2') {
+    const rpm = timeData as readonly WithSeconds<RpmPoint>[]
+    const observations = config.id === 'rpm1' ? primaryObs : secondaryObs
+    const maxRpm = Math.max(
+      maxFinite(rpm, (point) => point.rpm, 100),
+      maxFinite(observations, (point) => point.rpm, 100),
+    )
+    return [0, niceRpmCeiling(maxRpm)]
+  }
+  if (config.id === 'shift') {
+    const shift = timeData as readonly WithSeconds<ShiftPoint>[]
+    const upper = maxFinite(shift, (point) => point.value, 100)
+    return [0, Math.max(100, niceStep(upper, 5) * Math.ceil(upper / niceStep(upper, 5)))]
+  }
+  if (config.id === 'power') return powerDomain
+  if (config.id === 'efficiency') return [0, efficiencyMax]
+  if (config.id === 'shiftRatio') return [0, 6]
+  return [0, 1]
+}
+
+const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationshipData, primaryObs, secondaryObs, plotGeometry, xDomain, visibleSpanMs, scatterMax, efficiencyMax, powerDomain, lowRatio, highRatio }: {
   config: ChartConfig
-  timeData: readonly { time: number; seconds: number }[]
-  relationshipData: readonly (WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>)[]
-  primaryObs: WithSeconds<RpmPoint>[]
-  secondaryObs: WithSeconds<RpmPoint>[]
+  timeData: readonly TimeChartDatum[]
+  relationshipData: readonly RelationshipDatum[]
+  primaryObs: readonly WithSeconds<RpmPoint>[]
+  secondaryObs: readonly WithSeconds<RpmPoint>[]
+  plotGeometry: PlotGeometry | null
   xDomain: [number, number]
   visibleSpanMs: number
   scatterMax: number
@@ -553,8 +543,31 @@ const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationship
   lowRatio: number
   highRatio: number
 }) {
+  const rawYDomain = useMemo<[number, number]>(() => (
+    config.id === 'scatter' ? [0, scatterMax]
+      : config.id === 'shiftEfficiency' ? [0, efficiencyMax]
+      : timeSeriesYDomain(config, timeData, primaryObs, secondaryObs, efficiencyMax, powerDomain)
+  ), [config, efficiencyMax, powerDomain, primaryObs, scatterMax, secondaryObs, timeData])
+  const yDomain = useStableDomain(rawYDomain)
+  const rawCanvasXDomain: [number, number] = config.id === 'scatter' ? [0, scatterMax] : config.id === 'shiftEfficiency' ? [0.5, 6] : xDomain
+  const canvasXDomain = useStableDomain(rawCanvasXDomain)
+
+  return <>
+    <AxisScaffold chartId={config.id} xDomain={xDomain} yDomain={yDomain} visibleSpanMs={visibleSpanMs} scatterMax={scatterMax} efficiencyMax={efficiencyMax} powerDomain={powerDomain} />
+    <TelemetryCanvas chartId={config.id} color={config.color} plot={plotGeometry} xDomain={canvasXDomain} yDomain={yDomain} timeData={timeData} relationshipData={relationshipData} primaryObs={primaryObs} secondaryObs={secondaryObs} lowRatio={lowRatio} highRatio={highRatio} />
+  </>
+})
+
+const AxisScaffold = memo(function AxisScaffold({ chartId, xDomain, yDomain, visibleSpanMs, scatterMax, efficiencyMax, powerDomain }: {
+  chartId: ChartId
+  xDomain: [number, number]
+  yDomain: [number, number]
+  visibleSpanMs: number
+  scatterMax: number
+  efficiencyMax: number
+  powerDomain: [number, number]
+}) {
   const xTick = useCallback((value: number) => `${formatTimeSeconds(value, visibleSpanMs)}s`, [visibleSpanMs])
-  const chartData = (config.id === 'scatter' || config.id === 'shiftEfficiency') ? relationshipData : timeData
   const powerTicks = useMemo(() => ticksForDomain(powerDomain, 5), [powerDomain])
   const powerStep = powerTicks.length >= 2 ? powerTicks[1] - powerTicks[0] : niceStep(powerDomain[1] - powerDomain[0], 5)
   const hpTicks = useMemo(() => powerTicks.map((value) => value * KW_TO_HP), [powerTicks])
@@ -568,21 +581,18 @@ const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationship
   }, [scatterMax])
   const ratioTicks = useMemo(() => [0, 1, 2, 3, 4, 5, 6], [])
   const ratioRelationshipTicks = useMemo(() => [0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6], [])
-  const lowRatioLine = useMemo(() => [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * lowRatio }], [scatterMax, lowRatio])
-  const highRatioLine = useMemo(() => [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * highRatio }], [scatterMax, highRatio])
   const powerPadDomain: [number, number] = powerDomain
-  const timeAxis = (unit: string, domain?: [number, number], ticks?: number[]) => <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={xDomain} allowDataOverflow tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={xTick} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={domain} ticks={ticks} allowDataOverflow={domain !== undefined} label={{ value: unit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
+  const timeAxis = (unit: string, domain: [number, number], ticks?: number[]) => <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={xDomain} allowDataOverflow tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={xTick} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={domain} ticks={ticks} allowDataOverflow label={{ value: unit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
   const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={xDomain} allowDataOverflow tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={xTick} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => formatAxisTick(value, powerStep)} ticks={powerTicks} width={46} domain={powerPadDomain} allowDataOverflow label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => formatAxisTick(value, hpStep)} ticks={hpTicks} width={46} domain={[powerPadDomain[0] * KW_TO_HP, powerPadDomain[1] * KW_TO_HP]} allowDataOverflow label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /></>
+  const axisData = useMemo(() => [
+    { seconds: xDomain[0], rpm2: 0, rpm1: 0, ratio: 0.5, efficiencyPct: 0 },
+    { seconds: xDomain[1], rpm2: scatterMax, rpm1: scatterMax, ratio: 6, efficiencyPct: efficiencyMax },
+  ], [efficiencyMax, scatterMax, xDomain])
 
-  return <ResponsiveContainer width="100%" height="100%"><LineChart data={chartData as never[]} margin={{ top: 8, right: config.id === 'power' ? 4 : 14, left: 4, bottom: 14 }}>
-    {config.id === 'power' ? powerAxis : config.id === 'scatter' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="rpm2" domain={[0, scatterMax]} ticks={scatterTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Math.round(value).toString()} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" domain={[0, scatterMax]} ticks={scatterTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Math.round(value).toString()} width={50} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : config.id === 'shiftEfficiency' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="ratio" domain={[0.5, 6]} ticks={ratioRelationshipTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)} label={{ value: 'Speed ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="efficiencyPct" domain={[0, efficiencyMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : config.id === 'rpm1' || config.id === 'rpm2' ? timeAxis('RPM') : config.id === 'shift' ? timeAxis('%') : config.id === 'efficiency' ? timeAxis('%', [0, efficiencyMax]) : timeAxis('Ratio', [0, 6], ratioTicks)}
-    {config.id === 'scatter' && <><Line data={lowRatioLine} type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" {...lineProps} /><Line data={highRatioLine} type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" {...lineProps} /><Line type="linear" dataKey="rpm1" stroke="transparent" {...lineProps} dot={{ r: 2.2, fill: config.color, stroke: 'none' }} /></>}
-    {config.id === 'shiftEfficiency' && <><ReferenceLine x={1} stroke="#8b8982" strokeDasharray="3 4" strokeWidth={1} /><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /><Line type="linear" dataKey="efficiencyPct" stroke="transparent" {...lineProps} dot={{ r: 2.5, fill: config.color, fillOpacity: .62, stroke: 'none' }} /></>}
-    {config.id === 'rpm1' && <><Line data={primaryObs} type="linear" dataKey="rpm" stroke="transparent" {...lineProps} dot={{ r: 1.5, fill: config.color, fillOpacity: .24, stroke: 'none' }} /><Line type="linear" dataKey="rpm" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
-    {config.id === 'rpm2' && <><Line data={secondaryObs} type="linear" dataKey="rpm" stroke="transparent" {...lineProps} dot={{ r: 1.5, fill: config.color, fillOpacity: .24, stroke: 'none' }} /><Line type="linear" dataKey="rpm" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
-    {config.id === 'shift' && <Line type="linear" dataKey="value" stroke={config.color} strokeWidth={2} {...lineProps} />}
-    {config.id === 'power' && <><Line type="linear" dataKey="power1" yAxisId="kw" stroke="#f05d3b" strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: '#f05d3b' }} /><Line type="linear" dataKey="power2" yAxisId="kw" stroke="#3c8f88" strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: '#3c8f88' }} /></>}
-    {config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /><Line type="linear" dataKey="efficiencyPct" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
-    {config.id === 'shiftRatio' && <><ReferenceLine y={1} stroke="#8b8982" strokeDasharray="3 4" strokeWidth={1} /><Line type="linear" dataKey="ratio" stroke={config.color} strokeWidth={2} {...lineProps} dot={{ ...analysisDot, fill: config.color }} /></>}
-  </LineChart></ResponsiveContainer>
+  return <div className="chart-axis-layer"><ResponsiveContainer width="100%" height="100%"><LineChart data={axisData} margin={{ top: 8, right: chartId === 'power' ? 4 : 14, left: 4, bottom: 14 }}>
+    {chartId === 'power' ? powerAxis : chartId === 'scatter' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="rpm2" domain={[0, scatterMax]} ticks={scatterTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Math.round(value).toString()} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" domain={[0, scatterMax]} ticks={scatterTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Math.round(value).toString()} width={50} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : chartId === 'shiftEfficiency' ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="ratio" domain={[0.5, 6]} ticks={ratioRelationshipTicks} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value: number) => Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)} label={{ value: 'Speed ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="efficiencyPct" domain={[0, efficiencyMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></> : chartId === 'rpm1' || chartId === 'rpm2' ? timeAxis('RPM', yDomain) : chartId === 'shift' ? timeAxis('%', yDomain) : chartId === 'efficiency' ? timeAxis('%', yDomain) : timeAxis('Ratio', yDomain, ratioTicks)}
+    {chartId === 'shiftEfficiency' && <><ReferenceLine x={1} stroke="#8b8982" strokeDasharray="3 4" strokeWidth={1} /><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /></>}
+    {chartId === 'efficiency' && <ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} />}
+    {chartId === 'shiftRatio' && <ReferenceLine y={1} stroke="#8b8982" strokeDasharray="3 4" strokeWidth={1} />}
+  </LineChart></ResponsiveContainer></div>
 })

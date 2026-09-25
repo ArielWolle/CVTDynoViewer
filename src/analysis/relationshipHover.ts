@@ -1,11 +1,7 @@
-export type NumericDomain = readonly [number, number]
+import { projectX, projectY, type NumericDomain, type PlotGeometry } from './plotGeometry'
 
-export type PlotRect = {
-  left: number
-  top: number
-  width: number
-  height: number
-}
+export type { NumericDomain } from './plotGeometry'
+export type PlotRect = PlotGeometry
 
 export type ProjectedPoint<T> = {
   point: T
@@ -21,23 +17,9 @@ export function projectToPlot(
   yDomain: NumericDomain,
   plot: PlotRect,
 ): { xPx: number; yPx: number } | null {
-  const [xMin, xMax] = xDomain
-  const [yMin, yMax] = yDomain
-  const xSpan = xMax - xMin
-  const ySpan = yMax - yMin
-  if (!Number.isFinite(x) || !Number.isFinite(y) || !(xSpan > 0) || !(ySpan > 0) || !(plot.width > 0) || !(plot.height > 0)) return null
-
-  const fx = (x - xMin) / xSpan
-  const fy = (y - yMin) / ySpan
-
-  // Relationship charts use explicit numeric domains with allowDataOverflow, so Recharts clips
-  // samples outside the plot. Do not allow hover to snap to a point the user cannot see.
-  if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null
-
-  return {
-    xPx: plot.left + fx * plot.width,
-    yPx: plot.top + (1 - fy) * plot.height,
-  }
+  const xPx = projectX(x, xDomain, plot)
+  const yPx = projectY(y, yDomain, plot)
+  return xPx === null || yPx === null ? null : { xPx, yPx }
 }
 
 export function nearestProjectedPoint<T>(
