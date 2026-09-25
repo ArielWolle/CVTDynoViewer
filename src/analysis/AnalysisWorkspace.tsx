@@ -51,12 +51,14 @@ type ViewData = {
   power: PowerRow[]
 }
 
-type HoverListener = (time: number | null) => void
+type RelationshipSnap = { time: number; xPx: number; yPx: number; readout: string }
+type HoverEvent = { time: number | null; sourceChartId: ChartId | null; relationshipSnap?: RelationshipSnap }
+type HoverListener = (event: HoverEvent) => void
 
 class HoverBus {
   private listeners = new Set<HoverListener>()
   private frame: number | null = null
-  private pending: number | null = null
+  private pending: HoverEvent = { time: null, sourceChartId: null }
   private hasPending = false
 
   subscribe(listener: HoverListener) {
@@ -64,8 +66,8 @@ class HoverBus {
     return () => { this.listeners.delete(listener) }
   }
 
-  publish(time: number | null) {
-    this.pending = time
+  publish(event: HoverEvent) {
+    this.pending = event
     this.hasPending = true
     if (this.frame !== null) return
     this.frame = requestAnimationFrame(() => {
@@ -301,6 +303,7 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   const readoutRef = useRef<HTMLSpanElement | null>(null)
   const plotRectRef = useRef<DOMRect | null>(null)
   const bodyRectRef = useRef<DOMRect | null>(null)
+  const relationshipHitsRef = useRef<RelationshipSnap[]>([])
   const relationship = config.id === 'scatter' || config.id === 'shiftEfficiency'
   const visibleSpanMs = Math.max(0, windowEnd - windowStart)
   const visibleStartSeconds = (windowStart - timeOrigin) / 1000
@@ -325,6 +328,49 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   const plotLowRatio = config.id === 'scatter' ? lowRatio : 0
   const plotHighRatio = config.id === 'scatter' ? highRatio : 0
 
+  const refreshRelationshipHits = useCallback(() => {
+    if (!relationship) {
+      relationshipHitsRef.current = []
+      return
+    }
+    const body = chartBodyRef.current
+    if (!body) return
+
+    const points = config.id === 'scatter' ? view.ratioDots : view.efficiencyDots
+    if (!points.length) {
+      relationshipHitsRef.current = []
+      return
+    }
+
+    // Recharts renders line dots as SVG circles inside .recharts-line-dots.  The low/high-ratio
+    // guide lines have dots disabled, so the circles here correspond to the actual relationship
+    // samples.  Slice from the end as a defensive fallback if another dotted line is added later.
+    let dots = Array.from(body.querySelectorAll<SVGCircleElement>('.recharts-line-dots .recharts-line-dot'))
+    if (!dots.length) dots = Array.from(body.querySelectorAll<SVGCircleElement>('.recharts-line-dots circle'))
+    if (dots.length > points.length) dots = dots.slice(-points.length)
+
+    const count = Math.min(dots.length, points.length)
+    if (!count) {
+      relationshipHitsRef.current = []
+      return
+    }
+
+    const bodyRect = body.getBoundingClientRect()
+    bodyRectRef.current = bodyRect
+    const hits: RelationshipSnap[] = []
+    for (let index = 0; index < count; index += 1) {
+      const dotRect = dots[index].getBoundingClientRect()
+      const point = points[index]
+      const xPx = dotRect.left + dotRect.width / 2 - bodyRect.left
+      const yPx = dotRect.top + dotRect.height / 2 - bodyRect.top
+      const readout = config.id === 'scatter'
+        ? `Sec ${formatNumber((point as RatioPoint).rpm2)} / Pri ${formatNumber((point as RatioPoint).rpm1)}`
+        : `Ratio ${formatNumber((point as EfficiencyPoint).ratio, 2)} / Eff ${formatNumber((point as EfficiencyPoint).efficiencyPct, 2)}%`
+      hits.push({ time: point.time, xPx, yPx, readout })
+    }
+    relationshipHitsRef.current = hits
+  }, [config.id, relationship, view.ratioDots, view.efficiencyDots])
+
   function measurePlotRect(chartBody: HTMLDivElement) {
     plotRectRef.current = chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
     bodyRectRef.current = chartBody.getBoundingClientRect()
@@ -333,34 +379,47 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
   useEffect(() => {
     const body = chartBodyRef.current
     if (!body) return
-    measurePlotRect(body)
-    const observer = new ResizeObserver(() => measurePlotRect(body))
-    observer.observe(body)
-    return () => observer.disconnect()
-  }, [])
-
-  const nearestRelationship = useCallback((targetX: number, targetY: number) => {
-    if (config.id === 'scatter') {
-      let best: WithSeconds<RatioPoint> | undefined
-      let bestDistance = Infinity
-      for (const point of view.ratioDots) {
-        const dx = (point.rpm2 - targetX) / Math.max(scatterMax, 1)
-        const dy = (point.rpm1 - targetY) / Math.max(scatterMax, 1)
-        const distance = dx * dx + dy * dy
-        if (distance < bestDistance) { best = point; bestDistance = distance }
-      }
-      return best
+    let frame: number | null = null
+    const refresh = () => {
+      measurePlotRect(body)
+      if (frame !== null) cancelAnimationFrame(frame)
+      // Wait one frame so ResponsiveContainer/Recharts has committed the final circle geometry.
+      frame = requestAnimationFrame(() => {
+        frame = null
+        refreshRelationshipHits()
+      })
     }
-    let best: WithSeconds<EfficiencyPoint> | undefined
-    let bestDistance = Infinity
-    for (const point of view.efficiencyDots) {
-      const dx = (point.ratio - targetX) / 5.5
-      const dy = (point.efficiencyPct - targetY) / Math.max(efficiencyMax, 1)
-      const distance = dx * dx + dy * dy
-      if (distance < bestDistance) { best = point; bestDistance = distance }
+    refresh()
+    const observer = new ResizeObserver(refresh)
+    observer.observe(body)
+    return () => {
+      observer.disconnect()
+      if (frame !== null) cancelAnimationFrame(frame)
+    }
+  }, [refreshRelationshipHits])
+
+  const nearestRelationship = useCallback((clientX: number, clientY: number): RelationshipSnap | undefined => {
+    const body = chartBodyRef.current
+    if (!body) return undefined
+    if (!relationshipHitsRef.current.length) refreshRelationshipHits()
+    const bodyRect = bodyRectRef.current ?? body.getBoundingClientRect()
+    bodyRectRef.current = bodyRect
+    const mouseX = clientX - bodyRect.left
+    const mouseY = clientY - bodyRect.top
+
+    let best: RelationshipSnap | undefined
+    let bestDistancePx2 = Infinity
+    for (const hit of relationshipHitsRef.current) {
+      const dx = hit.xPx - mouseX
+      const dy = hit.yPx - mouseY
+      const d2 = dx * dx + dy * dy
+      if (d2 < bestDistancePx2) {
+        bestDistancePx2 = d2
+        best = hit
+      }
     }
     return best
-  }, [config.id, view.ratioDots, view.efficiencyDots, scatterMax, efficiencyMax])
+  }, [refreshRelationshipHits])
 
   const hideHover = useCallback(() => {
     if (crosshairRef.current) crosshairRef.current.style.display = 'none'
@@ -368,7 +427,8 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
     if (readoutRef.current) readoutRef.current.style.display = 'none'
   }, [])
 
-  const updateHover = useCallback((hoverTime: number | null) => {
+  const updateHover = useCallback((hoverEvent: HoverEvent) => {
+    const hoverTime = hoverEvent.time
     const vertical = crosshairRef.current
     const horizontal = crosshairHRef.current
     const readout = readoutRef.current
@@ -376,15 +436,27 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
     const plotRect = plotRectRef.current
     if (!vertical || !bodyRect || !plotRect || hoverTime === null || windowEnd <= windowStart) { hideHover(); return }
 
+    let relationshipSnap = relationship && hoverEvent.sourceChartId === config.id ? hoverEvent.relationshipSnap : undefined
+    if (relationship && !relationshipSnap) {
+      let bestDelta = Infinity
+      for (const hit of relationshipHitsRef.current) {
+        const delta = Math.abs(hit.time - hoverTime)
+        if (delta < bestDelta) {
+          bestDelta = delta
+          relationshipSnap = hit
+        }
+      }
+    }
+
     let hovered: RpmPoint | ShiftPoint | RatioPoint | EfficiencyPoint | PowerRow | undefined
-    if (config.id === 'rpm1') hovered = findNearestTime(view.primaryRpm, hoverTime)
-    else if (config.id === 'rpm2') hovered = findNearestTime(view.secondaryRpm, hoverTime)
-    else if (config.id === 'shift') hovered = findNearestTime(view.shift, hoverTime)
-    else if (config.id === 'power') hovered = findNearestTime(view.power, hoverTime)
-    else if (config.id === 'efficiency') hovered = findNearestTime(view.efficiencyTime, hoverTime)
-    else if (config.id === 'shiftRatio') hovered = findNearestTime(view.ratioTime, hoverTime)
-    else if (config.id === 'scatter') hovered = findNearestTime(view.ratioDots, hoverTime)
-    else if (config.id === 'shiftEfficiency') hovered = findNearestTime(view.efficiencyDots, hoverTime)
+    if (!relationship) {
+      if (config.id === 'rpm1') hovered = findNearestTime(view.primaryRpm, hoverTime)
+      else if (config.id === 'rpm2') hovered = findNearestTime(view.secondaryRpm, hoverTime)
+      else if (config.id === 'shift') hovered = findNearestTime(view.shift, hoverTime)
+      else if (config.id === 'power') hovered = findNearestTime(view.power, hoverTime)
+      else if (config.id === 'efficiency') hovered = findNearestTime(view.efficiencyTime, hoverTime)
+      else if (config.id === 'shiftRatio') hovered = findNearestTime(view.ratioTime, hoverTime)
+    }
 
     if (!relationship) {
       const f = clamp01((hoverTime - windowStart) / (windowEnd - windowStart))
@@ -392,40 +464,34 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
       vertical.style.transform = `translate3d(${plotRect.left - bodyRect.left + f * plotRect.width}px,0,0)`
       if (horizontal) horizontal.style.display = 'none'
     } else {
-      if (!hovered || plotRect.height <= 0) { hideHover(); return }
-      let x = 0
-      let y = 0
-      if (config.id === 'scatter') {
-        const point = hovered as RatioPoint
-        x = point.rpm2 / scatterMax
-        y = 1 - point.rpm1 / scatterMax
-      } else {
-        const point = hovered as EfficiencyPoint
-        x = (point.ratio - 0.5) / 5.5
-        y = 1 - point.efficiencyPct / efficiencyMax
-      }
+      if (!relationshipSnap) { hideHover(); return }
+      // These are the real rendered SVG-circle centers measured from the chart body.
       vertical.style.display = 'block'
-      vertical.style.transform = `translate3d(${plotRect.left - bodyRect.left + clamp01(x) * plotRect.width}px,0,0)`
+      vertical.style.transform = `translate3d(${relationshipSnap.xPx}px,0,0)`
       if (horizontal) {
         horizontal.style.display = 'block'
-        horizontal.style.transform = `translate3d(0,${plotRect.top - bodyRect.top + clamp01(y) * plotRect.height}px,0)`
+        horizontal.style.transform = `translate3d(0,${relationshipSnap.yPx}px,0)`
       }
     }
 
-    if (!readout || !hovered) { if (readout) readout.style.display = 'none'; return }
+    if (!readout) return
+    if (relationshipSnap) {
+      readout.textContent = relationshipSnap.readout
+      readout.style.display = ''
+      return
+    }
+    if (!hovered) { readout.style.display = 'none'; return }
     let text = ''
     if (config.id === 'rpm1' || config.id === 'rpm2') text = `${formatNumber((hovered as RpmPoint).rpm)} RPM`
     else if (config.id === 'shift') text = `${formatNumber((hovered as ShiftPoint).value)}%`
     else if (config.id === 'power') {
-      const point = hovered as PowerRow
-      text = `Pri ${formatNumber(point.power1 ?? Number.NaN)} kW / Sec ${formatNumber(point.power2 ?? Number.NaN)} kW`
+      const p = hovered as PowerRow
+      text = `Pri ${formatNumber(p.power1 ?? Number.NaN)} kW / Sec ${formatNumber(p.power2 ?? Number.NaN)} kW`
     } else if (config.id === 'shiftRatio') text = formatNumber((hovered as RatioPoint).ratio, 3)
-    else if (config.id === 'scatter') { const point = hovered as RatioPoint; text = `Sec ${formatNumber(point.rpm2)} / Pri ${formatNumber(point.rpm1)}` }
     else if (config.id === 'efficiency') text = `${formatNumber((hovered as EfficiencyPoint).efficiencyPct)}%`
-    else if (config.id === 'shiftEfficiency') { const point = hovered as EfficiencyPoint; text = `Ratio ${formatNumber(point.ratio, 2)} / Eff ${formatNumber(point.efficiencyPct, 2)}%` }
     if (text) { readout.textContent = text; readout.style.display = '' }
     else readout.style.display = 'none'
-  }, [config.id, efficiencyMax, hideHover, relationship, scatterMax, view, windowEnd, windowStart])
+  }, [config.id, hideHover, relationship, view, windowEnd, windowStart])
 
   useEffect(() => hoverBus.subscribe(updateHover), [hoverBus, updateHover])
 
@@ -434,22 +500,18 @@ function AnalysisChartCard({ config, view, hoverBus, timeOrigin, windowStart, wi
     if (!rect || rect.width <= 0) return
     const fx = clamp01((event.clientX - rect.left) / rect.width)
     if (!relationship) {
-      hoverBus.publish(windowStart + fx * Math.max(0, windowEnd - windowStart))
+      hoverBus.publish({ time: windowStart + fx * Math.max(0, windowEnd - windowStart), sourceChartId: config.id })
       return
     }
-    if (rect.height <= 0) return
-    const fy = clamp01((event.clientY - rect.top) / rect.height)
-    const targetX = config.id === 'scatter' ? fx * scatterMax : 0.5 + fx * 5.5
-    const targetY = (1 - fy) * (config.id === 'scatter' ? scatterMax : efficiencyMax)
-    const nearest = nearestRelationship(targetX, targetY)
-    if (nearest) hoverBus.publish(nearest.time)
+    const nearest = nearestRelationship(event.clientX, event.clientY)
+    if (nearest) hoverBus.publish({ time: nearest.time, sourceChartId: config.id, relationshipSnap: nearest })
   }
 
   const headerControls = config.id === 'scatter' ? <div className="chart-ratio-inputs"><label className="ratio-input" style={{ color: '#d8a227' }}><span>Low ratio</span><input type="number" step="0.01" min="0" value={lowRatio} onChange={(event: ChangeEvent<HTMLInputElement>) => { const value = Number(event.target.value); if (Number.isFinite(value) && value > 0) onLowRatioChange(value) }} /></label><label className="ratio-input" style={{ color: '#3c8f88' }}><span>High ratio</span><input type="number" step="0.01" min="0" value={highRatio} onChange={(event: ChangeEvent<HTMLInputElement>) => { const value = Number(event.target.value); if (Number.isFinite(value) && value > 0) onHighRatioChange(value) }} /></label></div> : null
 
   return <article className="chart-card" onDragOver={(event: DragEvent<HTMLElement>) => event.preventDefault()} onDrop={onDrop}>
     <header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{headerControls}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header>
-    <div className="chart-body" ref={chartBodyRef} onMouseMove={handleMouseMove} onMouseLeave={() => hoverBus.publish(null)}>
+    <div className="chart-body" ref={chartBodyRef} onMouseMove={handleMouseMove} onMouseLeave={() => hoverBus.publish({ time: null, sourceChartId: null })}>
       <AnalysisPlot config={config} timeData={timeData} relationshipData={relationshipData} primaryObs={plotPrimaryObs} secondaryObs={plotSecondaryObs} xDomain={xDomain} visibleSpanMs={visibleSpanMs} scatterMax={plotScatterMax} efficiencyMax={plotEfficiencyMax} powerDomain={plotPowerDomain} lowRatio={plotLowRatio} highRatio={plotHighRatio} />
       <div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />
       {relationship && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}
