@@ -32,6 +32,8 @@ function matchesOurDevice(device: USBDevice): boolean {
 export class UsbTransport {
   private worker: Worker | null = null
   private connectedFlag = false
+  private nextFlushRequestId = 1
+  private flushWaiters = new Map<number, { resolve: () => void; reject: (error: Error) => void }>()
 
   constructor(private readonly handlers: UsbHandlers) {}
 
@@ -87,6 +89,16 @@ export class UsbTransport {
     this.worker.postMessage(sendMessage)
   }
 
+  async flush() {
+    if (!this.worker) return
+    const requestId = this.nextFlushRequestId++
+    await new Promise<void>((resolve, reject) => {
+      this.flushWaiters.set(requestId, { resolve, reject })
+      const message: WorkerInboundMessage = { type: 'flush', requestId }
+      this.worker?.postMessage(message)
+    })
+  }
+
   private handleMessage(event: MessageEvent<WorkerOutboundMessage>) {
     const message = event.data
     if (message.type === 'chunk') {
@@ -113,11 +125,17 @@ export class UsbTransport {
         // to the main thread (NOT how fast it drains USB, which is unthrottled -- see that file's
         // top comment), so a main thread that's genuinely behind naturally slows delivery instead
         // of an unbounded backlog piling up in the browser's own postMessage queue.
-        if (this.worker) { const ackMessage: WorkerInboundMessage = { type: 'ack' }; this.worker.postMessage(ackMessage) }
+        if (this.worker) { const ackMessage: WorkerInboundMessage = { type: 'ack', deliveryId: message.deliveryId, maxPacketOrdinal: message.maxPacketOrdinal }; this.worker.postMessage(ackMessage) }
       }
+    } else if (message.type === 'flushed') {
+      this.flushWaiters.get(message.requestId)?.resolve()
+      this.flushWaiters.delete(message.requestId)
     } else if (message.type === 'disconnected') {
       this.connectedFlag = false
       this.worker = null
+      const error = new Error(message.reason ?? 'USB device disconnected')
+      this.flushWaiters.forEach((waiter) => waiter.reject(error))
+      this.flushWaiters.clear()
       this.handlers.onText(message.reason ?? 'USB device disconnected')
     } else if (message.type === 'send-error') {
       this.handlers.onText(`[SEND ERROR] ${message.message}`)

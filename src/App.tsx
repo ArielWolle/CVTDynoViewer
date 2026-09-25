@@ -1,20 +1,21 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type SetStateAction } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, GripVertical, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ReferenceArea, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
-import { applyChannelUpdate, channelNames, createLiveDerivationState, csvHeader, defaultEngineTorqueCurve, deriveSample, encodeCommand, EXPECTED_PROTOCOL_VERSION, parseSamplesCsv, periodUsToRpm, rawLogHeader, rawLogRow, sampleToCsvRow, samplesToCsv, type ChannelId, type EngineTorquePoint, type LiveDerivationState, type PowerMode, type TelemetrySample } from './protocol'
+import { channelNames, defaultEngineTorqueCurve, deriveSample, encodeCommand, EXPECTED_PROTOCOL_VERSION, parseSamplesCsv, periodUsToRpm, type ChannelId, type EngineTorquePoint, type PowerMode, type TelemetrySample } from './protocol'
 import { UsbTransport } from './usbTransport'
 import { downsampleForChart } from './downsample'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { TimeRangeSlider } from './TimeRangeSlider'
+import { AnalysisClient } from './analysis/client'
+import { ANALYSIS_WINDOWS_MS, DEFAULT_ANALYSIS_WINDOW_MS, DEFAULT_SECONDARY_INERTIA_KG_M2, type AnalysisConfig, type AnalysisFrame, type RpmObservation, type RpmObservationMode } from './analysis/types'
+import { analysisFramesToCsv } from './analysis/exportCsv'
+import { isRawLogCsv, parseRawLogCsv } from './analysis/rawCsv'
+import { RawSessionLogger, type RawSessionMetadata } from './session/rawSessionLogger'
 
 type ChartId = 'scatter' | 'rpm1' | 'rpm2' | 'shift' | 'power' | 'efficiency' | 'shiftRatio' | 'shiftEfficiency'
 type ChartConfig = { id: ChartId; title: string; subtitle: string; color: string; visible: boolean }
-type MaField = 'rpm1' | 'rpm2' | 'power1' | 'power2' | 'efficiency' | 'shiftRatio'
-type MaEnabled = Record<MaField, boolean>
-const defaultMaEnabled: MaEnabled = { rpm1: true, rpm2: false, power1: false, power2: true, efficiency: false, shiftRatio: false }
-const maFieldLabels: Record<MaField, string> = { rpm1: 'Primary RPM', rpm2: 'Secondary RPM', power1: 'Primary power', power2: 'Secondary power', efficiency: 'Efficiency', shiftRatio: 'Shift ratio' }
-type ChartPoint = TelemetrySample & { seconds: number; shiftRatio: number } & Record<`${MaField}Avg`, number>
-type RawValues = Pick<TelemetrySample, 'rpm1' | 'rpm2' | 'shift' | 'torq1' | 'torq2'>
+type ChartPoint = AnalysisFrame & { seconds: number }
+type RpmObservationPoint = RpmObservation & { seconds: number }
 type ConsoleType = 'RPM1' | 'RPM2' | 'SHIFT' | 'TORQ1' | 'TORQ2' | 'READ CONFIG' | 'RPM TEST' | 'RPM COUNT TEST' | 'TEXT' | 'TX'
 type ConsoleMessage = { id: number; time: string; type: ConsoleType; data: string }
 type ConsoleSort = 'time' | 'type' | 'data'
@@ -30,49 +31,39 @@ const defaultCharts: ChartConfig[] = [
   { id: 'shiftRatio', title: 'Shift ratio', subtitle: 'Primary RPM / secondary RPM', color: '#7d5ba6', visible: true },
 ]
 
-const emptyRaw: RawValues = { rpm1: 0, rpm2: 0, shift: 0, torq1: 0, torq2: 0 }
 const SENSOR_RETENTION_MS = 300_000
-// Caps how many points any single chart actually renders (see downsample.ts) -- independent of
-// how many samples are retained/logged. 1500 is comfortably within where Recharts (SVG-based, no
-// built-in decimation) stays smooth on typical hardware, while still showing enough resolution
-// that a downsampled curve is visually indistinguishable from the full-fidelity one at a glance.
 const MAX_CHART_POINTS = 1500
 const MAX_CONSOLE_MESSAGES = 500
-// Default chart time-range window: starts pinned at 0s (showing everything so far) until this much
-// data exists, then becomes a rolling window of exactly this width tracking the live edge -- like a
-// scrolling oscilloscope trace -- until the user manually drags the range slider or picks "Full
-// range", at which point their selection is left alone (see ChartWorkspace's rangeStart/rangeEnd).
-const DEFAULT_LIVE_WINDOW_MS = 10000
-// The raw per-channel log is flushed to disk whichever comes first: this many bytes have piled up
-// in memory, or RAW_LOG_FLUSH_DEBOUNCE_MS has elapsed since the last flush. The byte threshold
-// matters specifically at high RPM edge rates (per-tooth streaming, see downsample.ts's comment)
-// -- without it, a fast burst would still sit in memory for the full debounce window before
-// becoming durable, which is exactly the latency this log is meant to minimize.
-const RAW_LOG_FLUSH_BYTES = 65_536
-const RAW_LOG_FLUSH_DEBOUNCE_MS = 200
-const KW_TO_HP = 1.341022
-// Full-throttle highlighting colors: a translucent band behind time-series charts while the
-// engine is at full throttle, and the same solid color for relationship-chart dots/points
-// recorded during it -- distinct from every existing series color in the app.
-const FULL_THROTTLE_COLOR = '#d92b2b'
-// Bumped from an initial 0.08 -- at that opacity the bands were technically rendering but only
-// as a barely-perceptible tint, easy to miss entirely at a glance (confirmed from a real
-// screenshot). This is deliberately strong enough to be unmistakable at a glance.
-const FULL_THROTTLE_BAND_FILL = 'rgba(217, 43, 43, 0.28)'
+const DEFAULT_LIVE_WINDOW_MS = 10_000
 
+const EMPTY_ANALYSIS_FRAME: AnalysisFrame = { time: 0, rpm1: 0, rpm2: 0, rpm1Sigma: 0, rpm2Sigma: 0, shift: 0, torq1: 0, torq2: 0, power1: 0, power2: 0, efficiency: Number.NaN, shiftRatio: 0, fullThrottle: false }
 
-function retainRecentSamples(history: TelemetrySample[], next: TelemetrySample): TelemetrySample[] {
+function retainRecentSamples(history: AnalysisFrame[], next: AnalysisFrame): AnalysisFrame[] {
   const cutoff = next.time - SENSOR_RETENTION_MS
   return [...history.filter((sample) => sample.time >= cutoff), next]
 }
 
-function makeDemoSample(index: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: TelemetrySample, inertiaKgM2 = 0.3134, torqueCurve: EngineTorquePoint[] = defaultEngineTorqueCurve as EngineTorquePoint[]): TelemetrySample {
+function appendRecentFrames(history: AnalysisFrame[], next: AnalysisFrame[]): AnalysisFrame[] {
+  if (!next.length) return history
+  const cutoff = next[next.length - 1].time - SENSOR_RETENTION_MS
+  return [...history.filter((sample) => sample.time >= cutoff), ...next.filter((sample) => sample.time >= cutoff)]
+}
+
+function appendRecentObservations(history: RpmObservation[], next: RpmObservation[]): RpmObservation[] {
+  if (!next.length) return history
+  const cutoff = next[next.length - 1].time - SENSOR_RETENTION_MS
+  return [...history.filter((sample) => sample.time >= cutoff), ...next.filter((sample) => sample.time >= cutoff)]
+}
+
+function legacySampleToAnalysisFrame(sample: TelemetrySample): AnalysisFrame {
+  return { ...sample, rpm1Sigma: 0, rpm2Sigma: 0, shiftRatio: sample.rpm2 !== 0 ? sample.rpm1 / sample.rpm2 : 0 }
+}
+
+function makeDemoSample(index: number, torqueScale: number, torqueOffset: number, powerMode: PowerMode = 'torque', previous?: AnalysisFrame, inertiaKgM2 = DEFAULT_SECONDARY_INERTIA_KG_M2, torqueCurve: EngineTorquePoint[] = defaultEngineTorqueCurve as EngineTorquePoint[]): AnalysisFrame {
   const phase = index / 10
-  // Synthesizes contiguous full-throttle bands correlated with the RPM peaks, purely so the
-  // highlighting feature (background bands / dot coloring) has something to visibly demonstrate
-  // without needing real hardware.
   const values = { time: index * 100, rpm1: Math.round(3200 + Math.sin(phase) * 720 + index * 3), rpm2: Math.round(2200 + Math.sin(phase - 0.5) * 500 + index * 2), shift: Math.round(35 + Math.sin(phase * 0.45) * 20), torq1: Math.round(380 + Math.sin(phase * 0.8) * 90), torq2: Math.round(305 + Math.sin(phase * 0.8 - 0.3) * 76), fullThrottle: Math.sin(phase) > 0.6 }
-  return deriveSample(values, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
+  const telemetryPrevious: TelemetrySample | undefined = previous ? { time: previous.time, rpm1: previous.rpm1, rpm2: previous.rpm2, shift: previous.shift, torq1: previous.torq1, torq2: previous.torq2, power1: previous.power1, power2: previous.power2, efficiency: previous.efficiency, fullThrottle: previous.fullThrottle } : undefined
+  return legacySampleToAnalysisFrame(deriveSample(values, torqueScale, torqueOffset, powerMode, telemetryPrevious, inertiaKgM2, torqueCurve))
 }
 
 function formatNumber(value: number, decimals = 0) { return value.toLocaleString(undefined, { maximumFractionDigits: decimals, minimumFractionDigits: decimals }) }
@@ -106,7 +97,7 @@ function App() {
   const [firmwareGitSha, setFirmwareGitSha] = useState<string | null>(null)
   const [firmwareProtocolVersion, setFirmwareProtocolVersion] = useState<number | null>(null)
   const [powerMode, setPowerMode] = useState<PowerMode>('inertia')
-  const [inertiaKgM2, setInertiaKgM2] = useState(0.3134)
+  const [inertiaKgM2, setInertiaKgM2] = useState(DEFAULT_SECONDARY_INERTIA_KG_M2)
   const [torqueCurve, setTorqueCurve] = useState<EngineTorquePoint[]>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('cvt-dyno-torque-curve') ?? 'null')
@@ -129,8 +120,8 @@ function App() {
   const [sessionName, setSessionName] = useState('baseline-pull')
   const [torqueScale, setTorqueScale] = useState(0.01)
   const [torqueOffset, setTorqueOffset] = useState(0)
-  const [channels, setChannels] = useState([true, true, true, true, true])
-  const [frequencies, setFrequencies] = useState([20, 20, 10, 50, 50])
+  const [channels, setChannels] = useState([true, true, true, true, true, true])
+  const [frequencies, setFrequencies] = useState([20, 20, 10, 50, 50, 0])
   // RPM tooth/spoke counts are a purely local display setting now -- the firmware streams a raw
   // per-tooth period for channels 0/1 and has no concept of tooth count at all anymore (see
   // periodUsToRpm() in protocol.ts), so these persist to localStorage like the other display
@@ -145,12 +136,15 @@ function App() {
   })
   const [playbackSamples, setPlaybackSamples] = useState<TelemetrySample[]>([])
   const [playbackFileName, setPlaybackFileName] = useState('')
+  const [rawPlaybackActive, setRawPlaybackActive] = useState(false)
   const [playbackElapsedMs, setPlaybackElapsedMs] = useState(0)
   const [playbackPlaying, setPlaybackPlaying] = useState(false)
   const [playbackSpeed, setPlaybackSpeed] = useState(1)
   const [playbackRangeStart, setPlaybackRangeStart] = useState(0)
   const [playbackRangeEnd, setPlaybackRangeEnd] = useState(1)
-  const [samples, setSamples] = useState<TelemetrySample[]>([])
+  const [samples, setSamples] = useState<AnalysisFrame[]>([])
+  const [primaryObservations, setPrimaryObservations] = useState<RpmObservation[]>([])
+  const [secondaryObservations, setSecondaryObservations] = useState<RpmObservation[]>([])
   // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
   // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
   // detect gaps with). This ONLY reveals loss AFTER a packet was already queued for transmission
@@ -164,23 +158,17 @@ function App() {
   // it ever reached the ring/USB (e.g. RpmCounter's ring buffer overflowing during a transient host
   // stall), distinct from droppedPackets above.
   const [lostEdges, setLostEdges] = useState<[number, number]>([0, 0])
-  const [raw, setRaw] = useState<RawValues>(emptyRaw)
   const [chartPlaying, setChartPlaying] = useState(true)
   const [frozenDomainEnd, setFrozenDomainEnd] = useState<number | null>(null)
   // Bumped whenever a new dataset (CSV) is loaded, so <ChartWorkspace key={chartResetKey}> remounts
   // fresh -- cleanly resetting its internal hover/drag/time-range-slider state without needing to
   // plumb individual reset callbacks down into it.
   const [chartResetKey, setChartResetKey] = useState(0)
-  const [maEnabled, setMaEnabled] = useState<MaEnabled>(() => {
-    try {
-      const stored = JSON.parse(localStorage.getItem('cvt-dyno-ma-enabled') ?? 'null')
-      return stored && typeof stored === 'object' ? { ...defaultMaEnabled, ...stored } : defaultMaEnabled
-    } catch { return defaultMaEnabled }
+  const [analysisWindowMs, setAnalysisWindowMs] = useState(() => {
+    const stored = Number(localStorage.getItem('cvt-dyno-analysis-window-ms'))
+    return ANALYSIS_WINDOWS_MS.includes(stored as typeof ANALYSIS_WINDOWS_MS[number]) ? stored : DEFAULT_ANALYSIS_WINDOW_MS
   })
-  const [maWindow, setMaWindow] = useState(() => {
-    const stored = Number(localStorage.getItem('cvt-dyno-ma-window'))
-    return Number.isFinite(stored) && stored >= 2 ? stored : 5
-  })
+  const [rpmObservationMode, setRpmObservationMode] = useState<RpmObservationMode>(() => localStorage.getItem('cvt-dyno-rpm-observation-mode') === 'tooth' ? 'tooth' : 'revolution')
   const [charts, setCharts] = useState<ChartConfig[]>(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('cvt-dyno-layout') ?? 'null') as ChartConfig[] | null
@@ -209,86 +197,39 @@ function App() {
   const [directoryName, setDirectoryName] = useState('Browser download')
   const transport = useRef<UsbTransport | null>(null)
   const directoryHandle = useRef<FileSystemDirectoryHandle | null>(null)
-  const logWriter = useRef<FileSystemWritableFileStream | null>(null)
-  const logCommitTimer = useRef<number | undefined>(undefined)
-  const logCommitInProgress = useRef(false)
-  const pendingLogRows = useRef('')
-  const lastLoggedDemoSampleTime = useRef<number | null>(null)
-  const logFileName = useRef('')
-  // Lossless per-channel raw log (long format, one line per packet, no forward-fill/resampling) --
-  // kept alongside the wide CSV so a channel running much faster than the others in the future
-  // (e.g. high-rate torque) never loses samples just because the wide format has to resample.
-  const rawLogWriter = useRef<FileSystemWritableFileStream | null>(null)
-  const rawLogCommitTimer = useRef<number | undefined>(undefined)
-  const rawLogCommitInProgress = useRef(false)
-  const pendingRawLogRows = useRef('')
-  const rawLogFileName = useRef('')
+  const rawLoggerRef = useRef<RawSessionLogger | null>(null)
+  if (!rawLoggerRef.current) rawLoggerRef.current = new RawSessionLogger((message) => setNotice(message))
+  const logStartedAtRef = useRef<string | null>(null)
   const consoleOutputRef = useRef<HTMLDivElement | null>(null)
   const consoleMessageId = useRef(0)
   const demoTimer = useRef<number | undefined>(undefined)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  // --- Live event-driven capture (real USB hardware) -------------------------------------
-  // Each incoming packet is handled and logged immediately (full rate, independent of React
-  // rendering); only the on-screen chart data is throttled/decimated, via `latestSampleRef`
-  // below, so pushing samples at the firmware's real rate can't stall or be capped by rendering.
-  const liveStateRef = useRef<LiveDerivationState>(createLiveDerivationState())
-  // Maps firmware time_us_64() timestamps to wall-clock ms, fixed from the first packet after
-  // connecting, so every sample's time is firmware-accurate (not receive-time-jittered) while
-  // still being comparable to Date.now()-based UI elements.
+  // --- Live event-driven capture ---------------------------------------------------------
+  // Raw disk logging is deliberately independent of the analysis worker. handleValue() appends the
+  // exact packet to RawSessionLogger before health accounting or analysis dispatch.
   const timeOffsetMsRef = useRef<number | null>(null)
-  const channelSeqRef = useRef<number[]>([-1, -1, -1, -1, -1])
+  const channelSeqRef = useRef<number[]>([-1, -1, -1, -1, -1, -1])
   const droppedPacketsRef = useRef(0)
-  // Last-seen physical edge counter per RPM channel (index 0/1 only -- see protocol.ts's
-  // edgeCount comment), and the running per-channel lost-edge tally derived from gaps in it. -1
-  // means "no edge counter observed yet this connection" (or since the last reset), matching
-  // channelSeqRef's convention above -- the very first observed value can't be gap-checked against
-  // anything. Reset to -1 whenever a channel reports periodUs===0 (stopped): that's a fresh epoch
-  // on the firmware side (see RpmCounter.cpp's checkStale()), so comparing across it would produce
-  // a spurious "gap" that isn't real loss.
   const lastEdgeCountRef = useRef<number[]>([-1, -1])
   const lostEdgesRef = useRef<[number, number]>([0, 0])
-  // Only the most recently derived sample matters for the throttled display flush below (it reads
-  // the LATEST value every tick, discarding everything else) -- tracked as a single ref instead of
-  // an array that gets pushed to on every packet and thrown away every ~33ms. At high edge rates
-  // (per-tooth RPM streaming, up to ~1-2 kHz per channel) that used to mean building and discarding
-  // an array of hundreds-to-thousands of entries per flush tick for nothing; a direct overwrite is
-  // O(1) regardless of packet rate, removing that entirely from the hot path.
-  const latestSampleRef = useRef<TelemetrySample | null>(null)
   const pendingConsoleLinesRef = useRef<string[]>([])
-
-  // Mirrors of settings that the live USB packet handler needs to read. The handler is
-  // captured once into the UsbTransport instance when `connect()` runs, so if it closed over
-  // component state directly it would keep using whatever those values were *at connect time*
-  // even after the user changes them mid-session. Refs updated on every change avoid that.
-  const torqueScaleRef = useRef(torqueScale)
-  const torqueOffsetRef = useRef(torqueOffset)
-  const powerModeRef = useRef(powerMode)
-  const inertiaKgM2Ref = useRef(inertiaKgM2)
-  const torqueCurveRef = useRef(torqueCurve)
   const primarySpokesRef = useRef(primarySpokes)
   const secondarySpokesRef = useRef(secondarySpokes)
-  const loggingRef = useRef(logging)
   const isPlaybackActiveRef = useRef(false)
   const showSensorConsoleRef = useRef(showSensorConsole)
+  const analysisClientRef = useRef<AnalysisClient | null>(null)
 
-  const current = samples[samples.length - 1] ?? deriveSample({ time: 0, ...raw }, torqueScale, torqueOffset, powerMode, undefined, inertiaKgM2, torqueCurve)
-  const isPlaybackActive = playbackSamples.length > 0
-  // See EXPECTED_PROTOCOL_VERSION's comment in protocol.ts. Only meaningful once connected and the
-  // firmware has actually reported a version (older firmware -- from before this existed -- simply
-  // never sends the line at all, leaving firmwareProtocolVersion null forever; that's a real gap
-  // this can't detect, but is far less likely once every firmware build reports itself).
+  const current = samples[samples.length - 1] ?? EMPTY_ANALYSIS_FRAME
+  const isPlaybackActive = rawPlaybackActive || playbackSamples.length > 0
   const protocolMismatch = connected && firmwareProtocolVersion !== null && firmwareProtocolVersion !== EXPECTED_PROTOCOL_VERSION
-  // Recompute power/efficiency from the CSV's raw RPM/torque columns using the current power
-  // mode, torque conversion, inertia value, and torque curve, so playback reflects live edits
-  // to those settings instead of only replaying whatever was recorded at log time.
-  const derivedPlaybackSamples = useMemo(() => {
+  const derivedPlaybackFrames = useMemo(() => {
     if (!playbackSamples.length) return []
     let previous: TelemetrySample | undefined
     return playbackSamples.map((sample) => {
       const derived = deriveSample(sample, torqueScale, torqueOffset, powerMode, previous, inertiaKgM2, torqueCurve)
       previous = derived
-      return derived
+      return legacySampleToAnalysisFrame(derived)
     })
   }, [playbackSamples, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve])
   const playbackDurationMs = playbackSamples.length ? playbackSamples[playbackSamples.length - 1].time - playbackSamples[0].time : 0
@@ -299,140 +240,68 @@ function App() {
     return samples.filter((sample) => sample.time <= frozenDomainEnd)
   }, [samples, chartPlaying, frozenDomainEnd])
   const domainStart = displaySamples[0]?.time ?? 0
-  // The full derived dataset (moving averages, cascaded power, etc.) computed once over every
-  // buffered/retained sample -- NOT windowed to the currently selected time-range-slider view.
-  // Windowing is a separate, much cheaper filter step (see ChartWorkspace) so dragging the range
-  // slider's handles doesn't re-run this whole (comparatively expensive) pipeline on every tick;
-  // it's also more correct, since a trailing moving average shouldn't reset just because the user
-  // scrolled/zoomed the display window.
-  const derivedFullData = useMemo(() => {
-    const windowed = displaySamples
-    if (!windowed.length) return []
-    const windowSize = Math.max(1, Math.round(maWindow))
-
-    // O(n) trailing moving average via a sliding-window sum.
-    function trailingAverage(values: number[]): number[] {
-      const result = new Array<number>(values.length)
-      let sum = 0
-      for (let index = 0; index < values.length; index += 1) {
-        sum += values[index]
-        if (index >= windowSize) sum -= values[index - windowSize]
-        result[index] = sum / Math.min(windowSize, index + 1)
-      }
-      return result
-    }
-
-    // Moving averages propagate into calculated series: enabling primary RPM's average feeds the
-    // smoothed RPM into the power and shift-ratio calculations, enabling power's average feeds the
-    // smoothed power into efficiency, and so on -- matching how the raw values are actually derived.
-    const rpm1Raw = windowed.map((sample) => sample.rpm1)
-    const rpm2Raw = windowed.map((sample) => sample.rpm2)
-    const rpm1AvgArr = trailingAverage(rpm1Raw)
-    const rpm2AvgArr = trailingAverage(rpm2Raw)
-    const rpm1Eff = maEnabled.rpm1 ? rpm1AvgArr : rpm1Raw
-    const rpm2Eff = maEnabled.rpm2 ? rpm2AvgArr : rpm2Raw
-
-    let previousCascaded: { time: number; rpm1: number; rpm2: number } | undefined
-    const power1Cascaded: number[] = []
-    const power2Cascaded: number[] = []
-    windowed.forEach((sample, index) => {
-      const derived = deriveSample(
-        { time: sample.time, rpm1: rpm1Eff[index], rpm2: rpm2Eff[index], shift: sample.shift, torq1: sample.torq1, torq2: sample.torq2 },
-        torqueScale, torqueOffset, powerMode, previousCascaded, inertiaKgM2, torqueCurve,
-      )
-      power1Cascaded.push(derived.power1)
-      power2Cascaded.push(derived.power2)
-      previousCascaded = { time: sample.time, rpm1: rpm1Eff[index], rpm2: rpm2Eff[index] }
-    })
-    const power1AvgArr = trailingAverage(power1Cascaded)
-    const power2AvgArr = trailingAverage(power2Cascaded)
-    const power1Eff = maEnabled.power1 ? power1AvgArr : windowed.map((sample) => sample.power1)
-    const power2Eff = maEnabled.power2 ? power2AvgArr : windowed.map((sample) => sample.power2)
-
-    const shiftRatioRaw = windowed.map((sample) => (sample.rpm2 !== 0 ? sample.rpm1 / sample.rpm2 : 0))
-    const shiftRatioCascaded = windowed.map((_sample, index) => (rpm2Eff[index] !== 0 ? rpm1Eff[index] / rpm2Eff[index] : 0))
-    const shiftRatioAvgArr = trailingAverage(shiftRatioCascaded)
-
-    const efficiencyCascaded = windowed.map((_sample, index) => (power1Eff[index] > 0 ? Math.min(150, (power2Eff[index] / power1Eff[index]) * 100) : 0))
-    const efficiencyAvgArr = trailingAverage(efficiencyCascaded)
-
-    return windowed.map((sample, index) => ({
-      ...sample,
-      seconds: (sample.time - domainStart) / 1000,
-      shiftRatio: shiftRatioRaw[index],
-      rpm1Avg: rpm1AvgArr[index],
-      rpm2Avg: rpm2AvgArr[index],
-      power1Avg: power1AvgArr[index],
-      power2Avg: power2AvgArr[index],
-      efficiencyAvg: efficiencyAvgArr[index],
-      shiftRatioAvg: shiftRatioAvgArr[index],
-    }))
-  }, [displaySamples, domainStart, maWindow, maEnabled, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve])
-
+  const derivedFullData = useMemo(() => displaySamples.map((sample) => ({ ...sample, seconds: (sample.time - domainStart) / 1000 })), [displaySamples, domainStart])
+  const analysisConfig = useMemo<AnalysisConfig>(() => ({
+    windowMs: analysisWindowMs,
+    primaryTeeth: primarySpokes,
+    secondaryTeeth: secondarySpokes,
+    secondaryInertiaKgM2: inertiaKgM2,
+    torqueCurve: [...torqueCurve],
+    powerMode,
+    torqueScale,
+    torqueOffset,
+    observationMode: rpmObservationMode,
+  }), [analysisWindowMs, primarySpokes, secondarySpokes, inertiaKgM2, torqueCurve, powerMode, torqueScale, torqueOffset, rpmObservationMode])
 
   useEffect(() => { localStorage.setItem('cvt-dyno-layout', JSON.stringify(charts)) }, [charts])
   useEffect(() => { localStorage.setItem('cvt-dyno-torque-curve', JSON.stringify(torqueCurve)) }, [torqueCurve])
-  useEffect(() => { localStorage.setItem('cvt-dyno-ma-enabled', JSON.stringify(maEnabled)) }, [maEnabled])
-  useEffect(() => { localStorage.setItem('cvt-dyno-ma-window', String(maWindow)) }, [maWindow])
+  useEffect(() => { localStorage.setItem('cvt-dyno-analysis-window-ms', String(analysisWindowMs)) }, [analysisWindowMs])
+  useEffect(() => { localStorage.setItem('cvt-dyno-rpm-observation-mode', rpmObservationMode) }, [rpmObservationMode])
   useEffect(() => { localStorage.setItem('cvt-dyno-low-ratio', String(lowRatio)) }, [lowRatio])
   useEffect(() => { localStorage.setItem('cvt-dyno-high-ratio', String(highRatio)) }, [highRatio])
-  useEffect(() => { localStorage.setItem('cvt-dyno-highlight-full-throttle', String(highlightFullThrottle)) }, [highlightFullThrottle])
   useEffect(() => { localStorage.setItem('cvt-dyno-primary-teeth', String(primarySpokes)) }, [primarySpokes])
   useEffect(() => { localStorage.setItem('cvt-dyno-secondary-teeth', String(secondarySpokes)) }, [secondarySpokes])
-  useEffect(() => { torqueScaleRef.current = torqueScale }, [torqueScale])
-  useEffect(() => { torqueOffsetRef.current = torqueOffset }, [torqueOffset])
-  useEffect(() => { powerModeRef.current = powerMode }, [powerMode])
-  useEffect(() => { inertiaKgM2Ref.current = inertiaKgM2 }, [inertiaKgM2])
-  useEffect(() => { torqueCurveRef.current = torqueCurve }, [torqueCurve])
   useEffect(() => { primarySpokesRef.current = primarySpokes }, [primarySpokes])
   useEffect(() => { secondarySpokesRef.current = secondarySpokes }, [secondarySpokes])
-  useEffect(() => { loggingRef.current = logging }, [logging])
   useEffect(() => { isPlaybackActiveRef.current = isPlaybackActive }, [isPlaybackActive])
   useEffect(() => { showSensorConsoleRef.current = showSensorConsole }, [showSensorConsole])
+  useEffect(() => {
+    const client = new AnalysisClient(analysisConfig, (update) => {
+      if (update.type === 'replace') {
+        setSamples(update.snapshot.frames)
+        setPrimaryObservations(update.snapshot.primaryObservations)
+        setSecondaryObservations(update.snapshot.secondaryObservations)
+      } else {
+        if (update.snapshot.frames.length) setSamples((history) => appendRecentFrames(history, update.snapshot.frames))
+        if (update.snapshot.primaryObservations.length) setPrimaryObservations((history) => appendRecentObservations(history, update.snapshot.primaryObservations))
+        if (update.snapshot.secondaryObservations.length) setSecondaryObservations((history) => appendRecentObservations(history, update.snapshot.secondaryObservations))
+      }
+    })
+    analysisClientRef.current = client
+    return () => { client.terminate(); if (analysisClientRef.current === client) analysisClientRef.current = null }
+    // Initial worker creation only; configuration changes use the effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  useEffect(() => { analysisClientRef.current?.configure(analysisConfig) }, [analysisConfig])
   useEffect(() => {
     if (!playbackPlaying || !playbackSamples.length) return
     const timer = window.setInterval(() => { setPlaybackElapsedMs((elapsed) => Math.min(playbackEndBoundMs, elapsed + 100 * playbackSpeed)) }, 100)
     return () => window.clearInterval(timer)
   }, [playbackPlaying, playbackSpeed, playbackSamples, playbackEndBoundMs])
   useEffect(() => {
-    if (!derivedPlaybackSamples.length) return
-    const start = derivedPlaybackSamples[0].time
+    if (!derivedPlaybackFrames.length) return
+    const start = derivedPlaybackFrames[0].time
     const cutoff = start + playbackElapsedMs
-    let index = derivedPlaybackSamples.length - 1
-    for (let sampleIndex = 0; sampleIndex < derivedPlaybackSamples.length; sampleIndex += 1) {
-      if (derivedPlaybackSamples[sampleIndex].time > cutoff) { index = Math.max(0, sampleIndex - 1); break }
+    let index = derivedPlaybackFrames.length - 1
+    for (let sampleIndex = 0; sampleIndex < derivedPlaybackFrames.length; sampleIndex += 1) {
+      if (derivedPlaybackFrames[sampleIndex].time > cutoff) { index = Math.max(0, sampleIndex - 1); break }
     }
-    setSamples(derivedPlaybackSamples.slice(0, index + 1))
+    setSamples(derivedPlaybackFrames.slice(0, index + 1))
     if (playbackPlaying && playbackElapsedMs >= playbackEndBoundMs) setPlaybackPlaying(false)
-  }, [derivedPlaybackSamples, playbackElapsedMs, playbackPlaying, playbackEndBoundMs])
+  }, [derivedPlaybackFrames, playbackElapsedMs, playbackPlaying, playbackEndBoundMs])
   useEffect(() => {
-    // Live USB hardware logs directly at full rate from the packet handler (see `handleValue`)
-    // instead of here, since watching the (now decimated-for-display) `samples` state would both
-    // cap logged resolution to the display rate and double-log against the packet handler's own
-    // writes. This path stays in service only for demo-mode sample logging, which has no discrete
-    // per-channel packets to hook into.
-    if (!logging || !logWriter.current || connected) return
-    const newSamples = samples.filter((sample) => lastLoggedDemoSampleTime.current === null || sample.time > lastLoggedDemoSampleTime.current)
-    if (!newSamples.length) return
-    const rows = newSamples.map((sample) => sampleToCsvRow(sample, torqueScale, torqueOffset)).join('\n') + '\n'
-    lastLoggedDemoSampleTime.current = newSamples[newSamples.length - 1].time
-    pendingLogRows.current += rows
-    if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
-  }, [logging, samples, connected])
-  useEffect(() => {
-    // Live USB display/console throttle: real packets arrive (and are logged) at full rate in
-    // `handleValue`, independent of rendering. This interval instead periodically drains a small
-    // buffer into React state at a fixed, render-friendly cadence -- charts get a smooth but
-    // decimated view, and the sensor console gets batched updates instead of one re-render per
-    // packet, so neither can be starved by (or itself cause) a render backlog.
     if (!connected) return
     const flush = () => {
-      const latest = latestSampleRef.current
-      if (latest) {
-        latestSampleRef.current = null
-        setSamples((history) => retainRecentSamples(history, latest))
-        setRaw({ rpm1: latest.rpm1, rpm2: latest.rpm2, shift: latest.shift, torq1: latest.torq1, torq2: latest.torq2 })
-      }
       const consoleLinesToFlush = pendingConsoleLinesRef.current
       if (consoleLinesToFlush.length) {
         pendingConsoleLinesRef.current = []
@@ -441,7 +310,7 @@ function App() {
       setDroppedPackets(droppedPacketsRef.current)
       setLostEdges([...lostEdgesRef.current])
     }
-    const timer = window.setInterval(flush, 33) // ~30 Hz display refresh
+    const timer = window.setInterval(flush, 33)
     return () => { window.clearInterval(timer); flush() }
   }, [connected])
   useEffect(() => {
@@ -459,28 +328,29 @@ function App() {
     }, 100)
     return () => window.clearInterval(demoTimer.current)
   }, [demoMode, connected, torqueScale, torqueOffset, powerMode, inertiaKgM2, torqueCurve, isPlaybackActive])
-  useEffect(() => () => { window.clearTimeout(logCommitTimer.current); window.clearTimeout(rawLogCommitTimer.current); void commitLog(false); void commitRawLog(false); void transport.current?.disconnect() }, [])
+  useEffect(() => () => { void rawLoggerRef.current?.stop(); void transport.current?.disconnect() }, [])
 
   async function connect() {
     try {
       const next = new UsbTransport({ onValue: handleValue, onPacket: handleUsbPacket, onText: handleUsbText })
-      liveStateRef.current = createLiveDerivationState()
       timeOffsetMsRef.current = null
-      channelSeqRef.current = [-1, -1, -1, -1, -1]
+      channelSeqRef.current = [-1, -1, -1, -1, -1, -1]
       droppedPacketsRef.current = 0
       lastEdgeCountRef.current = [-1, -1]
       lostEdgesRef.current = [0, 0]
-      latestSampleRef.current = null
       pendingConsoleLinesRef.current = []
+      analysisClientRef.current?.reset()
+      setPrimaryObservations([])
+      setSecondaryObservations([])
       // Cleared on every fresh connect (not just at app startup) so stale info from a previously
       // connected device -- or a firmware that hadn't been reflashed with this feature yet -- can
       // never be mistaken for the currently connected device's actual identity.
       setFirmwareGitSha(null)
       setFirmwareProtocolVersion(null)
-      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setRaw(emptyRaw); setPlaybackSamples([]); setPlaybackPlaying(false); setPlaybackFileName(''); setPlaybackElapsedMs(0); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
+      await next.connect(); transport.current = next; setConnected(true); setDemoMode(false); setFirmwareDemoMode(false); setSamples([]); setPlaybackSamples([]); setRawPlaybackActive(false); setPlaybackPlaying(false); setPlaybackFileName(''); setPlaybackElapsedMs(0); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to USB device') }
   }
-  async function disconnect() { await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setFirmwareGitSha(null); setFirmwareProtocolVersion(null); setNotice('Device disconnected') }
+  async function disconnect() { if (logging) await stopLogging(); await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setFirmwareGitSha(null); setFirmwareProtocolVersion(null); setNotice('Device disconnected') }
   function consoleTimestamp() {
     const now = new Date()
     return `${now.toLocaleTimeString([], { hour12: false })}.${String(now.getMilliseconds()).padStart(3, '0')}`
@@ -679,30 +549,19 @@ function App() {
       setNotice(enabled ? 'RPM count test enabled' : 'RPM count test disabled')
     } catch { setNotice('Could not change RPM count test mode') }
   }
-  // Event-driven: fires on every decoded packet from any channel, at whatever rate the firmware
-  // is configured to send it -- there is no coalescing timer here (the old 50 ms one hard-capped
-  // the whole pipeline at 20 Hz regardless of firmware rate, and was the primary reason 50 Hz RPM
-  // never actually showed up in captured data). A wide sample row is produced immediately with
-  // the other channels' latest known values forward-filled in, logged at full rate, and buffered
-  // for the throttled display path -- none of that work is gated on or blocked by rendering.
+  // Event-driven raw-first capture. The exact packet is queued for durable logging before
+  // health accounting, display work, or analysis dispatch. Analysis therefore cannot compromise
+  // the source-of-truth recording path.
   function handleValue(channel: ChannelId, value: number, tUs: number, seq: number, edgeCount: number) {
-    if (isPlaybackActiveRef.current) return
     const receivedAtMs = performance.timeOrigin + performance.now()
-
-    // Map firmware time_us_64() to wall-clock ms once, from the first packet after connecting.
-    // Packets from firmware built before this protocol update report tUs === 0; fall back to
-    // receive time for those instead of mapping through a bogus zero offset.
     let sampleTimeMs = receivedAtMs
     if (tUs > 0) {
       if (timeOffsetMsRef.current === null) timeOffsetMsRef.current = receivedAtMs - tUs / 1000
       sampleTimeMs = timeOffsetMsRef.current + tUs / 1000
     }
 
-    // Per-channel rolling sequence number (0..255, wraps) lets downstream/USB-transmission loss be
-    // detected and surfaced instead of silently vanishing: a gap here means N packets were
-    // successfully built (tx_seq assigned) and written to USB, but never received. This can only
-    // reveal loss AFTER a packet was already queued for transmission -- see the edgeCount block
-    // right below for the other, previously-invisible kind of loss.
+    rawLoggerRef.current?.append(channel, value, tUs, sampleTimeMs, seq, edgeCount)
+
     const expectedSeq = channelSeqRef.current[channel]
     let seqGap = 0
     if (tUs > 0 && expectedSeq !== -1) {
@@ -710,28 +569,9 @@ function App() {
       if (seqGap > 0) droppedPacketsRef.current += seqGap
     }
     channelSeqRef.current[channel] = seq
-
-    // Per-RPM-channel physical edge counter (protocol v3+, see protocol.ts's edgeCount comment)
-    // additionally reveals loss that happens BEFORE a packet is ever built at all (e.g. the
-    // firmware's ring buffer overflowing) -- edgeCount is assigned at ISR time, strictly before
-    // tx_seq is ever assigned at transmit time, so a ring-dropped edge never reaches tx_seq and is
-    // completely invisible to the seq-gap check above on its own.
-    //
-    // Every edge that DOES get transmitted increments both edgeCount and seq together, so any
-    // downstream/USB loss (a seq gap) inherently ALSO shows up as an edge-count gap of the exact
-    // same size -- edgeCount can never advance less than seq between two received packets.
-    // Subtracting the already-counted seqGap from the raw edge-count gap isolates only the loss
-    // seqGap can't explain (edges that never even reached the point of being assigned a sequence
-    // number), keeping the two metrics mutually exclusive instead of double-counting the same lost
-    // edge under both "dropped" and "lost (device)".
-    //
-    // Reset whenever this channel reports periodUs===0 (stopped): that's a fresh epoch on the
-    // firmware side (see RpmCounter.cpp's checkStale()), so the edge count right after a restart
-    // can't be meaningfully compared to whatever came before the stop.
     if (channel === 0 || channel === 1) {
-      if (value === 0) {
-        lastEdgeCountRef.current[channel] = -1
-      } else {
+      if (value === 0) lastEdgeCountRef.current[channel] = -1
+      else {
         const lastEdgeCount = lastEdgeCountRef.current[channel]
         if (lastEdgeCount !== -1) {
           const edgeGap = (edgeCount - lastEdgeCount - 1) >>> 0
@@ -742,49 +582,8 @@ function App() {
       }
     }
 
-    // Raw per-channel logging is the single highest-priority thing this handler does: it's queued
-    // immediately from the packet's own fields (channel/value/tUs/seq), BEFORE the wide-row
-    // derivation below or anything display-related, so it has zero dependency on -- and can never
-    // be delayed by -- applyChannelUpdate()'s computation or the display buffer. It's also flushed
-    // to disk sooner and on a shorter fuse than the derived CSV (see commitRawLog()/
-    // RAW_LOG_FLUSH_BYTES below): this is the lossless source-of-truth capture, so minimizing how
-    // long it sits only in memory (rather than durably on disk) matters more for it than for the
-    // resampled/display-oriented wide CSV.
-    //
-    // Gated ONLY on loggingRef, deliberately NOT on rawLogWriter.current being non-null:
-    // commitRawLog() sets the writer to null for the entire close()->reopen() async window (several
-    // event-loop turns), and packets arriving during that window used to be silently dropped from
-    // the log even though they were processed normally otherwise -- a real, confirmed source of the
-    // "sequence gaps" seen in captured raw CSVs that were actually just missing rows, not real
-    // device/USB loss. Accumulation now depends only on whether logging is on; the writer's
-    // presence only gates when a flush can actually reach disk (see commitRawLog()), and anything
-    // queued during a reopen gets picked up by the very next flush once the writer comes back.
-    if (loggingRef.current) {
-      pendingRawLogRows.current += rawLogRow(channel, value, tUs, sampleTimeMs, seq, edgeCount) + '\n'
-      if (pendingRawLogRows.current.length >= RAW_LOG_FLUSH_BYTES) {
-        window.clearTimeout(rawLogCommitTimer.current)
-        rawLogCommitTimer.current = undefined
-        void commitRawLog(true)
-      } else if (rawLogCommitTimer.current === undefined) {
-        rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
-      }
-    }
-
-    const sample = applyChannelUpdate(
-      liveStateRef.current, channel, value, sampleTimeMs,
-      torqueScaleRef.current, torqueOffsetRef.current, powerModeRef.current, inertiaKgM2Ref.current, torqueCurveRef.current,
-      primarySpokesRef.current, secondarySpokesRef.current,
-    )
-
-    latestSampleRef.current = sample
-
-    // Same reasoning as the raw log above: gated only on loggingRef, not on logWriter.current, so a
-    // row derived while commitLog() has the writer nulled out during its own close/reopen window
-    // still gets queued instead of silently lost.
-    if (loggingRef.current) {
-      pendingLogRows.current += sampleToCsvRow(sample, torqueScaleRef.current, torqueOffsetRef.current) + '\n'
-      if (logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
-    }
+    if (isPlaybackActiveRef.current) return
+    analysisClientRef.current?.push({ channel, value, tUs, seq, edgeCount })
   }
   // RPM channels (0/1) are edge-triggered now, not polled -- command 0x02 (target frequency) is
   // vestigial for them (see the firmware's cfg_freq[] comment), so it's simply never sent for
@@ -793,7 +592,7 @@ function App() {
   async function sendConfig(channel: number, enabled: boolean, frequency: number) {
     if (!transport.current) return
     await transport.current.send(encodeCommand(1, channel, enabled ? 1 : 0))
-    if (channel > 1) await transport.current.send(encodeCommand(2, channel, frequency))
+    if (channel >= 2 && channel <= 4) await transport.current.send(encodeCommand(2, channel, frequency))
   }
   function updateChannel(channel: number, enabled: boolean) {
     setChannels((previous) => previous.map((value, index) => index === channel ? enabled : value))
@@ -817,180 +616,59 @@ function App() {
     if (channel === 0) setPrimarySpokes(spokes)
     else setSecondarySpokes(spokes)
   }
-  async function downloadCsv(sourceSamples: TelemetrySample[] = samples, baseName: string = sessionName || 'cvt-dyno-session') {
-    const csv = samplesToCsv(sourceSamples, torqueScale, torqueOffset)
+  async function downloadProcessedCsv(sourceFrames: AnalysisFrame[] = samples, baseName: string = sessionName || 'cvt-dyno-session') {
+    const csv = analysisFramesToCsv(sourceFrames)
+    const name = `${baseName}-processed-${analysisWindowMs}ms.csv`
     if (directoryHandle.current) {
-      const file = await directoryHandle.current.getFileHandle(`${baseName}.csv`, { create: true })
+      const file = await directoryHandle.current.getFileHandle(name, { create: true })
       const writable = await file.createWritable(); await writable.write(csv); await writable.close()
-      setNotice(`Saved ${sourceSamples.length.toLocaleString()} samples to ${directoryHandle.current.name}`)
+      setNotice(`Saved ${sourceFrames.length.toLocaleString()} processed frames to ${directoryHandle.current.name}`)
       return
     }
-    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${baseName}.csv`; anchor.click(); URL.revokeObjectURL(url); setNotice(`Downloaded ${sourceSamples.length.toLocaleString()} samples`)
+    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const anchor = document.createElement('a'); anchor.href = url; anchor.download = name; anchor.click(); URL.revokeObjectURL(url); setNotice(`Downloaded ${sourceFrames.length.toLocaleString()} processed frames`)
   }
-  async function saveRecalculatedCsv() {
-    if (!derivedPlaybackSamples.length) { setNotice('Load a CSV before saving recalculated values'); return }
-    const baseName = `${(playbackFileName || 'cvt-dyno-session').replace(/\.csv$/i, '')}-recalculated`
-    await downloadCsv(derivedPlaybackSamples, baseName)
-  }
+  async function saveRecalculatedCsv() { await downloadProcessedCsv(samples, (playbackFileName || 'cvt-dyno-session').replace(/\.csv$/i, '')) }
   async function chooseDirectory(): Promise<FileSystemDirectoryHandle | null> {
-    if (!window.showDirectoryPicker) { setNotice('Chrome folder access is unavailable in this browser; CSV download remains available'); return null }
-    try {
-      directoryHandle.current = await window.showDirectoryPicker()
-      setDirectoryName(directoryHandle.current.name)
-      setNotice(`Folder access granted: ${directoryHandle.current.name}`)
-      return directoryHandle.current
-    } catch { setNotice('Folder selection cancelled'); return null }
+    if (!window.showDirectoryPicker) { setNotice('Chrome folder access is required for lossless raw logging'); return null }
+    try { directoryHandle.current = await window.showDirectoryPicker(); setDirectoryName(directoryHandle.current.name); setNotice(`Folder access granted: ${directoryHandle.current.name}`); return directoryHandle.current } catch { setNotice('Folder selection cancelled'); return null }
   }
-  async function nextLogFileName(directory: FileSystemDirectoryHandle): Promise<string> {
-    const base = (sessionName.trim() || 'cvt-dyno-session').replace(/[<>:"/\\|?*]/g, '-')
-    for (let index = 1; index < 10000; index += 1) {
-      const name = index === 1 ? `${base}.csv` : `${base}-${index}.csv`
-      try { await directory.getFileHandle(name); } catch { return name }
-    }
-    throw new Error('Could not find an available log filename')
-  }
-  async function openLogWriter(directory: FileSystemDirectoryHandle, name: string) {
-    const file = await directory.getFileHandle(name, { create: true })
-    const writer = await file.createWritable({ keepExistingData: true })
-    await writer.seek((await file.getFile()).size)
-    logWriter.current = writer
-  }
-  async function commitLog(reopen: boolean) {
-    if (logCommitInProgress.current || !logWriter.current || !pendingLogRows.current) return
-    logCommitInProgress.current = true
-    const rows = pendingLogRows.current
-    pendingLogRows.current = ''
-    const writer = logWriter.current
-    try {
-      await writer.write(rows)
-      await writer.close()
-      logWriter.current = null
-      if (reopen && directoryHandle.current) await openLogWriter(directoryHandle.current, logFileName.current)
-    } catch {
-      // Same class of bug as the reopen-window fix above, different trigger: if write()/close()
-      // itself throws (disk full, permission revoked mid-session, the drive unplugged), `rows` was
-      // already cleared from pendingLogRows before the attempt -- without putting it back, that
-      // whole batch is lost forever instead of just delayed. Prepending (not appending) preserves
-      // chronological order against anything that accumulated in the meantime. The writer is also
-      // left in an unknown state after a failed write/close, so it's nulled out here too --
-      // otherwise every future flush would keep hitting the same broken writer indefinitely instead
-      // of getting a chance to open a fresh one on the next attempt.
-      pendingLogRows.current = rows + pendingLogRows.current
-      logWriter.current = null
-      setNotice('Could not commit the log file')
-      if (reopen && directoryHandle.current) await openLogWriter(directoryHandle.current, logFileName.current).catch(() => undefined)
-    }
-    finally {
-      logCommitInProgress.current = false
-      if (reopen && pendingLogRows.current && logCommitTimer.current === undefined) logCommitTimer.current = window.setTimeout(() => { logCommitTimer.current = undefined; void commitLog(true) }, 500)
-    }
-  }
-  async function openRawLogWriter(directory: FileSystemDirectoryHandle, name: string) {
-    const file = await directory.getFileHandle(name, { create: true })
-    const writer = await file.createWritable({ keepExistingData: true })
-    await writer.seek((await file.getFile()).size)
-    rawLogWriter.current = writer
-  }
-  async function commitRawLog(reopen: boolean) {
-    if (rawLogCommitInProgress.current || !rawLogWriter.current || !pendingRawLogRows.current) return
-    rawLogCommitInProgress.current = true
-    const rows = pendingRawLogRows.current
-    pendingRawLogRows.current = ''
-    const writer = rawLogWriter.current
-    try {
-      await writer.write(rows)
-      await writer.close()
-      rawLogWriter.current = null
-      if (reopen && directoryHandle.current) await openRawLogWriter(directoryHandle.current, rawLogFileName.current)
-    } catch {
-      // Same class of bug as the reopen-window fix above (this is the lossless source-of-truth
-      // capture, so it matters most here), different trigger: if write()/close() itself throws
-      // (disk full, permission revoked mid-session, the drive unplugged), `rows` was already
-      // cleared from pendingRawLogRows before the attempt -- without putting it back, that whole
-      // batch is lost forever instead of just delayed. Prepending (not appending) preserves
-      // chronological order against anything that accumulated in the meantime. The writer is also
-      // left in an unknown state after a failed write/close, so it's nulled out here too --
-      // otherwise every future flush would keep hitting the same broken writer indefinitely instead
-      // of getting a chance to open a fresh one on the next attempt.
-      pendingRawLogRows.current = rows + pendingRawLogRows.current
-      rawLogWriter.current = null
-      setNotice('Could not commit the raw log file')
-      if (reopen && directoryHandle.current) await openRawLogWriter(directoryHandle.current, rawLogFileName.current).catch(() => undefined)
-    }
-    finally {
-      rawLogCommitInProgress.current = false
-      if (reopen && pendingRawLogRows.current && rawLogCommitTimer.current === undefined) rawLogCommitTimer.current = window.setTimeout(() => { rawLogCommitTimer.current = undefined; void commitRawLog(true) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
-    }
+  function sessionMetadata(stoppedAt?: string): RawSessionMetadata {
+    return { schemaVersion: 1, startedAt: logStartedAtRef.current ?? new Date().toISOString(), ...(stoppedAt ? { stoppedAt } : {}), firmwareGitSha, firmwareProtocolVersion, primaryTeeth: primarySpokes, secondaryTeeth: secondarySpokes, secondaryInertiaKgM2: inertiaKgM2, analysisWindowMs, powerMode, torqueCurve, torqueScale, torqueOffset, channels, frequencies }
   }
   async function startLogging() {
+    if (!connected) { setNotice('Connect the dyno before starting lossless raw logging'); return }
     const directory = directoryHandle.current ?? await chooseDirectory()
     if (!directory) return
-    try {
-      // Discard anything left over from a previous session's commitLog()/commitRawLog() failure
-      // (see those functions' catch blocks) -- without this, stale rows from a session that ended
-      // with an unrecovered write error would silently bleed into the front of this brand new file
-      // on its first flush.
-      pendingLogRows.current = ''
-      pendingRawLogRows.current = ''
-      const name = await nextLogFileName(directory)
-      const file = await directory.getFileHandle(name, { create: true })
-      const writer = await file.createWritable()
-      await writer.write(`${csvHeader}\n`)
-      await writer.close()
-      logWriter.current = writer
-      logFileName.current = name
-      lastLoggedDemoSampleTime.current = samples[samples.length - 1]?.time ?? null
-      await openLogWriter(directory, name)
-
-      // Lossless raw per-channel log alongside the wide CSV -- see `rawLogHeader`'s comment.
-      const rawName = name.replace(/\.csv$/i, '-raw.csv')
-      const rawFile = await directory.getFileHandle(rawName, { create: true })
-      const rawWriter = await rawFile.createWritable()
-      await rawWriter.write(`${rawLogHeader}\n`)
-      await rawWriter.close()
-      rawLogFileName.current = rawName
-      await openRawLogWriter(directory, rawName)
-
-      setLogging(true)
-      setNotice(`Writing ${name} (+ ${rawName})`)
-    } catch { setNotice('Could not open a log file in that folder') }
+    try { logStartedAtRef.current = new Date().toISOString(); await rawLoggerRef.current?.start(directory, sessionName, sessionMetadata()); setLogging(true); setNotice(`Writing ${rawLoggerRef.current?.fileName ?? 'raw log'}`) } catch { setNotice('Could not open the raw log file in that folder') }
   }
   async function stopLogging() {
-    setLogging(false)
-    window.clearTimeout(logCommitTimer.current)
-    logCommitTimer.current = undefined
-    window.clearTimeout(rawLogCommitTimer.current)
-    rawLogCommitTimer.current = undefined
-    if (logWriter.current) {
-      await commitLog(false)
-      await logWriter.current?.close().catch(() => undefined)
-      logWriter.current = null
-    }
-    if (rawLogWriter.current) {
-      await commitRawLog(false)
-      await rawLogWriter.current?.close().catch(() => undefined)
-      rawLogWriter.current = null
-    }
-    setNotice(`Closed ${logFileName.current}`)
+    try { await transport.current?.flush(); await rawLoggerRef.current?.stop(sessionMetadata(new Date().toISOString())); setLogging(false); setNotice(`Closed ${rawLoggerRef.current?.fileName ?? 'raw log'}`) } catch { setNotice('Could not finish the raw log cleanly') }
   }
   async function loadPlaybackFile(file: File) {
     try {
       const text = await file.text()
-      const parsed = parseSamplesCsv(text, torqueScale, torqueOffset)
-      if (!parsed.length) { setNotice('No samples found in that CSV file'); return }
+      if (!isRawLogCsv(text)) {
+        setNotice('That file is not a raw dyno run. Load the *-raw.csv file with firmware_t_us / seq / raw_value / edge_count columns.')
+        return
+      }
+      const rawPackets = parseRawLogCsv(text)
+      if (!rawPackets.length) { setNotice('Raw CSV recognized, but it contains no telemetry packets'); return }
       window.clearInterval(demoTimer.current)
       setDemoMode(false)
-      setPlaybackSamples(parsed)
+      setRawPlaybackActive(true)
+      setPlaybackSamples([])
       setPlaybackFileName(file.name)
-      setPlaybackElapsedMs(parsed[parsed.length - 1].time - parsed[0].time)
       setPlaybackPlaying(false)
-      setPlaybackRangeStart(0)
-      setPlaybackRangeEnd(1)
+      setSamples([])
+      setPrimaryObservations([])
+      setSecondaryObservations([])
       setChartPlaying(true)
       setFrozenDomainEnd(null)
       setChartResetKey((key) => key + 1)
-      setNotice(`Loaded ${parsed.length.toLocaleString()} samples from ${file.name}`)
-    } catch { setNotice('Could not read that CSV file') }
+      analysisClientRef.current?.reset()
+      for (let index = 0; index < rawPackets.length; index += 5000) analysisClientRef.current?.pushMany(rawPackets.slice(index, index + 5000))
+      setNotice(`Loaded ${rawPackets.length.toLocaleString()} raw packets from ${file.name}`)
+    } catch { setNotice('Could not read that raw CSV file') }
   }
   function togglePlaybackPlaying() {
     setPlaybackPlaying((playing) => {
@@ -1008,12 +686,16 @@ function App() {
   function stopPlayback() {
     setPlaybackPlaying(false)
     setPlaybackSamples([])
+    setRawPlaybackActive(false)
     setPlaybackFileName('')
     setPlaybackElapsedMs(0)
     setPlaybackRangeStart(0)
     setPlaybackRangeEnd(1)
     setSamples([])
-    setNotice('Playback cleared; live and demo telemetry are available again')
+    setPrimaryObservations([])
+    setSecondaryObservations([])
+    analysisClientRef.current?.reset()
+    setNotice('Playback cleared; live analysis resumes from new incoming packets')
   }
   function seekPlayback(ms: number) {
     if (!playbackSamples.length) return
@@ -1027,7 +709,6 @@ function App() {
       return !playing
     })
   }
-  function toggleMa(field: MaField) { setMaEnabled((previous) => ({ ...previous, [field]: !previous[field] })) }
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : demoMode ? 'Browser demo stream' : 'Offline'}<span className="status-divider" /><span className="mono">{formatNumber(current.rpm1)} RPM</span>{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions"><button className="button button-quiet" onClick={() => setDemoMode((value) => !value)} title="Toggle browser demo telemetry"><Gauge size={16} />{demoMode ? 'Browser demo' : 'Demo off'}</button>{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
     {protocolMismatch && <section className="protocol-mismatch-banner" role="alert">
@@ -1035,33 +716,34 @@ function App() {
       Data may be misinterpreted -- reflash the firmware from the latest build, or use a matching viewer version, before trusting anything shown below.
     </section>}
     {consoleOpen && <UsbConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
-    <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 2)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
-        <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${logFileName.current}` : 'Start log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Download CSV" onClick={() => void downloadCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
-    {powerMode === 'inertia' && inertiaSettingsOpen && <section className="inertia-settings"><div className="inertia-settings-header"><span className="section-kicker">INERTIA MODE SETTINGS</span><h3>Shaft inertia and engine curve</h3><button className="icon-button" title="Close" onClick={() => setInertiaSettingsOpen(false)}><X size={15} /></button></div><div className="inertia-settings-body"><div className="control-group compact inertia-input"><label htmlFor="inertia-value">Secondary inertia</label><div className="input-with-unit"><input id="inertia-value" type="number" step="0.01" min="0" value={inertiaKgM2} onChange={(event) => setInertiaKgM2(Number(event.target.value))} /><span>kg·m²</span></div></div><div className="torque-curve-wrap"><div className="torque-curve-heading"><span>Primary RPM vs. torque curve</span><button className="button button-quiet" onClick={() => setTorqueCurve([...defaultEngineTorqueCurve])}><RotateCcw size={13} />Reset curve</button></div><TorqueCurveEditor points={torqueCurve} onChange={setTorqueCurve} /></div></div></section>}
-    <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span>{index <= 1 ? <span className="mono" title="RPM channels are edge-triggered (one packet per physical tooth), not polled at a configurable rate">Per-tooth</span> : <select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select>}</div>)}</section>
+    <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 4)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
+        <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${rawLoggerRef.current?.fileName ?? 'raw'}` : 'Start raw log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" title="Export processed CSV" onClick={() => void downloadProcessedCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { setSamples([]); setNotice('Session buffer cleared') }}><Trash2 size={17} /></button></div></section>
+    {powerMode === 'inertia' && inertiaSettingsOpen && <section className="inertia-settings"><div className="inertia-settings-header"><span className="section-kicker">INERTIA MODE SETTINGS</span><h3>Shaft inertia and engine curve</h3><button className="icon-button" title="Close" onClick={() => setInertiaSettingsOpen(false)}><X size={15} /></button></div><div className="inertia-settings-body"><div className="control-group compact inertia-input"><label htmlFor="inertia-value">Secondary inertia</label><div className="input-with-unit"><input id="inertia-value" type="number" step="0.0001" min="0" value={inertiaKgM2} onChange={(event) => setInertiaKgM2(Number(event.target.value))} /><span>kg·m²</span></div></div><div className="torque-curve-wrap"><div className="torque-curve-heading"><span>Primary RPM vs. torque curve</span><button className="button button-quiet" onClick={() => setTorqueCurve([...defaultEngineTorqueCurve])}><RotateCcw size={13} />Reset curve</button></div><TorqueCurveEditor points={torqueCurve} onChange={setTorqueCurve} /></div></div></section>}
+    <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span>{index <= 1 ? <span className="mono" title="RPM channels are edge-triggered (one packet per physical tooth), not polled at a configurable rate">Per-tooth</span> : index === 5 ? <span className="mono" title="Full-throttle state is event-driven and transmitted only when it changes">On change</span> : <select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select>}</div>)}</section>
     <section className="channel-strip"><div className="strip-label"><Gauge size={17} /><span>RPM wheel teeth / spokes</span></div><div className="channel-control"><span>Primary wheel teeth</span><input type="number" min="1" max="999" value={primarySpokes} onChange={(event) => updateSpokes(0, Number(event.target.value))} /></div><div className="channel-control"><span>Secondary wheel teeth</span><input type="number" min="1" max="999" value={secondarySpokes} onChange={(event) => updateSpokes(1, Number(event.target.value))} /></div></section>
-    <section className="playback-bar"><div className="strip-label"><Upload size={17} /><span>CSV playback</span></div><input ref={fileInputRef} type="file" accept=".csv,text/csv" className="visually-hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadPlaybackFile(file); event.target.value = '' }} /><button className="button button-quiet" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load CSV</button>{isPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span><button className="icon-button" title={playbackPlaying ? 'Pause playback' : 'Play playback'} onClick={togglePlaybackPlaying}>{playbackPlaying ? <Pause size={16} /> : <Play size={16} />}</button><TimeRangeSlider startFraction={playbackRangeStart} endFraction={playbackRangeEnd} onChange={handlePlaybackRangeChange} formatValue={(fraction) => `${((fraction * playbackDurationMs) / 1000).toFixed(1)}s`} /><span className="mono">{(playbackElapsedMs / 1000).toFixed(1)}s / {(playbackDurationMs / 1000).toFixed(1)}s</span><select value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))}><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select><button className="icon-button" title="Save recalculated CSV (current power settings applied to every row)" onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear playback" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
-    <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0)}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
+    <section className="playback-bar"><div className="strip-label"><Upload size={17} /><span>Raw run playback</span></div><input ref={fileInputRef} type="file" accept=".csv,text/csv" className="visually-hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadPlaybackFile(file); event.target.value = '' }} /><button className="button button-quiet" onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load raw CSV</button>{isPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span>{rawPlaybackActive ? <span className="mono">Raw run · reprocessed at {analysisWindowMs} ms</span> : <><button className="icon-button" title={playbackPlaying ? 'Pause playback' : 'Play playback'} onClick={togglePlaybackPlaying}>{playbackPlaying ? <Pause size={16} /> : <Play size={16} />}</button><TimeRangeSlider startFraction={playbackRangeStart} endFraction={playbackRangeEnd} onChange={handlePlaybackRangeChange} formatValue={(fraction) => `${((fraction * playbackDurationMs) / 1000).toFixed(1)}s`} /><span className="mono">{(playbackElapsedMs / 1000).toFixed(1)}s / {(playbackDurationMs / 1000).toFixed(1)}s</span><select value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))}><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select></>}<button className="icon-button" title="Export processed CSV" onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear playback" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
+    <section className="metric-grid">{[['Primary RPM', current.rpm1, 'rpm'], ['Secondary RPM', current.rpm2, 'rpm'], ['Shift position', current.shift, '%'], ['Primary power', current.power1, 'kW'], ['Secondary power', current.power2, 'kW'], ['Efficiency', current.efficiency, '%']].map(([label, value, unit], index) => <article className="metric" key={label as string}><span className="metric-index">0{index + 1}</span><span className="metric-label">{label as string}</span><strong>{Number.isFinite(value as number) ? formatNumber(value as number, unit === 'kW' || unit === '%' ? 1 : 0) : '—'}</strong><span className="metric-unit">{unit as string}</span></article>)}</section>
     <ChartWorkspace
       key={chartResetKey}
       sampleCount={samples.length}
       chartPlaying={chartPlaying}
       onToggleChartPlaying={toggleChartPlaying}
-      maWindow={maWindow}
-      onMaWindowChange={setMaWindow}
+      analysisWindowMs={analysisWindowMs}
+      onAnalysisWindowChange={setAnalysisWindowMs}
+      observationMode={rpmObservationMode}
+      onObservationModeChange={setRpmObservationMode}
       charts={charts}
       setCharts={setCharts}
       data={derivedFullData}
-      maEnabled={maEnabled}
-      onToggleMa={toggleMa}
+      primaryObservations={primaryObservations}
+      secondaryObservations={secondaryObservations}
       lowRatio={lowRatio}
       highRatio={highRatio}
       onLowRatioChange={setLowRatio}
       onHighRatioChange={setHighRatio}
       droppedPackets={droppedPackets}
       lostEdges={lostEdges}
-      highlightFullThrottle={highlightFullThrottle}
-      onToggleHighlightFullThrottle={() => setHighlightFullThrottle((value) => !value)}
+      powerMode={powerMode}
     />
     <footer className="footer"><span><Wifi size={14} /> Browser WebUSB requires Chromium</span><span className="mono">CVT / {sessionName || 'untitled'} / {new Date().toLocaleTimeString()}</span></footer>
   </main>
@@ -1074,16 +756,7 @@ function App() {
  * hover would re-render the whole app (topbar, console, control deck, playback bar, etc.), not
  * just the charts, which is visibly laggy. Keeping it here means only this subtree re-renders.
  */
-function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWindow, onMaWindowChange, charts, setCharts, data, maEnabled, onToggleMa, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets, lostEdges, highlightFullThrottle, onToggleHighlightFullThrottle }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; maWindow: number; onMaWindowChange: (value: number) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number; lostEdges: [number, number]; highlightFullThrottle: boolean; onToggleHighlightFullThrottle: () => void }) {
-  // The time-range-slider selection lives here (not in App) so dragging it only re-renders this
-  // subtree. The expensive per-field moving-average computation already happened in App over the
-  // full `data`; windowing it down to the selected range here is a cheap filter, not a recompute.
-  //
-  // `manualRange` is null until the user takes control (dragging the slider, or picking "Full
-  // range") -- while null, rangeStart/rangeEnd below are derived fresh every render from the
-  // current domain span instead of stored in state, so the window auto-tracks live data with no
-  // extra effect-triggered re-render on every incoming sample: pinned at [0, domain-so-far] until
-  // DEFAULT_LIVE_WINDOW_MS of data exists, then a fixed-width window ending at the live edge.
+function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, analysisWindowMs, onAnalysisWindowChange, observationMode, onObservationModeChange, charts, setCharts, data, primaryObservations, secondaryObservations, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, droppedPackets, lostEdges, powerMode }: { sampleCount: number; chartPlaying: boolean; onToggleChartPlaying: () => void; analysisWindowMs: number; onAnalysisWindowChange: (value: number) => void; observationMode: RpmObservationMode; onObservationModeChange: (value: RpmObservationMode) => void; charts: ChartConfig[]; setCharts: Dispatch<SetStateAction<ChartConfig[]>>; data: ChartPoint[]; primaryObservations: RpmObservation[]; secondaryObservations: RpmObservation[]; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; droppedPackets: number; lostEdges: [number, number]; powerMode: PowerMode }) {
   const [manualRange, setManualRange] = useState<{ start: number; end: number } | null>(null)
   const domainStart = data[0]?.time ?? 0
   const domainEnd = data[data.length - 1]?.time ?? domainStart
@@ -1093,13 +766,16 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const rangeEnd = manualRange ? manualRange.end : 1
   const windowStartMs = domainStart + rangeStart * domainSpan
   const windowEndMs = domainStart + rangeEnd * domainSpan
-  // Downsample AFTER windowing (not before): the time-range slider should still see every sample
-  // within its selected window get a fair chance to be rendered, and zooming into a smaller window
-  // naturally reduces the point count below MAX_CHART_POINTS, at which point downsampleForChart()
-  // is a no-op and the view is full-fidelity again. See downsample.ts for why RPM's move to
-  // per-tooth streaming (up to ~1-2 kHz instead of a fixed 20 Hz) made this necessary.
   const windowedData = useMemo(() => data.filter((point) => point.time >= windowStartMs && point.time <= windowEndMs), [data, windowStartMs, windowEndMs])
   const chartData = useMemo(() => downsampleForChart(windowedData, MAX_CHART_POINTS), [windowedData])
+  const observationData = useCallback((observations: RpmObservation[]) => downsampleForChart(
+    observations
+      .filter((point) => point.time >= windowStartMs && point.time <= windowEndMs)
+      .map((point) => ({ ...point, seconds: (point.time - domainStart) / 1000 })),
+    MAX_CHART_POINTS,
+  ), [windowStartMs, windowEndMs, domainStart])
+  const primaryObservationData = useMemo(() => observationData(primaryObservations), [observationData, primaryObservations])
+  const secondaryObservationData = useMemo(() => observationData(secondaryObservations), [observationData, secondaryObservations])
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const hoverFrameRef = useRef<number | null>(null)
   const pendingHoverRef = useRef<number | null>(null)
@@ -1107,12 +783,6 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
   const [dragged, setDragged] = useState<ChartId | null>(null)
 
   useEffect(() => () => { if (hoverFrameRef.current !== null) cancelAnimationFrame(hoverFrameRef.current) }, [])
-
-  // Chart hover fires on every raw mousemove event, which can be very frequent; committing
-  // `hoverTime` directly would re-render all eight chart cards on every pixel of movement and
-  // thrash badly enough to look broken. Coalesce updates to at most one per animation frame.
-  // Stable identity (useCallback, refs only, no deps) so downstream dot renderers don't get
-  // recreated -- and their underlying SVG elements torn down and rebuilt -- on every hover tick.
   const scheduleHover = useCallback((time: number | null) => {
     pendingHoverRef.current = time
     hasPendingHoverRef.current = true
@@ -1123,58 +793,27 @@ function ChartWorkspace({ sampleCount, chartPlaying, onToggleChartPlaying, maWin
     })
   }, [])
   function reorder(target: ChartId) { if (!dragged || dragged === target) return; const from = charts.findIndex((chart) => chart.id === dragged); const to = charts.findIndex((chart) => chart.id === target); const next = [...charts]; const [item] = next.splice(from, 1); next.splice(to, 0, item); setCharts(next); setDragged(null) }
-  // Looked up once here (not once per chart card) since every card shares the same `chartData`
-  // array and the same `hoverTime` -- an O(n) search per card, times eight cards, on every hover
-  // tick adds up on longer sessions.
   const hoveredPoint = useMemo(() => (hoverTime !== null ? chartData.find((point) => point.time === hoverTime) : undefined), [chartData, hoverTime])
 
   return <>
-    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} samples buffered</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost after being queued for transmission, detected via the firmware's per-channel sequence numbers (protocol v2+)"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}{(lostEdges[0] + lostEdges[1]) > 0 && <span className="workspace-dropped" title={`Primary RPM: ${lostEdges[0].toLocaleString()} lost | Secondary RPM: ${lostEdges[1].toLocaleString()} lost -- RPM edges lost BEFORE reaching the USB transport (e.g. the firmware's ring buffer overflowing during a host stall), detected via the firmware's per-channel physical edge counter (protocol v3+)`}><X size={13} />{(lostEdges[0] + lostEdges[1]).toLocaleString()} lost (device)</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Pause chart updates' : 'Resume chart updates'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="ma-window-label" title="Number of samples averaged for each moving-average trace"><span>MA points</span><input type="number" min="2" max="500" value={maWindow} onChange={(event) => { const next = Number(event.target.value); onMaWindowChange(Number.isFinite(next) && next >= 2 ? Math.round(next) : 2) }} /></label><label className="ma-toggle" title="Shade time-series chart backgrounds and color relationship-chart points while the full-throttle input is asserted"><input type="checkbox" checked={highlightFullThrottle} onChange={onToggleHighlightFullThrottle} />Highlight full throttle</label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
+    <section className="workspace-heading"><div><span className="section-kicker">02 / LIVE TELEMETRY</span><h2>Analysis workspace</h2></div><div className="workspace-tools"><span><span className="status-dot is-live" />{sampleCount.toLocaleString()} analysis frames</span>{droppedPackets > 0 && <span className="workspace-dropped" title="Packets lost after being queued for transmission, detected via sequence numbers"><X size={13} />{droppedPackets.toLocaleString()} dropped</span>}{(lostEdges[0] + lostEdges[1]) > 0 && <span className="workspace-dropped" title={`Primary RPM: ${lostEdges[0].toLocaleString()} lost | Secondary RPM: ${lostEdges[1].toLocaleString()} lost`}><X size={13} />{(lostEdges[0] + lostEdges[1]).toLocaleString()} lost (device)</span>}<button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Pause' : 'Paused'}</button><label className="analysis-select"><span>Analysis window</span><select value={analysisWindowMs} onChange={(event) => onAnalysisWindowChange(Number(event.target.value))}>{ANALYSIS_WINDOWS_MS.map((value) => <option value={value} key={value}>{value} ms</option>)}</select></label><label className="analysis-select"><span>RPM points</span><select value={observationMode} onChange={(event) => onObservationModeChange(event.target.value as RpmObservationMode)}><option value="revolution">1 revolution</option><option value="tooth">Per tooth</option></select></label><button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button></div></section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next) => setManualRange(next)} formatValue={(fraction) => `${((fraction * domainSpan) / 1000).toFixed(1)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => setManualRange({ start: 0, end: 1 })}>Full range</button></section>}
-    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} windowSeconds={(windowEndMs - windowStartMs) / 1000} maEnabled={maEnabled} onToggleMa={onToggleMa} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} highlightFullThrottle={highlightFullThrottle} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
+    <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <ChartCard key={chart.id} config={chart} data={chartData} primaryObservations={primaryObservationData} secondaryObservations={secondaryObservationData} analysisWindowMs={analysisWindowMs} windowSeconds={(windowEndMs - windowStartMs) / 1000} hoveredPoint={hoveredPoint} onHover={scheduleHover} lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange} powerMode={powerMode} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)} onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))} />)}</section>
   </>
 }
 
-function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hoveredPoint, onHover, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, highlightFullThrottle, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; windowSeconds: number; maEnabled: MaEnabled; onToggleMa: (field: MaField) => void; hoveredPoint: ChartPoint | undefined; onHover: (time: number | null) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; highlightFullThrottle: boolean; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
+function ChartCard({ config, data, primaryObservations, secondaryObservations, analysisWindowMs, windowSeconds, hoveredPoint, onHover, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, powerMode, onDragStart, onDrop, onHide }: { config: ChartConfig; data: ChartPoint[]; primaryObservations: RpmObservationPoint[]; secondaryObservations: RpmObservationPoint[]; analysisWindowMs: number; windowSeconds: number; hoveredPoint: ChartPoint | undefined; onHover: (time: number | null) => void; lowRatio: number; highRatio: number; onLowRatioChange: (value: number) => void; onHighRatioChange: (value: number) => void; powerMode: PowerMode; onDragStart: () => void; onDrop: () => void; onHide: () => void }) {
   const yUnit = config.id === 'rpm1' || config.id === 'rpm2' ? 'RPM' : config.id === 'shift' || config.id === 'efficiency' ? '%' : config.id === 'shiftRatio' ? 'Ratio' : ''
   const axisLabelStyle = { fill: '#8b8982', fontSize: 10 }
-  const common = { data, margin: { top: 8, right: config.id === 'power' ? 4 : 14, left: 4, bottom: 14 } }
-  const yDomain = config.id === 'shiftRatio' ? [0, 5] : undefined
-  // `onHover` can change identity across renders; a ref lets event handlers always call the
-  // *latest* callback without needing to be recreated themselves.
+  const common = { data, margin: { top: 8, right: 14, left: 4, bottom: 14 } }
+  const yDomain = config.id === 'shiftRatio' ? [0, 6] : config.id === 'efficiency' ? [0, 110] : undefined
   const onHoverRef = useRef(onHover)
   onHoverRef.current = onHover
   const isRelationshipChart = config.id === 'scatter' || config.id === 'shiftEfficiency'
-  // All eight charts share one simple, global hover mechanism: bypass Recharts' own mouse
-  // tracking and <ReferenceLine>/Tooltip entirely (attaching those meant every chart fully
-  // re-rendered its SVG tree on every hover tick, which is what made hovering feel slow, and its
-  // per-point dot hover for the relationship charts proved unreliable to trigger). Instead, the
-  // nearest point is found with plain DOM math from a single onMouseMove on the chart body, and
-  // the crosshair is a plain CSS-positioned line/lines, never an SVG element -- so moving it never
-  // touches Recharts at all, on any chart.
-  //
-  // The plot area's exact pixel bounds (margins, reserved axis width, the extra Y axis on the
-  // power chart, etc.) are read directly from Recharts' own rendered grid background rect
-  // (`.recharts-cartesian-grid-bg`, enabled by passing CartesianGrid a `fill`) instead of being
-  // separately guessed as hardcoded margin constants -- guessing them by hand was fragile and
-  // got out of sync with Recharts' actual layout more than once. Reading the real geometry is
-  // simpler and correct for any chart's margin configuration automatically.
   const chartBodyRef = useRef<HTMLDivElement | null>(null)
   const crosshairRef = useRef<HTMLDivElement | null>(null)
   const crosshairHRef = useRef<HTMLDivElement | null>(null)
-  // Cached instead of measured live in the hover path: getBoundingClientRect() forces a
-  // synchronous layout recalculation, and calling it on every single mousemove pixel -- across up
-  // to 8 chart cards, each doing it twice more in the crosshair-positioning effect below -- was
-  // confirmed (via a real INP/Performance trace) to be the dominant cost of chart hover lag,
-  // independent of and on top of raw point count. The plot area's screen position/size only
-  // actually changes when the chart body's box changes (window resize, panel open/close, a card
-  // being hidden/shown), which is exactly what ResizeObserver reports -- so measuring only on
-  // those events instead of on every hover frame eliminates the repeated forced reflows entirely
-  // without ever going stale.
   const plotRectRef = useRef<DOMRect | null>(null)
-  // The chart body's own rect (the crosshair's positioning offset reference) changes on exactly
-  // the same events as the plot rect above, so it's cached alongside it rather than being a second
-  // live getBoundingClientRect() call per hover frame.
   const bodyRectRef = useRef<DOMRect | null>(null)
   function measurePlotRect(chartBody: HTMLDivElement) {
     plotRectRef.current = chartBody.querySelector('.recharts-cartesian-grid-bg')?.getBoundingClientRect() ?? null
@@ -1183,40 +822,21 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
   useEffect(() => {
     const chartBody = chartBodyRef.current
     if (!chartBody) return
-    measurePlotRect(chartBody) // initial synchronous measurement, before any ResizeObserver callback has fired
+    measurePlotRect(chartBody)
     const observer = new ResizeObserver(() => measurePlotRect(chartBody))
     observer.observe(chartBody)
     return () => observer.disconnect()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally NOT re-running per hover/data change; see comment above
   }, [])
-  // Moving averages propagate downstream (RPM -> power -> efficiency, RPM -> shift ratio). When an
-  // upstream field is being averaged, a chart's own raw trace is redundant -- only the resulting
-  // (already-cascaded) value is shown, as a single solid line. The "double" raw+average display is
-  // reserved for the chart where the averaging actually originates (its own checkbox is checked and
-  // nothing upstream of it is already averaged).
-  const power1Upstream = maEnabled.rpm1
-  const power2Upstream = maEnabled.rpm2
-  const shiftRatioUpstream = maEnabled.rpm1 || maEnabled.rpm2
-  const efficiencyUpstream = maEnabled.power1 || maEnabled.power2 || maEnabled.rpm1 || maEnabled.rpm2
-  const shiftRatioUsesAvg = shiftRatioUpstream || maEnabled.shiftRatio
-  const efficiencyUsesAvg = efficiencyUpstream || maEnabled.efficiency
-  // Reference lines y = ratio * x through the origin, marking a low/high acceptable shift-ratio
-  // band. Rendered as their own two-point Line series (with an explicit `data` override) so they
-  // draw independent of the live telemetry data, spanning the same square domain as the RPM axes.
-  const scatterMax = Math.max(10, ...data.map((point) => point.rpm1), ...data.map((point) => point.rpm2)) * 1.05
-  // Point keys must match the shared axes' dataKeys ("rpm2"/"rpm1") -- Recharts resolves a
-  // Line's X position via the chart's XAxis dataKey even when the Line supplies its own `data`.
+
+  const finiteRpms = data.flatMap((point) => [point.rpm1, point.rpm2]).filter(Number.isFinite)
+  const scatterMax = Math.max(10, ...finiteRpms) * 1.05
   const lowRatioLine = [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * lowRatio }]
   const highRatioLine = [{ rpm2: 0, rpm1: 0 }, { rpm2: scatterMax, rpm1: scatterMax * highRatio }]
-  // The relationship charts' two axes aren't time, so "nearest point" is a 2D nearest-neighbor by
-  // normalized data-space distance rather than a 1D time lookup.
-  const relationshipXMax = config.id === 'scatter' ? scatterMax : 5
+  const relationshipXMax = config.id === 'scatter' ? scatterMax : 6
   const relationshipXMin = config.id === 'scatter' ? 0 : 0.5
-  const relationshipYMax = config.id === 'scatter' ? scatterMax : 125
+  const relationshipYMax = config.id === 'scatter' ? scatterMax : 110
   function relationshipCoords(point: ChartPoint) {
-    return config.id === 'scatter'
-      ? { x: point.rpm2, y: point.rpm1 }
-      : { x: shiftRatioUsesAvg ? point.shiftRatioAvg : point.shiftRatio, y: efficiencyUsesAvg ? point.efficiencyAvg : point.efficiency }
+    return config.id === 'scatter' ? { x: point.rpm2, y: point.rpm1 } : { x: point.shiftRatio, y: point.efficiency }
   }
   function handlePlotMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
     if (!data.length) return
@@ -1239,6 +859,7 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     let bestDist = Infinity
     for (const point of data) {
       const { x: px, y: py } = relationshipCoords(point)
+      if (!Number.isFinite(px) || !Number.isFinite(py)) continue
       const dx = (px - targetX) / (relationshipXMax || 1)
       const dy = (py - targetY) / (relationshipYMax || 1)
       const dist = dx * dx + dy * dy
@@ -1247,8 +868,6 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     if (nearest) onHoverRef.current(nearest.time)
   }
   function handlePlotMouseLeave() { onHoverRef.current(null) }
-  // Positions the crosshair imperatively (a direct style mutation, not React state) so showing it
-  // on the other seven charts when hovering one of them doesn't require yet another re-render.
   useLayoutEffect(() => {
     const crosshairV = crosshairRef.current
     const crosshairH = crosshairHRef.current
@@ -1257,9 +876,8 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
     const hide = () => { crosshairV.style.display = 'none'; if (crosshairH) crosshairH.style.display = 'none' }
     if (!hoveredPoint) { hide(); return }
     const plotRect = plotRectRef.current
-    if (!plotRect || plotRect.width <= 0) { hide(); return }
     const bodyRect = bodyRectRef.current
-    if (!bodyRect) { hide(); return }
+    if (!plotRect || !bodyRect || plotRect.width <= 0) { hide(); return }
     if (!isRelationshipChart) {
       if (data.length < 2) { hide(); return }
       const domainStart = data[0].seconds
@@ -1267,10 +885,11 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
       const fraction = domainEnd > domainStart ? (hoveredPoint.seconds - domainStart) / (domainEnd - domainStart) : 0
       crosshairV.style.display = 'block'
       crosshairV.style.left = `${plotRect.left - bodyRect.left + clamp01(fraction) * plotRect.width}px`
+      if (crosshairH) crosshairH.style.display = 'none'
       return
     }
-    if (plotRect.height <= 0) { hide(); return }
     const { x: px, y: py } = relationshipCoords(hoveredPoint)
+    if (!Number.isFinite(px) || !Number.isFinite(py) || plotRect.height <= 0) { hide(); return }
     const fx = config.id === 'scatter' ? px / relationshipXMax : (relationshipXMax - px) / (relationshipXMax - relationshipXMin)
     const fy = 1 - py / relationshipYMax
     crosshairV.style.display = 'block'
@@ -1279,111 +898,74 @@ function ChartCard({ config, data, windowSeconds, maEnabled, onToggleMa, hovered
       crosshairH.style.display = 'block'
       crosshairH.style.top = `${plotRect.top - bodyRect.top + clamp01(fy) * plotRect.height}px`
     }
-  }, [hoveredPoint, data, isRelationshipChart, config.id, relationshipXMax, relationshipXMin, relationshipYMax, shiftRatioUsesAvg, efficiencyUsesAvg])
+  }, [hoveredPoint, data, isRelationshipChart, config.id, relationshipXMax, relationshipXMin, relationshipYMax])
+
   const axis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={['dataMin', 'dataMax']} tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={yDomain} allowDataOverflow={yDomain !== undefined} label={{ value: yUnit, angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
-  const powerMaxKw = Math.max(1, ...data.map((sample) => sample.power1), ...data.map((sample) => sample.power2)) * 1.1
-  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={['dataMin', 'dataMax']} tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis yAxisId="kw" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /><YAxis yAxisId="hp" orientation="right" tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={40} domain={[0, powerMaxKw * KW_TO_HP]} label={{ value: 'hp', angle: 90, position: 'insideRight', style: axisLabelStyle }} /></>
+  const finitePowers = data.flatMap((sample) => [sample.power1, sample.power2]).filter(Number.isFinite)
+  const powerMinKw = Math.min(0, ...finitePowers) * 1.08
+  const powerMaxKw = Math.max(1, ...finitePowers) * 1.08
+  const powerAxis = <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="seconds" domain={['dataMin', 'dataMax']} tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} tickFormatter={(value) => `${value}s`} label={{ value: 'Time (s)', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis tickLine={false} axisLine={false} tick={{ fill: '#8b8982', fontSize: 10 }} width={46} domain={[powerMinKw, powerMaxKw]} label={{ value: 'kW', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
+  const relationshipAxis = config.id === 'scatter'
+    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="rpm2" name="Secondary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
+    : <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="shiftRatio" name="Shift ratio" domain={[0.5, 6]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="efficiency" name="Efficiency" domain={[0, 110]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
   const lineProps = { isAnimationActive: false, animationDuration: 0, dot: false, activeDot: false, connectNulls: false }
-  const rawLineProps = { ...lineProps, strokeWidth: 2, strokeDasharray: '2 3', strokeLinecap: 'round' as const, strokeOpacity: 0.65 }
-  const avgLineProps = { ...lineProps, strokeWidth: 2 }
-  function seriesLines(field: MaField, dataKey: string, avgDataKey: string, color: string, upstreamAveraged: boolean, extra: Record<string, unknown> = {}) {
-    const label = maFieldLabels[field]
-    if (upstreamAveraged) return <Line type="monotone" dataKey={avgDataKey} name={label} stroke={color} {...avgLineProps} {...extra} />
-    if (maEnabled[field]) return <><Line type="monotone" dataKey={dataKey} name={label} stroke={color} {...rawLineProps} {...extra} /><Line type="monotone" dataKey={avgDataKey} name={`${label} (avg)`} stroke={color} {...avgLineProps} {...extra} /></>
-    return <Line type="monotone" dataKey={dataKey} name={label} stroke={color} {...avgLineProps} {...extra} />
-  }
-  // A plain, static text readout instead of a Recharts <Tooltip> floating box. Every chart shares
-  // the same `hoveredPoint`, so this shows every chart's relevant value(s) at once when hovering
-  // any one of them -- and it's just a text node update, not a mouse-following popup recomputed
-  // on eight separate chart instances, which is what made hovering feel slow.
-  function formatField(raw: number, avg: number, upstream: boolean, own: boolean) {
-    if (upstream) return `${avg.toFixed(2)} (avg)`
-    if (own) return `${raw.toFixed(2)} (avg ${avg.toFixed(2)})`
-    return raw.toFixed(2)
-  }
+  const rpmDot = (color: string) => ({ r: 1.6, fill: color, fillOpacity: 0.28, stroke: 'none' })
+  const invalidSegments = useMemo(() => {
+    if (powerMode !== 'inertia' || (config.id !== 'power' && config.id !== 'efficiency')) return []
+    const segments: { start: number; end: number }[] = []
+    let start: number | null = null
+    data.forEach((point, index) => {
+      if (!point.fullThrottle) {
+        if (start === null) start = point.seconds
+      } else if (start !== null) {
+        segments.push({ start, end: data[index - 1].seconds })
+        start = null
+      }
+    })
+    if (start !== null && data.length) segments.push({ start, end: data[data.length - 1].seconds })
+    return segments
+  }, [data, config.id, powerMode])
+  const efficiencyTrend = useMemo(() => {
+    if (config.id !== 'shiftEfficiency') return []
+    const valid = data.filter((point) => Number.isFinite(point.efficiency) && point.shiftRatio >= 0.5 && point.shiftRatio <= 6)
+    const bins = 16
+    const width = (6 - 0.5) / bins
+    const result: { shiftRatio: number; efficiency: number }[] = []
+    for (let bin = 0; bin < bins; bin += 1) {
+      const low = 0.5 + bin * width
+      const high = low + width
+      const values = valid.filter((point) => point.shiftRatio >= low && point.shiftRatio < high).map((point) => point.efficiency).sort((a, b) => a - b)
+      if (values.length < 2) continue
+      const middle = Math.floor(values.length / 2)
+      const median = values.length % 2 ? values[middle] : 0.5 * (values[middle - 1] + values[middle])
+      result.push({ shiftRatio: 0.5 * (low + high), efficiency: median })
+    }
+    return result
+  }, [config.id, data])
+
   const readout = (() => {
     if (!hoveredPoint) return null
     switch (config.id) {
-      case 'rpm1': return `${formatField(hoveredPoint.rpm1, hoveredPoint.rpm1Avg, false, maEnabled.rpm1)} RPM`
-      case 'rpm2': return `${formatField(hoveredPoint.rpm2, hoveredPoint.rpm2Avg, false, maEnabled.rpm2)} RPM`
+      case 'rpm1': return `${hoveredPoint.rpm1.toFixed(2)} RPM`
+      case 'rpm2': return `${hoveredPoint.rpm2.toFixed(2)} RPM`
       case 'shift': return `${hoveredPoint.shift.toFixed(2)}%`
-      case 'power': return `Pri ${formatField(hoveredPoint.power1, hoveredPoint.power1Avg, power1Upstream, maEnabled.power1)} kW / Sec ${formatField(hoveredPoint.power2, hoveredPoint.power2Avg, power2Upstream, maEnabled.power2)} kW`
-      case 'efficiency': return `${formatField(hoveredPoint.efficiency, hoveredPoint.efficiencyAvg, efficiencyUpstream, maEnabled.efficiency)}%`
-      case 'shiftRatio': return formatField(hoveredPoint.shiftRatio, hoveredPoint.shiftRatioAvg, shiftRatioUpstream, maEnabled.shiftRatio)
+      case 'power': return `Pri ${hoveredPoint.power1.toFixed(2)} kW / Sec ${hoveredPoint.power2.toFixed(2)} kW`
+      case 'efficiency': return Number.isFinite(hoveredPoint.efficiency) ? `${hoveredPoint.efficiency.toFixed(2)}%` : 'Efficiency unavailable (not WOT / no positive output)'
+      case 'shiftRatio': return hoveredPoint.shiftRatio.toFixed(3)
       case 'scatter': return `Sec ${hoveredPoint.rpm2.toFixed(2)} / Pri ${hoveredPoint.rpm1.toFixed(2)}`
-      case 'shiftEfficiency': return `Ratio ${(shiftRatioUsesAvg ? hoveredPoint.shiftRatioAvg : hoveredPoint.shiftRatio).toFixed(2)} / Eff ${(efficiencyUsesAvg ? hoveredPoint.efficiencyAvg : hoveredPoint.efficiency).toFixed(2)}%`
+      case 'shiftEfficiency': return Number.isFinite(hoveredPoint.efficiency) ? `Ratio ${hoveredPoint.shiftRatio.toFixed(2)} / Eff ${hoveredPoint.efficiency.toFixed(2)}%` : 'Efficiency unavailable'
       default: return null
     }
   })()
-  const relationshipAxis = config.id === 'scatter'
-    ? <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey="rpm2" name="Secondary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Secondary RPM', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey="rpm1" name="Primary" domain={[0, scatterMax]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: 'Primary RPM', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
-    : <><CartesianGrid stroke="#e4dfd5" vertical={false} fill="transparent" /><XAxis type="number" dataKey={shiftRatioUsesAvg ? 'shiftRatioAvg' : 'shiftRatio'} name="Shift ratio" domain={[0.5, 5]} reversed allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} label={{ value: 'Shift ratio', position: 'insideBottom', offset: -6, style: axisLabelStyle }} /><YAxis type="number" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" domain={[0, 125]} allowDataOverflow tick={{ fill: '#8b8982', fontSize: 10 }} width={46} label={{ value: '%', angle: -90, position: 'insideLeft', style: axisLabelStyle }} /></>
-  // Memoized on inputs that exclude the hover position entirely (its crosshair is the plain CSS
-  // overlay above, never an SVG element in here), so every chart -- relationship charts included,
-  // now that their crosshair is no longer a Recharts <ReferenceLine> -- fully skips Recharts'
-  // reconciliation while only the hover position changes.
-  const staticDot = { r: 3, strokeWidth: 1, stroke: '#fffdf8' }
-  // Full-throttle is never its own plotted series -- these two are purely visual styling that
-  // read `.fullThrottle` off the existing data points:
-  //  - Time-series charts get translucent <ReferenceArea> bands spanning each contiguous stretch
-  //    of full-throttle samples (computed once here rather than per-render inside the memo below).
-  //  - Relationship charts (scatter/shiftEfficiency) color each point's dot directly, which needs
-  //    a per-point render function instead of the shared static dot object used otherwise -- kept
-  //    conditional on `highlightFullThrottle` so the (cheaper) static object is still used when
-  //    the feature is off, preserving the existing "no dot re-render on every point" perf note.
-  const fullThrottleSegments = useMemo(() => {
-    if (isRelationshipChart || !highlightFullThrottle) return []
-    const segments: { start: number; end: number }[] = []
-    let segmentStart: number | null = null
-    data.forEach((point, index) => {
-      if (point.fullThrottle) {
-        if (segmentStart === null) segmentStart = point.seconds
-      } else if (segmentStart !== null) {
-        segments.push({ start: segmentStart, end: data[index - 1].seconds })
-        segmentStart = null
-      }
-    })
-    if (segmentStart !== null) segments.push({ start: segmentStart, end: data[data.length - 1].seconds })
-    return segments
-  }, [data, isRelationshipChart, highlightFullThrottle])
-  // `extreme` makes full-throttle points dramatically larger/bolder rather than just a different
-  // fill color -- requested specifically for the primary-vs-secondary scatter chart, where the
-  // point cloud is dense enough that a same-size color swap alone was hard to pick out at a
-  // glance. Renders as a small "target" (an outer ring plus the filled dot) so it reads as
-  // distinctly different in shape, not just hue, from every other point.
-  function relationshipDot(color: string, extreme = false) {
-    if (!highlightFullThrottle) return { ...staticDot, fill: color }
-    return (dotProps: { cx?: number; cy?: number; payload?: ChartPoint }) => {
-      const isFull = dotProps.payload?.fullThrottle === true
-      if (isFull && extreme) {
-        return <g>
-          <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r + 4} fill="none" stroke={FULL_THROTTLE_COLOR} strokeWidth={2} />
-          <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r + 1} strokeWidth={1.5} stroke="#fffdf8" fill={FULL_THROTTLE_COLOR} />
-        </g>
-      }
-      return <circle cx={dotProps.cx} cy={dotProps.cy} r={staticDot.r} strokeWidth={staticDot.strokeWidth} stroke={staticDot.stroke} fill={isFull ? FULL_THROTTLE_COLOR : color} />
-    }
-  }
-  const chart = useMemo(() => <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{!isRelationshipChart && fullThrottleSegments.map((segment, index) => <ReferenceArea key={index} x1={segment.start} x2={segment.end} {...(config.id === 'power' ? { yAxisId: 'kw' } : {})} fill={FULL_THROTTLE_BAND_FILL} stroke="none" ifOverflow="visible" />)}{config.id === 'scatter' && <><Line data={lowRatioLine} name="Low ratio" type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line data={highRatioLine} name="High ratio" type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" strokeLinecap="round" isAnimationActive={false} dot={false} activeDot={false} legendType="none" tooltipType="none" /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color, true)} /></>}{config.id === 'shiftEfficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} /><Line type="monotone" dataKey={efficiencyUsesAvg ? 'efficiencyAvg' : 'efficiency'} name="Efficiency" stroke={config.color} strokeWidth={2} {...lineProps} dot={relationshipDot(config.color)} /></>}{config.id === 'rpm1' && seriesLines('rpm1', 'rpm1', 'rpm1Avg', config.color, false)}{config.id === 'rpm2' && seriesLines('rpm2', 'rpm2', 'rpm2Avg', config.color, false)}{config.id === 'shift' && <Line type="monotone" dataKey="shift" name="Shift position" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <>{seriesLines('power1', 'power1', 'power1Avg', '#f05d3b', power1Upstream, { yAxisId: 'kw' })}{seriesLines('power2', 'power2', 'power2Avg', '#3c8f88', power2Upstream, { yAxisId: 'kw' })}</>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.5} />{seriesLines('efficiency', 'efficiency', 'efficiencyAvg', config.color, efficiencyUpstream)}</>}{config.id === 'shiftRatio' && seriesLines('shiftRatio', 'shiftRatio', 'shiftRatioAvg', config.color, shiftRatioUpstream)}</LineChart></ResponsiveContainer>, [config, data, maEnabled, lowRatio, highRatio, highlightFullThrottle, fullThrottleSegments])
-  const singleMaField: MaField | null = config.id === 'rpm1' || config.id === 'rpm2' || config.id === 'efficiency' || config.id === 'shiftRatio' ? config.id : null
-  const maToggles = config.id === 'power'
-    ? <div className="chart-ma-toggles"><label className="ma-toggle" style={{ color: '#f05d3b' }}><input type="checkbox" checked={maEnabled.power1} onChange={() => onToggleMa('power1')} />Primary MA</label><label className="ma-toggle" style={{ color: '#3c8f88' }}><input type="checkbox" checked={maEnabled.power2} onChange={() => onToggleMa('power2')} />Secondary MA</label></div>
-    : singleMaField
-    ? <div className="chart-ma-toggles"><label className="ma-toggle"><input type="checkbox" checked={maEnabled[singleMaField]} onChange={() => onToggleMa(singleMaField)} />Moving avg</label></div>
-    : config.id === 'scatter'
-    ? <div className="chart-ratio-inputs">
-        <label className="ratio-input" style={{ color: '#d8a227' }}>
-          <span>Low ratio</span>
-          <input type="number" step="0.01" min="0" value={lowRatio} onChange={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next > 0) onLowRatioChange(next) }} />
-        </label>
-        <label className="ratio-input" style={{ color: '#3c8f88' }}>
-          <span>High ratio</span>
-          <input type="number" step="0.01" min="0" value={highRatio} onChange={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next > 0) onHighRatioChange(next) }} />
-        </label>
-      </div>
+
+  const chart = useMemo(() => <ResponsiveContainer width="100%" height="100%"><LineChart {...common}>{config.id === 'power' ? powerAxis : isRelationshipChart ? relationshipAxis : axis}{invalidSegments.map((segment, index) => <ReferenceArea key={index} x1={segment.start} x2={segment.end} fill="rgba(80, 80, 80, 0.10)" stroke="none" ifOverflow="visible" />)}{config.id === 'scatter' && <><Line data={lowRatioLine} type="linear" dataKey="rpm1" stroke="#d8a227" strokeWidth={2} strokeDasharray="1 5" {...lineProps} /><Line data={highRatioLine} type="linear" dataKey="rpm1" stroke="#3c8f88" strokeWidth={2} strokeDasharray="1 5" {...lineProps} /><Line type="linear" dataKey="rpm1" stroke={config.color} strokeOpacity={0} {...lineProps} dot={{ r: 2.2, fill: config.color, stroke: 'none' }} /></>}{config.id === 'shiftEfficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /><Line type="linear" dataKey="efficiency" stroke={config.color} strokeOpacity={0} {...lineProps} dot={{ r: 2.2, fill: config.color, fillOpacity: .55, stroke: 'none' }} /><Line data={efficiencyTrend} type="monotone" dataKey="efficiency" stroke={config.color} strokeWidth={2.3} {...lineProps} /></>}{config.id === 'rpm1' && <><Line data={primaryObservations} type="linear" dataKey="rpm" stroke="transparent" {...lineProps} dot={rpmDot(config.color)} /><Line type="monotone" dataKey="rpm1" name="Primary RPM" stroke={config.color} strokeWidth={2} {...lineProps} /></>}{config.id === 'rpm2' && <><Line data={secondaryObservations} type="linear" dataKey="rpm" stroke="transparent" {...lineProps} dot={rpmDot(config.color)} /><Line type="monotone" dataKey="rpm2" name="Secondary RPM" stroke={config.color} strokeWidth={2} {...lineProps} /></>}{config.id === 'shift' && <Line type="monotone" dataKey="shift" stroke={config.color} strokeWidth={2} {...lineProps} />}{config.id === 'power' && <><Line type="monotone" dataKey="power1" name="Primary" stroke="#f05d3b" strokeWidth={2} {...lineProps} /><Line type="monotone" dataKey="power2" name="Secondary" stroke="#3c8f88" strokeWidth={2} {...lineProps} /></>}{config.id === 'efficiency' && <><ReferenceLine y={100} stroke="#d92b2b" strokeDasharray="4 4" strokeWidth={1.2} /><Line type="monotone" dataKey="efficiency" stroke={config.color} strokeWidth={2} {...lineProps} /></>}{config.id === 'shiftRatio' && <Line type="monotone" dataKey="shiftRatio" stroke={config.color} strokeWidth={2} {...lineProps} />}</LineChart></ResponsiveContainer>, [config, data, primaryObservations, secondaryObservations, lowRatio, highRatio, invalidSegments, efficiencyTrend, powerMode])
+
+  const headerControls = config.id === 'scatter'
+    ? <div className="chart-ratio-inputs"><label className="ratio-input" style={{ color: '#d8a227' }}><span>Low ratio</span><input type="number" step="0.01" min="0" value={lowRatio} onChange={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next > 0) onLowRatioChange(next) }} /></label><label className="ratio-input" style={{ color: '#3c8f88' }}><span>High ratio</span><input type="number" step="0.01" min="0" value={highRatio} onChange={(event) => { const next = Number(event.target.value); if (Number.isFinite(next) && next > 0) onHighRatioChange(next) }} /></label></div>
     : null
-  return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{maToggles}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body" ref={chartBodyRef} onMouseMove={handlePlotMouseMove} onMouseLeave={handlePlotMouseLeave}>{chart}<div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />{isRelationshipChart && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}</div><div className="chart-footer"><span style={{ color: config.color }}>● LIVE</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW / hp' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Time window: ${windowSeconds.toFixed(1)} s`}</span></div></article>
+  return <article className="chart-card" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}><header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{headerControls}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header><div className="chart-body" ref={chartBodyRef} onMouseMove={handlePlotMouseMove} onMouseLeave={handlePlotMouseLeave}>{chart}<div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />{isRelationshipChart && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}</div><div className="chart-footer"><span style={{ color: config.color }}>● {analysisWindowMs} ms</span>{readout && <span className="hover-readout">{readout}</span>}<span>{config.id === 'scatter' ? 'RPM / RPM' : config.id === 'efficiency' ? 'Percent' : config.id === 'power' ? 'kW' : config.id === 'shiftRatio' ? 'Ratio' : config.id === 'shiftEfficiency' ? 'Ratio / Percent' : `Visible: ${windowSeconds.toFixed(1)} s`}</span></div></article>
 }
+
 
 // Hoisted to module scope (rather than declared inside UsbConsolePanel, where it's also used) so
 // it's available to the useState lazy initializers below, which run before any in-component
