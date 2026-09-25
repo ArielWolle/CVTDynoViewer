@@ -64,3 +64,9 @@ button { cursor: pointer; }
 .replay-toggle { display: flex; align-items: center; gap: 5px; color: #67655e; font: 500 10px 'DM Mono', monospace; white-space: nowrap; }
 .replay-toggle input { margin: 0; }
 .replay-progress { min-width: 150px; color: var(--muted); }
+
+
+/* v5.4 plot interaction performance */
+.chart-body .recharts-wrapper { pointer-events: none; }
+.chart-crosshair-line { left: 0; will-change: transform; }
+.chart-crosshair-line-h { top: 0; will-change: transform; }

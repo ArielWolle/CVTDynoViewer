@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { channelNames, encodeCommand, EXPECTED_PROTOCOL_VERSION, periodUsToRpm, type ChannelId } from './protocol'
 import { UsbTransport } from './usbTransport'
@@ -185,7 +185,11 @@ function App() {
   useEffect(() => { showSensorConsoleRef.current = showSensorConsole }, [showSensorConsole])
   useEffect(() => {
     const client = new AnalysisClient(analysisConfig, (update) => {
-      setAnalysis((currentSnapshot) => applyAnalysisUpdate(currentSnapshot, update, SENSOR_RETENTION_MS))
+      // Worker analysis is already complete before this callback. Mark only the React/UI commit as
+      // non-urgent so pointer interaction can pre-empt a chart paint without dropping any points.
+      startTransition(() => {
+        setAnalysis((currentSnapshot) => applyAnalysisUpdate(currentSnapshot, update, SENSOR_RETENTION_MS))
+      })
     })
     analysisClientRef.current = client
     return () => { client.terminate(); if (analysisClientRef.current === client) analysisClientRef.current = null }

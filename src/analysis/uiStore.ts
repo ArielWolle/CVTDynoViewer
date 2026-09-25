@@ -22,7 +22,13 @@ function lowerBoundTime<T extends { time: number }>(values: readonly T[], target
 function appendRetained<T extends { time: number }>(history: readonly T[], next: readonly T[], cutoff: number): T[] {
   const historyStart = lowerBoundTime(history, cutoff)
   const nextStart = lowerBoundTime(next, cutoff)
-  if (historyStart === 0 && nextStart >= next.length) return [...history]
+  const hasNext = nextStart < next.length
+
+  // Sparse worker updates usually touch only a subset of series. Keep untouched arrays by
+  // reference so unrelated memoized plots remain completely static. UI-store arrays are immutable.
+  if (historyStart === 0 && !hasNext) return history as T[]
+  if (historyStart === 0) return [...history, ...next.slice(nextStart)]
+  if (!hasNext) return history.slice(historyStart)
   return [...history.slice(historyStart), ...next.slice(nextStart)]
 }
 
