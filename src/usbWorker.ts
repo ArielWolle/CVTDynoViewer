@@ -38,14 +38,16 @@ export type WorkerOutboundMessage =
   // when this specific delivery includes a report of packets dropped from the internal buffer
   // since the last delivery (an extreme, sustained main-thread stall well beyond what the buffer's
   // generous cap is sized to absorb).
-  | { type: 'chunk'; packets: WorkerDecodedPacket[]; texts: string[]; overflowDropped: number }
+  | { type: 'chunk'; packets: WorkerDecodedPacket[]; texts: string[]; overflowDropped: number; deliveryId: number; maxPacketOrdinal: number }
+  | { type: 'flushed'; requestId: number }
   | { type: 'send-error'; message: string }
 
 export type WorkerInboundMessage =
   | { type: 'connect'; vendorId: number; productId: number }
   | { type: 'send'; bytes: Uint8Array }
   | { type: 'disconnect' }
-  | { type: 'ack' }
+  | { type: 'ack'; deliveryId: number; maxPacketOrdinal: number }
+  | { type: 'flush'; requestId: number }
 
 // --- Two decoupled stages: an unthrottled read loop, and a paced delivery loop ------------------
 // Earlier this file had ONE combined loop: transferIn() -> decode -> postMessage(), gated by a
@@ -75,31 +77,45 @@ const MAX_BUFFERED_PACKETS = 50_000 // a few MB worst case -- comfortably absorb
 const DELIVERY_BATCH_SIZE = 500 // caps how much a single delivered message asks the main thread to process at once
 const DELIVERY_CREDIT_WINDOW = 2
 
-let bufferedPackets: WorkerDecodedPacket[] = []
+type BufferedPacket = WorkerDecodedPacket & { ordinal: number }
+let bufferedPackets: BufferedPacket[] = []
 let bufferedTexts: string[] = []
 let bufferOverflowDropped = 0
 let deliveryCredits = DELIVERY_CREDIT_WINDOW
+let nextPacketOrdinal = 0
+let lastAckedPacketOrdinal = 0
+let nextDeliveryId = 1
+let flushWaiters: { requestId: number; targetOrdinal: number }[] = []
 
 // Drop-newest on overflow, matching the same policy the firmware's own ring buffer uses (see
 // RpmCounter.cpp's pushEdge()) -- and count it instead of growing without bound or silently
 // discarding without any visibility.
 function bufferPacket(packet: WorkerDecodedPacket) {
   if (bufferedPackets.length >= MAX_BUFFERED_PACKETS) { bufferOverflowDropped++; return }
-  bufferedPackets.push(packet)
+  bufferedPackets.push({ ...packet, ordinal: ++nextPacketOrdinal })
 }
 function bufferText(text: string) {
   if (bufferedTexts.length >= MAX_BUFFERED_PACKETS) { bufferOverflowDropped++; return }
   bufferedTexts.push(text)
 }
 
+function checkFlushWaiters() {
+  const ready = flushWaiters.filter((waiter) => lastAckedPacketOrdinal >= waiter.targetOrdinal)
+  flushWaiters = flushWaiters.filter((waiter) => lastAckedPacketOrdinal < waiter.targetOrdinal)
+  ready.forEach((waiter) => post({ type: 'flushed', requestId: waiter.requestId }))
+}
+
 function tryDeliver() {
   while (deliveryCredits > 0 && (bufferedPackets.length > 0 || bufferedTexts.length > 0)) {
-    const packets = bufferedPackets.splice(0, DELIVERY_BATCH_SIZE)
+    const buffered = bufferedPackets.splice(0, DELIVERY_BATCH_SIZE)
+    const packets = buffered.map(({ ordinal: _ordinal, ...packet }) => packet)
     const texts = bufferedTexts.splice(0, DELIVERY_BATCH_SIZE)
+    const maxPacketOrdinal = buffered.length ? buffered[buffered.length - 1].ordinal : lastAckedPacketOrdinal
+    const deliveryId = nextDeliveryId++
     deliveryCredits -= 1
     const overflowDropped = bufferOverflowDropped
     bufferOverflowDropped = 0
-    post({ type: 'chunk', packets, texts, overflowDropped })
+    post({ type: 'chunk', packets, texts, overflowDropped, deliveryId, maxPacketOrdinal })
   }
 }
 
@@ -160,6 +176,10 @@ async function connect(vendorId: number, productId: number) {
     bufferedTexts = []
     bufferOverflowDropped = 0
     deliveryCredits = DELIVERY_CREDIT_WINDOW
+    nextPacketOrdinal = 0
+    lastAckedPacketOrdinal = 0
+    nextDeliveryId = 1
+    flushWaiters = []
     post({ type: 'connected' })
     readLoop()
   } catch (error) {
@@ -228,38 +248,35 @@ function consume(chunk: Uint8Array) {
       if (line.trim()) bufferText(line.trim())
     }
   }
-  const findPacketHeader = (): { index: number; length: number } | null => {
+  const findPacketHeader = (): number | null => {
     for (let index = 0; index < buffer.length - 1; index += 1) {
-      const first = buffer[index]
-      const second = buffer[index + 1]
-      if (first === TELEMETRY_SYNC0 && second === TELEMETRY_SYNC1) return { index, length: TELEMETRY_PACKET_LEN }
-      if ((first === 0xbb && second === 0xaa) || (first === 0xaa && second === 0xbb)) return { index, length: 8 }
+      if (buffer[index] === TELEMETRY_SYNC0 && buffer[index + 1] === TELEMETRY_SYNC1) return index
     }
     return null
   }
 
   while (buffer.length > 0) {
-    const header = findPacketHeader()
-    if (!header) {
+    const headerIndex = findPacketHeader()
+    if (headerIndex === null) {
       const newline = buffer.lastIndexOf(0x0a)
       if (newline < 0) break
       emitText(buffer.slice(0, newline + 1))
       buffer = buffer.slice(newline + 1)
       continue
     }
-    if (header.index > 0) {
-      emitText(buffer.slice(0, header.index))
-      buffer = buffer.slice(header.index)
+    if (headerIndex > 0) {
+      emitText(buffer.slice(0, headerIndex))
+      buffer = buffer.slice(headerIndex)
     }
-    if (buffer.length < header.length) break
-    const raw = buffer.slice(0, header.length)
+    if (buffer.length < TELEMETRY_PACKET_LEN) break
+    const raw = buffer.slice(0, TELEMETRY_PACKET_LEN)
     const packet = decodePacket(raw)
     if (packet) {
       bufferPacket({ channel: packet.channel, value: packet.value, tUs: packet.tUs, seq: packet.seq, edgeCount: packet.edgeCount, raw })
-      buffer = buffer.slice(header.length)
+      buffer = buffer.slice(TELEMETRY_PACKET_LEN)
     } else {
-      // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop only the
-      // sync bytes and keep scanning, instead of discarding the whole tentative packet length, so
+      // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop one byte
+      // and keep scanning, instead of discarding the whole tentative packet length, so
       // a false-positive sync match can't swallow real data that follows it.
       emitText(buffer.slice(0, 1))
       buffer = buffer.slice(1)
@@ -274,5 +291,6 @@ self.onmessage = (event: MessageEvent<WorkerInboundMessage>) => {
   if (message.type === 'connect') void connect(message.vendorId, message.productId)
   else if (message.type === 'send') void send(message.bytes)
   else if (message.type === 'disconnect') void disconnect()
-  else if (message.type === 'ack') { deliveryCredits += 1; tryDeliver() }
+  else if (message.type === 'ack') { deliveryCredits += 1; lastAckedPacketOrdinal = Math.max(lastAckedPacketOrdinal, message.maxPacketOrdinal); checkFlushWaiters(); tryDeliver() }
+  else if (message.type === 'flush') { flushWaiters.push({ requestId: message.requestId, targetOrdinal: nextPacketOrdinal }); tryDeliver(); checkFlushWaiters() }
 }

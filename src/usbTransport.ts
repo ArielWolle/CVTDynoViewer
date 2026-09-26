@@ -5,6 +5,7 @@ export type UsbHandlers = {
   onValue: (channel: ChannelId, value: number, tUs: number, seq: number, edgeCount: number) => void
   onPacket?: (raw: Uint8Array, channel: ChannelId, value: number, seq: number) => void
   onText: (text: string) => void
+  onError?: (message: string) => void
 }
 
 // Must match platformio.ini's board_build.arduino.earlephilhower.usb_vid/usb_pid exactly -- these
@@ -32,6 +33,8 @@ function matchesOurDevice(device: USBDevice): boolean {
 export class UsbTransport {
   private worker: Worker | null = null
   private connectedFlag = false
+  private nextFlushRequestId = 1
+  private flushWaiters = new Map<number, { resolve: () => void; reject: (error: Error) => void }>()
 
   constructor(private readonly handlers: UsbHandlers) {}
 
@@ -68,6 +71,14 @@ export class UsbTransport {
     })
     this.worker = worker
     this.connectedFlag = true
+    worker.onerror = (event) => {
+      const error = new Error(event.message || 'USB worker failed')
+      this.connectedFlag = false
+      this.handlers.onText(`[USB WORKER ERROR] ${error.message}`)
+      this.handlers.onError?.(error.message)
+      this.flushWaiters.forEach((waiter) => waiter.reject(error))
+      this.flushWaiters.clear()
+    }
   }
 
   async disconnect() {
@@ -85,6 +96,19 @@ export class UsbTransport {
     if (!this.worker) throw new Error('USB device is not connected.')
     const sendMessage: WorkerInboundMessage = { type: 'send', bytes }
     this.worker.postMessage(sendMessage)
+  }
+
+  // Delivery barrier only: this waits for every packet the worker had already decoded when
+  // the request reached it. It cannot see bytes still inside the device/browser USB stack; a
+  // firmware stream marker is required for a true physical stop boundary.
+  async flushDelivered() {
+    if (!this.worker) return
+    const requestId = this.nextFlushRequestId++
+    await new Promise<void>((resolve, reject) => {
+      this.flushWaiters.set(requestId, { resolve, reject })
+      const message: WorkerInboundMessage = { type: 'flush', requestId }
+      this.worker?.postMessage(message)
+    })
   }
 
   private handleMessage(event: MessageEvent<WorkerOutboundMessage>) {
@@ -113,14 +137,21 @@ export class UsbTransport {
         // to the main thread (NOT how fast it drains USB, which is unthrottled -- see that file's
         // top comment), so a main thread that's genuinely behind naturally slows delivery instead
         // of an unbounded backlog piling up in the browser's own postMessage queue.
-        if (this.worker) { const ackMessage: WorkerInboundMessage = { type: 'ack' }; this.worker.postMessage(ackMessage) }
+        if (this.worker) { const ackMessage: WorkerInboundMessage = { type: 'ack', deliveryId: message.deliveryId, maxPacketOrdinal: message.maxPacketOrdinal }; this.worker.postMessage(ackMessage) }
       }
+    } else if (message.type === 'flushed') {
+      this.flushWaiters.get(message.requestId)?.resolve()
+      this.flushWaiters.delete(message.requestId)
     } else if (message.type === 'disconnected') {
       this.connectedFlag = false
       this.worker = null
+      const error = new Error(message.reason ?? 'USB device disconnected')
+      this.flushWaiters.forEach((waiter) => waiter.reject(error))
+      this.flushWaiters.clear()
       this.handlers.onText(message.reason ?? 'USB device disconnected')
     } else if (message.type === 'send-error') {
       this.handlers.onText(`[SEND ERROR] ${message.message}`)
+      this.handlers.onError?.(`USB send error: ${message.message}`)
     }
   }
 }
