@@ -32,6 +32,15 @@ describe('wire protocol', () => {
     expect(decodePacket(packet)).toBeNull()
   })
 
+  it('rejects the obsolete 8-byte telemetry framing', () => {
+    const legacy = new Uint8Array(8)
+    legacy[0] = 0xaa
+    legacy[1] = 0xbb
+    legacy[2] = 0
+    new DataView(legacy.buffer).setInt32(4, 1234, true)
+    expect(decodePacket(legacy)).toBeNull()
+  })
+
   it('converts raw inter-tooth periods to RPM and preserves the explicit stopped value', () => {
     expect(periodUsToRpm(1250, 16)).toBeCloseTo(3000)
     expect(periodUsToRpm(0, 16)).toBe(0)

@@ -248,38 +248,35 @@ function consume(chunk: Uint8Array) {
       if (line.trim()) bufferText(line.trim())
     }
   }
-  const findPacketHeader = (): { index: number; length: number } | null => {
+  const findPacketHeader = (): number | null => {
     for (let index = 0; index < buffer.length - 1; index += 1) {
-      const first = buffer[index]
-      const second = buffer[index + 1]
-      if (first === TELEMETRY_SYNC0 && second === TELEMETRY_SYNC1) return { index, length: TELEMETRY_PACKET_LEN }
-      if ((first === 0xbb && second === 0xaa) || (first === 0xaa && second === 0xbb)) return { index, length: 8 }
+      if (buffer[index] === TELEMETRY_SYNC0 && buffer[index + 1] === TELEMETRY_SYNC1) return index
     }
     return null
   }
 
   while (buffer.length > 0) {
-    const header = findPacketHeader()
-    if (!header) {
+    const headerIndex = findPacketHeader()
+    if (headerIndex === null) {
       const newline = buffer.lastIndexOf(0x0a)
       if (newline < 0) break
       emitText(buffer.slice(0, newline + 1))
       buffer = buffer.slice(newline + 1)
       continue
     }
-    if (header.index > 0) {
-      emitText(buffer.slice(0, header.index))
-      buffer = buffer.slice(header.index)
+    if (headerIndex > 0) {
+      emitText(buffer.slice(0, headerIndex))
+      buffer = buffer.slice(headerIndex)
     }
-    if (buffer.length < header.length) break
-    const raw = buffer.slice(0, header.length)
+    if (buffer.length < TELEMETRY_PACKET_LEN) break
+    const raw = buffer.slice(0, TELEMETRY_PACKET_LEN)
     const packet = decodePacket(raw)
     if (packet) {
       bufferPacket({ channel: packet.channel, value: packet.value, tUs: packet.tUs, seq: packet.seq, edgeCount: packet.edgeCount, raw })
-      buffer = buffer.slice(header.length)
+      buffer = buffer.slice(TELEMETRY_PACKET_LEN)
     } else {
-      // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop only the
-      // sync bytes and keep scanning, instead of discarding the whole tentative packet length, so
+      // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop one byte
+      // and keep scanning, instead of discarding the whole tentative packet length, so
       // a false-positive sync match can't swallow real data that follows it.
       emitText(buffer.slice(0, 1))
       buffer = buffer.slice(1)

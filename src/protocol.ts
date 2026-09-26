@@ -84,34 +84,24 @@ export function crc8(bytes: Uint8Array): number {
 export type DecodedPacket = { channel: ChannelId; value: number; tUs: number; seq: number; edgeCount: number }
 
 /**
- * Decodes one telemetry packet. Accepts the current v3 framing (21 bytes, CRC-checked, firmware
- * timestamp + per-channel sequence number + per-channel physical edge counter) and falls back to
- * the older v1 framing (8 bytes, no CRC, no timestamp) so logs/firmware from before the protocol
- * upgrade still decode -- `tUs`/`seq`/`edgeCount` are synthesized as 0 in that case since the
- * source data genuinely doesn't have them. There is deliberately no fallback for the intermediate
- * 17-byte v2 framing: a firmware still on that version reports a mismatched protocol version (see
- * EXPECTED_PROTOCOL_VERSION above) and the resulting banner is a clearer signal than silently
- * mis-framing every packet would be.
+ * Decodes one current telemetry packet: the fixed 21-byte, CRC-checked framing emitted by the
+ * supported WebUSB firmware. Older packet layouts are intentionally rejected; they do not carry
+ * the timestamp/sequence/edge-count information required by the current analysis and loss
+ * accounting pipeline. Firmware/viewer compatibility is handled explicitly via protocol version.
  */
 export function decodePacket(packet: Uint8Array): DecodedPacket | null {
-  if (packet.length >= TELEMETRY_PACKET_LEN && packet[0] === TELEMETRY_SYNC0 && packet[1] === TELEMETRY_SYNC1) {
-    const channel = packet[2]
-    if (channel > 5) return null
-    const expectedCrc = crc8(packet.slice(2, 2 + TELEMETRY_CRC_SPAN))
-    if (packet[20] !== expectedCrc) return null
-    const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength)
-    const value = view.getInt32(4, true)
-    const tUsLow = view.getUint32(8, true)
-    const tUsHigh = view.getUint32(12, true)
-    const tUs = tUsHigh * 4294967296 + tUsLow
-    const edgeCount = view.getUint32(16, true)
-    return { channel: channel as ChannelId, value, tUs, seq: packet[3], edgeCount }
-  }
-  if (packet.length === 8 && ((packet[0] === 0xaa && packet[1] === 0xbb) || (packet[0] === 0xbb && packet[1] === 0xaa)) && packet[2] <= 4) {
-    const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength)
-    return { channel: packet[2] as ChannelId, value: view.getInt32(4, true), tUs: 0, seq: 0, edgeCount: 0 }
-  }
-  return null
+  if (packet.length !== TELEMETRY_PACKET_LEN || packet[0] !== TELEMETRY_SYNC0 || packet[1] !== TELEMETRY_SYNC1) return null
+  const channel = packet[2]
+  if (channel > 5) return null
+  const expectedCrc = crc8(packet.slice(2, 2 + TELEMETRY_CRC_SPAN))
+  if (packet[20] !== expectedCrc) return null
+  const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength)
+  const value = view.getInt32(4, true)
+  const tUsLow = view.getUint32(8, true)
+  const tUsHigh = view.getUint32(12, true)
+  const tUs = tUsHigh * 4294967296 + tUsLow
+  const edgeCount = view.getUint32(16, true)
+  return { channel: channel as ChannelId, value, tUs, seq: packet[3], edgeCount }
 }
 
 export function encodeCommand(command: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8, channel = 0, value = 0): Uint8Array {

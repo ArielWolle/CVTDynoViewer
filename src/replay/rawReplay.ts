@@ -52,7 +52,7 @@ export class RawReplayController {
   private analyzing = false
   private analysisProgress = 0
   private speed: RawReplaySpeed = 1
-  private loop = true
+  private loop = false
   private loopCount = 0
   private lastStateEmitMs = -Infinity
   private operationId = 0

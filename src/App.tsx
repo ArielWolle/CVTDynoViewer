@@ -12,7 +12,7 @@ import { parseRawLog } from './analysis/rawCsv'
 import { AnalysisStore } from './analysis/store'
 import { RAW_REPLAY_SPEEDS, RawReplayController, type RawReplaySpeed, type RawReplayState } from './replay/rawReplay'
 import { RawSessionLogger } from './session/rawSessionLogger'
-import { parseRawSessionMetadataJson, type RawSessionMetadata } from './session/rawFormat'
+import type { RawSessionMetadata } from './session/rawFormat'
 
 type ConsoleType = 'RPM1' | 'RPM2' | 'SHIFT' | 'TORQ1' | 'TORQ2' | 'READ CONFIG' | 'RPM TEST' | 'RPM COUNT TEST' | 'TEXT' | 'TX'
 type ConsoleMessage = { id: number; time: string; type: ConsoleType; data: string }
@@ -125,7 +125,7 @@ function App() {
   })
   const [playbackFileName, setPlaybackFileName] = useState('')
   const [rawPlaybackActive, setRawPlaybackActive] = useState(false)
-  const [replayState, setReplayState] = useState<RawReplayState>({ loaded: false, playing: false, analyzing: false, analysisProgress: 0, speed: 1, loop: true, progress: 0, elapsedMs: 0, durationMs: 0, loopCount: 0 })
+  const [replayState, setReplayState] = useState<RawReplayState>({ loaded: false, playing: false, analyzing: false, analysisProgress: 0, speed: 1, loop: false, progress: 0, elapsedMs: 0, durationMs: 0, loopCount: 0 })
   // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
   // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
   // detect gaps with). This ONLY reveals loss AFTER a packet was already queued for transmission
@@ -278,7 +278,7 @@ function App() {
       },
     })
     rawReplayRef.current = controller
-    controller.setLoop(true)
+    controller.setLoop(false)
     controller.setSpeed(1)
     return () => { controller.clear(); if (rawReplayRef.current === controller) rawReplayRef.current = null }
     // The controller owns only replay timing; analysis settings are handled by AnalysisClient.
@@ -325,24 +325,6 @@ function App() {
     liveConfigBeforeReplayRef.current = null
     applyAnalysisConfigToUi(saved)
     analysisClientRef.current?.configure(saved)
-  }
-
-  async function companionMetadataFor(rawFile: File, selectedFiles: readonly File[]): Promise<RawSessionMetadata | null> {
-    const stem = rawFile.name.replace(/-raw\.csv$/i, '')
-    const expectedName = `${stem}-meta.json`.toLowerCase()
-    const selected = selectedFiles.find((file) => file.name.toLowerCase() === expectedName)
-      ?? selectedFiles.find((file) => file.name.toLowerCase().endsWith('-meta.json'))
-    if (selected) return parseRawSessionMetadataJson(await selected.text())
-
-    if (directoryHandle.current) {
-      try {
-        const handle = await directoryHandle.current.getFileHandle(`${stem}-meta.json`)
-        return parseRawSessionMetadataJson(await (await handle.getFile()).text())
-      } catch {
-        // The selected raw run can come from elsewhere; absence is surfaced by loadPlaybackFiles.
-      }
-    }
-    return null
   }
 
   async function connect() {
@@ -683,7 +665,7 @@ function App() {
       setNotice('Could not finish the raw log cleanly')
     }
   }
-  async function loadPlaybackFiles(files: readonly File[]) {
+  async function loadPlaybackFile(file: File) {
     if (connected || logging) {
       const message = connected ? 'Disconnect the real dyno before loading a saved run.' : 'Stop raw logging before loading a saved run.'
       setWarningNotice(message)
@@ -692,20 +674,10 @@ function App() {
     }
 
     setWarningNotice(null)
-    const csvCandidates = files.filter((file) => file.name.toLowerCase().endsWith('.csv'))
     try {
-      let rawFile: File | null = null
-      let parsed: ReturnType<typeof parseRawLog> | null = null
-      for (const candidate of csvCandidates) {
-        const next = parseRawLog(await candidate.text())
-        if (next.packets.length) {
-          rawFile = candidate
-          parsed = next
-          break
-        }
-      }
-      if (!rawFile || !parsed) {
-        setWarningNotice('No valid raw dyno CSV was selected. Choose the *-raw.csv file with firmware_t_us / seq / raw_value / edge_count columns.')
+      const parsed = parseRawLog(await file.text())
+      if (!parsed.packets.length) {
+        setWarningNotice('That file is not a valid raw dyno run. Choose the *-raw.csv file with firmware_t_us / seq / raw_value / edge_count columns.')
         setNotice('Saved run not loaded')
         return
       }
@@ -713,23 +685,22 @@ function App() {
       const originalLiveConfig = liveConfigBeforeReplayRef.current ?? copyAnalysisConfig(analysisConfig)
       if (!liveConfigBeforeReplayRef.current) liveConfigBeforeReplayRef.current = copyAnalysisConfig(analysisConfig)
 
-      const companionMetadata = parsed.metadata ?? await companionMetadataFor(rawFile, files)
-      const replayConfig = companionMetadata
-        ? analysisConfigFromMetadata(companionMetadata, originalLiveConfig)
+      const replayConfig = parsed.metadata
+        ? analysisConfigFromMetadata(parsed.metadata, originalLiveConfig)
         : copyAnalysisConfig(originalLiveConfig)
 
       setRawPlaybackActive(true)
-      setPlaybackFileName(rawFile.name)
+      setPlaybackFileName(file.name)
       setChartPlaying(true)
       setFrozenDomainEnd(null)
       setChartResetKey((key) => key + 1)
       applyAnalysisConfigToUi(replayConfig)
 
-      if (companionMetadata) {
-        setNotice(`Applying the recorded setup and analyzing ${parsed.packets.length.toLocaleString()} raw packets from ${rawFile.name}...`)
+      if (parsed.metadata) {
+        setNotice(`Applying the recorded setup and analyzing ${parsed.packets.length.toLocaleString()} raw packets from ${file.name}...`)
       } else {
-        setWarningNotice('This raw run has no recorded setup metadata, so replay is using your current viewer settings. For older runs, select the *-raw.csv and matching *-meta.json together.')
-        setNotice(`Analyzing ${parsed.packets.length.toLocaleString()} raw packets from ${rawFile.name} with current viewer settings...`)
+        setWarningNotice('This older raw run has no embedded setup metadata, so replay is using your current viewer settings.')
+        setNotice(`Analyzing ${parsed.packets.length.toLocaleString()} raw packets from ${file.name} with current viewer settings...`)
       }
 
       const controller = rawReplayRef.current
@@ -744,7 +715,7 @@ function App() {
       if (!completed) return
 
       setChartResetKey((key) => key + 1)
-      setNotice(`Loaded and analyzed ${parsed.packets.length.toLocaleString()} raw packets from ${rawFile.name}. Press Play to replay it from the beginning.`)
+      setNotice(`Loaded and analyzed ${parsed.packets.length.toLocaleString()} raw packets from ${file.name}. Press Play to replay it from the beginning.`)
     } catch (error) {
       rawReplayRef.current?.clear()
       analysisClientRef.current?.reset()
@@ -812,7 +783,7 @@ function App() {
     {powerMode === 'inertia' && inertiaSettingsOpen && <section className="inertia-settings"><div className="inertia-settings-header"><span className="section-kicker">INERTIA MODE SETTINGS</span><h3>Shaft inertia and engine curve</h3><button className="icon-button" title="Close" onClick={() => setInertiaSettingsOpen(false)}><X size={15} /></button></div><div className="inertia-settings-body"><div className="control-group compact inertia-input"><label htmlFor="inertia-value">Secondary inertia</label><div className="input-with-unit"><input id="inertia-value" disabled={replayState.analyzing} type="number" step="0.0001" min="0" value={inertiaKgM2} onChange={(event) => setInertiaKgM2(Number(event.target.value))} /><span>kg·m²</span></div></div><div className="torque-curve-wrap"><div className="torque-curve-heading"><span>Primary RPM vs. torque curve</span><button className="button button-quiet" onClick={() => setTorqueCurve([...defaultEngineTorqueCurve])}><RotateCcw size={13} />Reset curve</button></div><TorqueCurveEditor points={torqueCurve} onChange={replayState.analyzing ? () => undefined : setTorqueCurve} /></div></div></section>}
     <section className="channel-strip"><div className="strip-label"><SlidersHorizontal size={17} /><span>Telemetry channels</span></div>{channelNames.slice(0, 5).map((name, index) => <div className="channel-control" key={name}><button className={`channel-toggle ${channels[index] ? 'enabled' : ''}`} onClick={() => updateChannel(index, !channels[index])}>{channels[index] ? 'ON' : 'OFF'}</button><span>{name.replace('Primary ', 'PRI ').replace('Secondary ', 'SEC ')}</span>{index <= 1 ? <span className="mono" title="RPM channels are edge-triggered (one packet per physical tooth), not polled at a configurable rate">Per-tooth</span> : <select value={frequencies[index]} onChange={(event) => updateFrequency(index, Number(event.target.value))}><option value="10">10 Hz</option><option value="20">20 Hz</option><option value="50">50 Hz</option></select>}</div>)}</section>
     <section className="channel-strip"><div className="strip-label"><Gauge size={17} /><span>RPM wheel teeth / spokes</span></div><div className="channel-control"><span>Primary wheel teeth</span><input type="number" disabled={replayState.analyzing} min="1" max="999" value={primarySpokes} onChange={(event) => updateSpokes(0, Number(event.target.value))} /></div><div className="channel-control"><span>Secondary wheel teeth</span><input type="number" disabled={replayState.analyzing} min="1" max="999" value={secondarySpokes} onChange={(event) => updateSpokes(1, Number(event.target.value))} /></div></section>
-    <section className="playback-bar"><div className="strip-label"><span>Saved run</span></div><input ref={fileInputRef} type="file" multiple accept=".csv,.json,text/csv,application/json" className="visually-hidden" onChange={(event) => { const files = [...(event.target.files ?? [])]; if (files.length) void loadPlaybackFiles(files); event.target.value = '' }} /><button className="button button-quiet" disabled={replayState.analyzing} title="Load a source-of-truth *-raw.csv run. New raw files contain their recorded setup; for older runs you can select the matching *-meta.json at the same time." onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load raw replay</button>{rawPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span><button className="icon-button" disabled={replayState.analyzing} title={replayState.playing ? 'Pause replay' : 'Play replay'} onClick={togglePlaybackPlaying}>{replayState.playing ? <Pause size={16} /> : <Play size={16} />}</button><button className="button button-quiet" disabled={replayState.analyzing} onClick={restartPlayback}>Restart</button><select disabled={replayState.analyzing} value={replayState.speed} onChange={(event) => changePlaybackSpeed(Number(event.target.value))}>{RAW_REPLAY_SPEEDS.map((speed) => <option key={speed} value={speed}>{speed}x</option>)}</select><label className="replay-toggle"><input type="checkbox" checked={replayState.loop} onChange={togglePlaybackLoop} />Loop</label><span className="mono replay-progress">{replayState.analyzing ? `Analyzing ${(replayState.analysisProgress * 100).toFixed(0)}%` : `${(replayState.elapsedMs / 1000).toFixed(1)}s / ${(replayState.durationMs / 1000).toFixed(1)}s · ${(replayState.progress * 100).toFixed(0)}%${replayState.loopCount > 0 ? ` · loop ${replayState.loopCount + 1}` : ''}`}</span><button className="icon-button" disabled={replayState.analyzing} title={replayState.analyzing ? 'Processed export is available when analysis is complete' : 'Export processed CSV'} onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear replay" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
+    <section className="playback-bar"><div className="strip-label"><span>Saved run</span></div><input ref={fileInputRef} type="file" accept=".csv,text/csv" className="visually-hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadPlaybackFile(file); event.target.value = '' }} /><button className="button button-quiet" disabled={replayState.analyzing} title="Load a canonical *-raw.csv run. New raw files contain all setup and clean-stop metadata inside the CSV." onClick={() => fileInputRef.current?.click()}><Upload size={14} />Load raw replay</button>{rawPlaybackActive && <><span className="mono playback-filename">{playbackFileName}</span><button className="icon-button" disabled={replayState.analyzing} title={replayState.playing ? 'Pause replay' : 'Play replay'} onClick={togglePlaybackPlaying}>{replayState.playing ? <Pause size={16} /> : <Play size={16} />}</button><button className="button button-quiet" disabled={replayState.analyzing} onClick={restartPlayback}>Restart</button><select disabled={replayState.analyzing} value={replayState.speed} onChange={(event) => changePlaybackSpeed(Number(event.target.value))}>{RAW_REPLAY_SPEEDS.map((speed) => <option key={speed} value={speed}>{speed}x</option>)}</select><label className="replay-toggle"><input type="checkbox" checked={replayState.loop} onChange={togglePlaybackLoop} />Loop</label><span className="mono replay-progress">{replayState.analyzing ? `Analyzing ${(replayState.analysisProgress * 100).toFixed(0)}%` : `${(replayState.elapsedMs / 1000).toFixed(1)}s / ${(replayState.durationMs / 1000).toFixed(1)}s · ${(replayState.progress * 100).toFixed(0)}%${replayState.loopCount > 0 ? ` · loop ${replayState.loopCount + 1}` : ''}`}</span><button className="icon-button" disabled={replayState.analyzing} title={replayState.analyzing ? 'Processed export is available when analysis is complete' : 'Export processed CSV'} onClick={() => void saveRecalculatedCsv()}><Download size={16} /></button><button className="icon-button" title="Clear replay" onClick={stopPlayback}><Trash2 size={16} /></button></>}</section>
     <AnalysisMetricGrid store={analysisStore} />
     <AnalysisWorkspace
       key={chartResetKey}

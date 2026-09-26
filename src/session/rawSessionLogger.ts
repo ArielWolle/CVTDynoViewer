@@ -1,4 +1,4 @@
-import { RAW_LOG_HEADER, rawMetadataComment, type RawSessionMetadata } from './rawFormat'
+import { RAW_LOG_HEADER, rawEndComment, rawMetadataComment, type RawSessionMetadata } from './rawFormat'
 
 const RAW_LOG_FLUSH_BYTES = 65_536
 const RAW_LOG_FLUSH_DEBOUNCE_MS = 200
@@ -25,8 +25,6 @@ export class RawSessionLogger {
   private flushPromise: Promise<void> | null = null
   private active = false
   private rawFileName = ''
-  private metadataFileName = ''
-  private metadata: RawSessionMetadata | null = null
 
   get isActive() { return this.active }
   get fileName() { return this.rawFileName }
@@ -35,19 +33,16 @@ export class RawSessionLogger {
     if (this.active) throw new Error('Raw logger is already active')
     this.directory = directory
     this.pending = ''
-    this.metadata = metadata
 
     const base = (sessionName.trim() || 'cvt-dyno-session').replace(/[<>:"/\\|?*]/g, '-')
     const stem = await this.nextAvailableStem(directory, base)
     this.rawFileName = `${stem}-raw.csv`
-    this.metadataFileName = `${stem}-meta.json`
 
     const file = await directory.getFileHandle(this.rawFileName, { create: true })
     const initial = await file.createWritable()
     await initial.write(`${rawMetadataComment(metadata)}\n${RAW_LOG_HEADER}\n`)
     await initial.close()
     await this.openWriter()
-    await this.writeMetadata(metadata)
     this.active = true
   }
 
@@ -59,7 +54,10 @@ export class RawSessionLogger {
       this.flushTimer = undefined
       void this.flush(true).catch(() => this.onError?.('Could not commit the raw log file'))
     } else if (this.flushTimer === undefined) {
-      this.flushTimer = window.setTimeout(() => { this.flushTimer = undefined; void this.flush(true).catch(() => this.onError?.('Could not commit the raw log file')) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
+      this.flushTimer = window.setTimeout(() => {
+        this.flushTimer = undefined
+        void this.flush(true).catch(() => this.onError?.('Could not commit the raw log file'))
+      }, RAW_LOG_FLUSH_DEBOUNCE_MS)
     }
   }
 
@@ -69,12 +67,16 @@ export class RawSessionLogger {
     if (this.flushTimer !== undefined) window.clearTimeout(this.flushTimer)
     this.flushTimer = undefined
     if (this.flushPromise) await this.flushPromise
+
+    // Telemetry rows are committed first. Only then is a clean-stop footer appended.
     await this.flush(false)
-    if (this.writer) await this.writer.close().catch(() => undefined)
-    this.writer = null
-    if (finalMetadata) {
-      this.metadata = finalMetadata
-      await this.writeMetadata(finalMetadata)
+    if (this.writer) {
+      await this.writer.close().catch(() => undefined)
+      this.writer = null
+    }
+
+    if (finalMetadata?.stoppedAt) {
+      await this.appendEndMetadata(finalMetadata as RawSessionMetadata & { stoppedAt: string })
     }
   }
 
@@ -119,16 +121,23 @@ export class RawSessionLogger {
       throw error
     } finally {
       if (reopen && this.active && this.pending && this.flushTimer === undefined) {
-        this.flushTimer = window.setTimeout(() => { this.flushTimer = undefined; void this.flush(true).catch(() => this.onError?.('Could not commit the raw log file')) }, RAW_LOG_FLUSH_DEBOUNCE_MS)
+        this.flushTimer = window.setTimeout(() => {
+          this.flushTimer = undefined
+          void this.flush(true).catch(() => this.onError?.('Could not commit the raw log file'))
+        }, RAW_LOG_FLUSH_DEBOUNCE_MS)
       }
     }
   }
 
-  private async writeMetadata(metadata: RawSessionMetadata) {
-    if (!this.directory || !this.metadataFileName) return
-    const file = await this.directory.getFileHandle(this.metadataFileName, { create: true })
-    const writer = await file.createWritable()
-    await writer.write(`${JSON.stringify(metadata, null, 2)}\n`)
-    await writer.close()
+  private async appendEndMetadata(metadata: RawSessionMetadata & { stoppedAt: string }) {
+    if (!this.directory || !this.rawFileName) return
+    const file = await this.directory.getFileHandle(this.rawFileName, { create: true })
+    const writer = await file.createWritable({ keepExistingData: true })
+    try {
+      await writer.seek((await file.getFile()).size)
+      await writer.write(`${rawEndComment(metadata)}\n`)
+    } finally {
+      await writer.close().catch(() => undefined)
+    }
   }
 }
