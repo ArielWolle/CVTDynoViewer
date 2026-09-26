@@ -5,6 +5,7 @@ export type UsbHandlers = {
   onValue: (channel: ChannelId, value: number, tUs: number, seq: number, edgeCount: number) => void
   onPacket?: (raw: Uint8Array, channel: ChannelId, value: number, seq: number) => void
   onText: (text: string) => void
+  onError?: (message: string) => void
 }
 
 // Must match platformio.ini's board_build.arduino.earlephilhower.usb_vid/usb_pid exactly -- these
@@ -70,6 +71,14 @@ export class UsbTransport {
     })
     this.worker = worker
     this.connectedFlag = true
+    worker.onerror = (event) => {
+      const error = new Error(event.message || 'USB worker failed')
+      this.connectedFlag = false
+      this.handlers.onText(`[USB WORKER ERROR] ${error.message}`)
+      this.handlers.onError?.(error.message)
+      this.flushWaiters.forEach((waiter) => waiter.reject(error))
+      this.flushWaiters.clear()
+    }
   }
 
   async disconnect() {
@@ -89,7 +98,10 @@ export class UsbTransport {
     this.worker.postMessage(sendMessage)
   }
 
-  async flush() {
+  // Delivery barrier only: this waits for every packet the worker had already decoded when
+  // the request reached it. It cannot see bytes still inside the device/browser USB stack; a
+  // firmware stream marker is required for a true physical stop boundary.
+  async flushDelivered() {
     if (!this.worker) return
     const requestId = this.nextFlushRequestId++
     await new Promise<void>((resolve, reject) => {
@@ -139,6 +151,7 @@ export class UsbTransport {
       this.handlers.onText(message.reason ?? 'USB device disconnected')
     } else if (message.type === 'send-error') {
       this.handlers.onText(`[SEND ERROR] ${message.message}`)
+      this.handlers.onError?.(`USB send error: ${message.message}`)
     }
   }
 }

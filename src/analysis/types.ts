@@ -39,6 +39,7 @@ export type RpmPoint = {
   time: number
   rpm: number
   sigmaRpm: number
+  epoch?: number
 }
 
 export type PowerPoint = {
@@ -49,6 +50,7 @@ export type PowerPoint = {
 export type ShiftPoint = {
   time: number
   value: number
+  epoch?: number
 }
 
 export type RatioPoint = {

@@ -3,15 +3,18 @@ import { AnalysisEngine } from './engine'
 import type { AnalysisConfig, AnalysisCounts, AnalysisPacket, AnalysisUpdate, RpmObservationMode, RpmObservationView } from './types'
 
 export type AnalysisWorkerInbound =
-  | { type: 'configure'; config: AnalysisConfig }
+  | { type: 'configure'; config: AnalysisConfig; requestId?: number }
   | { type: 'reset' }
   | { type: 'packets'; packets: AnalysisPacket[] }
+  | { type: 'process-batch'; packets: AnalysisPacket[]; requestId: number }
+  | { type: 'barrier'; requestId: number }
   | { type: 'snapshot'; requestId: number }
   | { type: 'observation-view'; mode: RpmObservationMode; startMs: number; endMs: number; maxPoints: number; requestId: number }
 
 export type AnalysisWorkerOutbound =
   | { type: 'update'; update: AnalysisUpdate; requestId?: number }
   | { type: 'observation-view'; view: RpmObservationView; requestId: number }
+  | { type: 'request-complete'; requestId: number }
 
 let engine: AnalysisEngine | null = null
 let publishTimer: number | null = null
@@ -22,6 +25,11 @@ function zeroCounts(): AnalysisCounts {
 }
 
 function markPublished() { if (engine) published = engine.counts() }
+
+function cancelScheduledPublish() {
+  if (publishTimer !== null) self.clearTimeout(publishTimer)
+  publishTimer = null
+}
 
 function publishReplace(requestId?: number) {
   if (!engine) return
@@ -37,6 +45,10 @@ function publishAppend() {
   markPublished()
 }
 
+function complete(requestId: number) {
+  postMessage({ type: 'request-complete', requestId } satisfies AnalysisWorkerOutbound)
+}
+
 function schedulePublish() {
   if (publishTimer !== null) return
   publishTimer = self.setTimeout(() => { publishTimer = null; publishAppend() }, 33)
@@ -45,10 +57,13 @@ function schedulePublish() {
 self.onmessage = (event: MessageEvent<AnalysisWorkerInbound>) => {
   const message = event.data
   if (message.type === 'configure') {
+    cancelScheduledPublish()
     if (engine) engine.setConfig(message.config)
     else engine = new AnalysisEngine(message.config)
     publishReplace()
+    if (message.requestId !== undefined) complete(message.requestId)
   } else if (message.type === 'reset') {
+    cancelScheduledPublish()
     engine?.reset()
     published = zeroCounts()
     publishReplace()
@@ -56,6 +71,16 @@ self.onmessage = (event: MessageEvent<AnalysisWorkerInbound>) => {
     if (!engine) return
     engine.ingestMany(message.packets)
     schedulePublish()
+  } else if (message.type === 'process-batch') {
+    if (!engine) { complete(message.requestId); return }
+    cancelScheduledPublish()
+    engine.ingestMany(message.packets)
+    publishAppend()
+    complete(message.requestId)
+  } else if (message.type === 'barrier') {
+    cancelScheduledPublish()
+    publishAppend()
+    complete(message.requestId)
   } else if (message.type === 'snapshot') {
     publishReplace(message.requestId)
   } else if (message.type === 'observation-view') {

@@ -1,6 +1,7 @@
 import type { AnalysisSnapshot, ShiftPoint } from './types'
 
-export const processedAnalysisHeader = 'timestamp_s,primary_rpm,secondary_rpm,shift_position_percent,primary_power_kw,secondary_power_kw,efficiency_percent,shift_ratio'
+export const PROCESSED_ANALYSIS_SCHEMA_VERSION = 2
+export const processedAnalysisHeader = 'schema_version,timestamp_s,primary_rpm,secondary_rpm,shift_position_percent,primary_power_kw,secondary_power_kw,efficiency_percent,shift_ratio'
 
 function heldShift(shift: readonly ShiftPoint[], time: number): number | null {
   if (!shift.length || time < shift[0].time) return null
@@ -11,12 +12,23 @@ function heldShift(shift: readonly ShiftPoint[], time: number): number | null {
     if (shift[mid].time <= time) low = mid
     else high = mid - 1
   }
-  return shift[low].value
+
+  const current = shift[low]
+  const next = shift[low + 1]
+  if (
+    next
+    && current.epoch !== undefined
+    && next.epoch !== undefined
+    && current.epoch !== next.epoch
+    && time > current.time
+    && time < next.time
+  ) return null
+  return current.value
 }
 
 export function analysisSnapshotToCsv(snapshot: AnalysisSnapshot): string {
   const times = new Set<number>()
-  for (const series of [snapshot.primaryRpm, snapshot.secondaryRpm, snapshot.primaryPower, snapshot.secondaryPower, snapshot.ratio, snapshot.efficiency]) {
+  for (const series of [snapshot.primaryRpm, snapshot.secondaryRpm, snapshot.primaryPower, snapshot.secondaryPower, snapshot.ratio, snapshot.efficiency, snapshot.shift]) {
     for (const point of series) times.add(point.time)
   }
   const rpm1 = new Map(snapshot.primaryRpm.map((point) => [point.time, point.rpm]))
@@ -28,6 +40,7 @@ export function analysisSnapshotToCsv(snapshot: AnalysisSnapshot): string {
 
   const cell = (value: number | null | undefined, digits: number) => Number.isFinite(value) ? (value as number).toFixed(digits) : ''
   const rows = [...times].sort((a, b) => a - b).map((time) => [
+    PROCESSED_ANALYSIS_SCHEMA_VERSION,
     (time / 1000).toFixed(6),
     cell(rpm1.get(time), 3),
     cell(rpm2.get(time), 3),

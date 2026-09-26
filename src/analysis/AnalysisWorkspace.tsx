@@ -5,7 +5,8 @@ import { TimeRangeSlider } from '../TimeRangeSlider'
 import { ANALYSIS_WINDOWS_MS, type EfficiencyPoint, type RatioPoint, type RpmObservationMode, type RpmObservationView, type RpmPoint, type ShiftPoint } from './types'
 import { findNearestTime } from './uiStore'
 import { AnalysisStore, type PowerRow, type WithSeconds } from './store'
-import { nearestProjectedPoint, projectToPlot } from './relationshipHover'
+import { projectToPlot } from './relationshipHover'
+import { RelationshipSpatialIndex } from './relationshipIndex'
 import { TelemetryCanvas } from './TelemetryCanvas'
 import { usePlotGeometry } from './usePlotGeometry'
 import type { NumericDomain, PlotGeometry } from './plotGeometry'
@@ -167,7 +168,7 @@ function AnalysisPointCount({ store }: { store: AnalysisStore }) {
 function AnalysisWorkspaceComponent({
   store, chartPlaying, frozenDomainEnd, onToggleChartPlaying, analysisWindowMs, onAnalysisWindowChange,
   observationMode, onObservationModeChange, charts, setCharts, lowRatio, highRatio, onLowRatioChange,
-  onHighRatioChange, sourceLabel, requestObservations, initialFullRange = false,
+  onHighRatioChange, sourceLabel, requestObservations, analysisBusy = false, initialFullRange = false,
 }: {
   store: AnalysisStore
   chartPlaying: boolean
@@ -185,6 +186,7 @@ function AnalysisWorkspaceComponent({
   onHighRatioChange: (value: number) => void
   sourceLabel: string
   requestObservations: (mode: RpmObservationMode, startMs: number, endMs: number, maxPoints: number) => Promise<RpmObservationView>
+  analysisBusy?: boolean
   initialFullRange?: boolean
 }) {
   const [manualRange, setManualRange] = useState<{ start: number; end: number } | null>(
@@ -287,7 +289,7 @@ function AnalysisWorkspaceComponent({
       <div className="workspace-tools">
         <AnalysisPointCount store={store} />
         <button className={`button ${chartPlaying ? 'button-quiet' : 'button-accent'}`} onClick={onToggleChartPlaying} title={chartPlaying ? 'Freeze the displayed view; capture and analysis continue' : 'Resume following the latest analysis'}>{chartPlaying ? <Pause size={15} /> : <Play size={15} />}{chartPlaying ? 'Freeze view' : 'View frozen'}</button>
-        <label className="analysis-select"><span>Analysis interval</span><select value={analysisWindowMs} onChange={(event: ChangeEvent<HTMLSelectElement>) => onAnalysisWindowChange(Number(event.target.value))}>{ANALYSIS_WINDOWS_MS.map((value) => <option value={value} key={value}>{value} ms</option>)}</select></label>
+        <label className="analysis-select"><span>Analysis interval</span><select disabled={analysisBusy} value={analysisWindowMs} onChange={(event: ChangeEvent<HTMLSelectElement>) => onAnalysisWindowChange(Number(event.target.value))}>{ANALYSIS_WINDOWS_MS.map((value) => <option value={value} key={value}>{value} ms</option>)}</select></label>
         <label className="analysis-select"><span>RPM observations</span><select value={observationMode} onChange={(event: ChangeEvent<HTMLSelectElement>) => onObservationModeChange(event.target.value as RpmObservationMode)}><option value="none">None</option><option value="revolution">1-rev estimate</option><option value="tooth">Per tooth</option></select></label>
         <button className="button button-quiet" onClick={() => setCharts(defaultCharts)}><RotateCcw size={15} />Reset layout</button>
       </div>
@@ -340,6 +342,9 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
   const relationshipData: readonly RelationshipDatum[] = config.id === 'scatter' ? view.ratioDots
     : config.id === 'shiftEfficiency' ? view.efficiencyDots
     : EMPTY_RELATIONSHIP_DATA
+  const relationshipRenderData: readonly RelationshipDatum[] = config.id === 'scatter' ? view.ratioTime
+    : config.id === 'shiftEfficiency' ? view.efficiencyTime
+    : EMPTY_RELATIONSHIP_DATA
   const timeData: readonly TimeChartDatum[] = config.id === 'rpm1' ? view.primaryRpm
     : config.id === 'rpm2' ? view.secondaryRpm
     : config.id === 'shift' ? view.shift
@@ -387,18 +392,21 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
     }
   }, [plotGeometry, relationshipDomains, relationshipReadout, relationshipX, relationshipY])
 
+  const relationshipIndex = useMemo(() => (
+    relationship && plotGeometry
+      ? new RelationshipSpatialIndex(
+        relationshipData,
+        relationshipDomains.x,
+        relationshipDomains.y,
+        plotGeometry,
+        relationshipX,
+        relationshipY,
+      )
+      : null
+  ), [plotGeometry, relationship, relationshipData, relationshipDomains, relationshipX, relationshipY])
+
   const nearestRelationship = useCallback((mouseX: number, mouseY: number): RelationshipSnap | undefined => {
-    if (!relationship || !plotGeometry) return undefined
-    const nearest = nearestProjectedPoint(
-      relationshipData,
-      mouseX,
-      mouseY,
-      relationshipDomains.x,
-      relationshipDomains.y,
-      plotGeometry,
-      relationshipX,
-      relationshipY,
-    )
+    const nearest = relationshipIndex?.nearest(mouseX, mouseY)
     if (!nearest) return undefined
     return {
       time: nearest.point.time,
@@ -406,7 +414,7 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
       yPx: nearest.yPx,
       readout: relationshipReadout(nearest.point),
     }
-  }, [plotGeometry, relationship, relationshipData, relationshipDomains, relationshipReadout, relationshipX, relationshipY])
+  }, [relationshipIndex, relationshipReadout])
 
   const hideHover = useCallback(() => {
     if (crosshairRef.current) crosshairRef.current.style.display = 'none'
@@ -452,16 +460,19 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
       return
     }
 
-    // Hover interrogates the full-resolution derived store, never the decimated Canvas view.
+    // Full-resolution hover is constrained to the visible/frozen viewport and rejects a
+    // remote point across a genuine analysis gap.
+    const analysisNearest = { minTime: windowStart, maxTime: windowEnd, maxDelta: Math.max(20, analysisWindowMs * 2) }
+    const shiftNearest = { minTime: windowStart, maxTime: windowEnd, maxDelta: Math.max(250, analysisWindowMs * 2) }
     let text = ''
-    if (config.id === 'rpm1') text = `${formatNumber(store.nearest('primaryRpm', hoverTime)?.rpm ?? Number.NaN)} RPM`
-    else if (config.id === 'rpm2') text = `${formatNumber(store.nearest('secondaryRpm', hoverTime)?.rpm ?? Number.NaN)} RPM`
-    else if (config.id === 'shift') text = `${formatNumber(store.nearest('shift', hoverTime)?.value ?? Number.NaN)}%`
-    else if (config.id === 'shiftRatio') text = formatNumber(store.nearest('ratio', hoverTime)?.ratio ?? Number.NaN, 3)
-    else if (config.id === 'efficiency') text = `${formatNumber(store.nearest('efficiency', hoverTime)?.efficiencyPct ?? Number.NaN)}%`
+    if (config.id === 'rpm1') text = `${formatNumber(store.nearest('primaryRpm', hoverTime, analysisNearest)?.rpm ?? Number.NaN)} RPM`
+    else if (config.id === 'rpm2') text = `${formatNumber(store.nearest('secondaryRpm', hoverTime, analysisNearest)?.rpm ?? Number.NaN)} RPM`
+    else if (config.id === 'shift') text = `${formatNumber(store.nearest('shift', hoverTime, shiftNearest)?.value ?? Number.NaN)}%`
+    else if (config.id === 'shiftRatio') text = formatNumber(store.nearest('ratio', hoverTime, analysisNearest)?.ratio ?? Number.NaN, 3)
+    else if (config.id === 'efficiency') text = `${formatNumber(store.nearest('efficiency', hoverTime, analysisNearest)?.efficiencyPct ?? Number.NaN)}%`
     else if (config.id === 'power') {
-      const primary = store.nearest('primaryPower', hoverTime)?.powerKw ?? Number.NaN
-      const secondary = store.nearest('secondaryPower', hoverTime)?.powerKw ?? Number.NaN
+      const primary = store.nearest('primaryPower', hoverTime, analysisNearest)?.powerKw ?? Number.NaN
+      const secondary = store.nearest('secondaryPower', hoverTime, analysisNearest)?.powerKw ?? Number.NaN
       text = `Pri ${formatNumber(primary)} kW / Sec ${formatNumber(secondary)} kW`
     }
     if (text) { readout.textContent = text; readout.style.display = '' }
@@ -489,7 +500,7 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
   return <article className="chart-card" onDragOver={(event: DragEvent<HTMLElement>) => event.preventDefault()} onDrop={onDrop}>
     <header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{headerControls}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header>
     <div className="chart-body" ref={chartBodyRef} onMouseMove={handleMouseMove} onMouseLeave={() => hoverBus.publish({ time: null, sourceChartId: null })}>
-      <AnalysisPlot config={config} timeData={timeData} relationshipData={relationshipData} primaryObs={plotPrimaryObs} secondaryObs={plotSecondaryObs} plotGeometry={plotGeometry} xDomain={xDomain} visibleSpanMs={visibleSpanMs} scatterMax={plotScatterMax} efficiencyMax={plotEfficiencyMax} powerDomain={plotPowerDomain} lowRatio={plotLowRatio} highRatio={plotHighRatio} />
+      <AnalysisPlot config={config} timeData={timeData} relationshipData={relationshipRenderData} primaryObs={plotPrimaryObs} secondaryObs={plotSecondaryObs} plotGeometry={plotGeometry} xDomain={xDomain} visibleSpanMs={visibleSpanMs} scatterMax={plotScatterMax} efficiencyMax={plotEfficiencyMax} powerDomain={plotPowerDomain} lowRatio={plotLowRatio} highRatio={plotHighRatio} />
       <div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />
       {relationship && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}
     </div>

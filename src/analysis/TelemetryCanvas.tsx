@@ -31,6 +31,7 @@ function drawLine<T>(
   plot: PlotGeometry,
   color: string,
   width = 2,
+  canConnect: ((previous: T, current: T) => boolean) | null = null,
 ) {
   ctx.beginPath()
   ctx.strokeStyle = color
@@ -38,20 +39,23 @@ function drawLine<T>(
   ctx.lineJoin = 'round'
   ctx.lineCap = 'round'
   let drawing = false
+  let previousPoint: T | null = null
 
   for (const point of values) {
     const x = projectX(getX(point), xDomain, plot)
     const y = projectY(getY(point), yDomain, plot)
     if (x === null || y === null) {
       drawing = false
+      previousPoint = null
       continue
     }
-    if (!drawing) {
+    if (!drawing || (previousPoint !== null && canConnect && !canConnect(previousPoint, point))) {
       ctx.moveTo(x, y)
       drawing = true
     } else {
       ctx.lineTo(x, y)
     }
+    previousPoint = point
   }
   ctx.stroke()
 }
@@ -131,11 +135,11 @@ function drawTelemetry(ctx: CanvasRenderingContext2D, props: Props) {
     const observations = chartId === 'rpm1' ? primaryObs : secondaryObs
     drawDots(ctx, observations, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 1.5, 0.24)
     const rpm = timeData as readonly WithSeconds<RpmPoint>[]
-    drawLine(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color)
+    drawLine(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 2, (a, b) => a.epoch === undefined || b.epoch === undefined || a.epoch === b.epoch)
     drawDots(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 1.8)
   } else if (chartId === 'shift') {
     const shift = timeData as readonly WithSeconds<ShiftPoint>[]
-    drawLine(ctx, shift, (p) => p.seconds, (p) => p.value, xDomain, yDomain, plot, color)
+    drawLine(ctx, shift, (p) => p.seconds, (p) => p.value, xDomain, yDomain, plot, color, 2, (a, b) => a.epoch === undefined || b.epoch === undefined || a.epoch === b.epoch)
   } else if (chartId === 'power') {
     const power = timeData as readonly PowerRow[]
     drawLine(ctx, power, (p) => p.seconds, (p) => p.power1 ?? Number.NaN, xDomain, yDomain, plot, '#f05d3b')

@@ -6,6 +6,8 @@ export type RawReplaySpeed = typeof RAW_REPLAY_SPEEDS[number]
 export type RawReplayState = {
   loaded: boolean
   playing: boolean
+  analyzing: boolean
+  analysisProgress: number
   speed: RawReplaySpeed
   loop: boolean
   progress: number
@@ -22,30 +24,21 @@ type ReplayClock = {
 
 type RawReplayCallbacks = {
   onBatch: (packets: AnalysisPacket[]) => void
+  onBulkBatch?: (packets: AnalysisPacket[]) => Promise<void>
+  onDrain?: () => Promise<void>
   onReset: (firstPacketUs: number, loopCount: number) => void
   onState: (state: RawReplayState) => void
 }
 
 const TICK_MS = 8
 const STATE_UPDATE_MS = 50
+const BULK_BATCH_SIZE = 10_000
 const browserClock: ReplayClock = {
   now: () => performance.now(),
   setTimer: (callback, delayMs) => window.setTimeout(callback, delayMs),
   clearTimer: (timerId) => window.clearTimeout(timerId),
 }
 
-/**
- * Replays raw rows in their recorded FILE/ARRIVAL ORDER. Firmware capture timestamps are
- * channel-local measurements and are deliberately not globally monotonic: a secondary packet
- * drained after a primary packet may have been captured slightly earlier. Therefore tUs cannot
- * itself be used as a globally sortable replay clock.
- *
- * For old/current raw logs there is no independent host-arrival timestamp. We construct a
- * monotonic stream clock from the running maximum capture timestamp encountered in file order.
- * A late packet whose tUs is behind that maximum is delivered immediately at the current stream
- * time, while its original tUs is passed through unchanged to the analysis engine. This preserves
- * both pieces of truth we actually have: row arrival order and physical capture timestamps.
- */
 export class RawReplayController {
   private packets: AnalysisPacket[] = []
   private replayOffsetsMs: number[] = []
@@ -56,14 +49,18 @@ export class RawReplayController {
   private playStartedMs = 0
   private timer: number | null = null
   private playing = false
+  private analyzing = false
+  private analysisProgress = 0
   private speed: RawReplaySpeed = 1
   private loop = true
   private loopCount = 0
   private lastStateEmitMs = -Infinity
+  private operationId = 0
 
   constructor(private callbacks: RawReplayCallbacks, private clock: ReplayClock = browserClock) {}
 
   load(packets: readonly AnalysisPacket[]) {
+    this.operationId += 1
     this.stopTimer()
     this.packets = [...packets]
     this.firstUs = this.packets[0]?.tUs ?? 0
@@ -78,33 +75,59 @@ export class RawReplayController {
     this.basePositionMs = 0
     this.playStartedMs = this.clock.now()
     this.playing = false
+    this.analyzing = false
+    this.analysisProgress = 0
     this.loopCount = 0
     if (this.packets.length) this.callbacks.onReset(this.firstUs, this.loopCount)
     this.emitState(undefined, true)
   }
 
-  showAll() {
-    if (!this.packets.length) return
+  async showAll(): Promise<boolean> {
+    if (!this.packets.length || this.analyzing) return false
+    const operation = ++this.operationId
     this.stopTimer()
     this.cursor = 0
     this.basePositionMs = 0
     this.playing = false
+    this.analyzing = true
+    this.analysisProgress = 0
     this.loopCount = 0
-
-    // A complete-view load is a fresh analysis pass over the saved source data, not a timed replay.
-    // Reset first so this method is safe even after a partial replay, then publish the raw packets
-    // once in their recorded arrival order. The worker receives one batch, so this is intentionally
-    // cheap compared with accelerating the replay clock just to reach the end.
     this.callbacks.onReset(this.firstUs, this.loopCount)
-    this.callbacks.onBatch([...this.packets])
+    this.emitState(0, true)
 
-    this.cursor = this.packets.length
-    this.basePositionMs = this.durationMs
-    this.playStartedMs = this.clock.now()
-    this.emitState(this.durationMs, true)
+    try {
+      for (let start = 0; start < this.packets.length; start += BULK_BATCH_SIZE) {
+        if (operation !== this.operationId) return false
+        const end = Math.min(this.packets.length, start + BULK_BATCH_SIZE)
+        const batch = this.packets.slice(start, end)
+        if (this.callbacks.onBulkBatch) await this.callbacks.onBulkBatch(batch)
+        else this.callbacks.onBatch(batch)
+        if (operation !== this.operationId) return false
+        this.cursor = end
+        this.analysisProgress = end / this.packets.length
+        this.basePositionMs = this.replayOffsetsMs[Math.max(0, end - 1)] ?? 0
+        this.emitState(this.basePositionMs, true)
+      }
+
+      if (operation !== this.operationId) return false
+      this.cursor = this.packets.length
+      this.basePositionMs = this.durationMs
+      this.playStartedMs = this.clock.now()
+      this.analysisProgress = 1
+      this.analyzing = false
+      this.emitState(this.durationMs, true)
+      return true
+    } catch (error) {
+      if (operation === this.operationId) {
+        this.analyzing = false
+        this.emitState(this.basePositionMs, true)
+      }
+      throw error
+    }
   }
 
   clear() {
+    this.operationId += 1
     this.stopTimer()
     this.packets = []
     this.replayOffsetsMs = []
@@ -113,12 +136,15 @@ export class RawReplayController {
     this.cursor = 0
     this.basePositionMs = 0
     this.playing = false
+    this.analyzing = false
+    this.analysisProgress = 0
     this.loopCount = 0
     this.emitState(undefined, true)
   }
 
   play() {
-    if (!this.packets.length || this.playing) return
+    if (!this.packets.length || this.playing || this.analyzing) return
+    this.operationId += 1
     if (this.basePositionMs >= this.durationMs && this.cursor >= this.packets.length) this.restart(false)
     this.playStartedMs = this.clock.now()
     this.playing = true
@@ -135,10 +161,13 @@ export class RawReplayController {
   }
 
   restart(keepPlaying = this.playing) {
+    this.operationId += 1
     this.stopTimer()
     this.cursor = 0
     this.basePositionMs = 0
     this.playing = false
+    this.analyzing = false
+    this.analysisProgress = 0
     this.loopCount = 0
     if (this.packets.length) this.callbacks.onReset(this.firstUs, this.loopCount)
     this.emitState(undefined, true)
@@ -162,11 +191,15 @@ export class RawReplayController {
     return Math.min(this.durationMs, this.basePositionMs + Math.max(0, (this.clock.now() - this.playStartedMs) * this.speed))
   }
 
-  private schedule(delayMs = TICK_MS) { this.stopTimer(); this.timer = this.clock.setTimer(() => this.pump(), delayMs) }
+  private schedule(delayMs = TICK_MS) {
+    this.stopTimer()
+    const operation = this.operationId
+    this.timer = this.clock.setTimer(() => { void this.pump(operation) }, delayMs)
+  }
 
-  private pump() {
+  private async pump(operation: number) {
     this.timer = null
-    if (!this.playing || !this.packets.length) return
+    if (!this.playing || !this.packets.length || operation !== this.operationId) return
     const positionMs = this.currentPositionMs()
     const due: AnalysisPacket[] = []
     while (this.cursor < this.packets.length && this.replayOffsetsMs[this.cursor] <= positionMs) {
@@ -175,13 +208,25 @@ export class RawReplayController {
     if (due.length) this.callbacks.onBatch(due)
 
     if (this.cursor >= this.packets.length) {
+      try {
+        await this.callbacks.onDrain?.()
+      } catch {
+        if (operation === this.operationId) {
+          this.playing = false
+          this.emitState(this.currentPositionMs(), true)
+        }
+        return
+      }
+      if (operation !== this.operationId) return
       this.basePositionMs = this.durationMs
       this.playing = false
+      this.analysisProgress = 1
       this.emitState(undefined, true)
       if (this.loop) {
         this.loopCount += 1
         this.cursor = 0
         this.basePositionMs = 0
+        this.analysisProgress = 0
         this.callbacks.onReset(this.firstUs, this.loopCount)
         this.playStartedMs = this.clock.now()
         this.playing = true
@@ -202,6 +247,17 @@ export class RawReplayController {
     this.lastStateEmitMs = now
     const loaded = this.packets.length > 0
     const progress = !loaded ? 0 : this.durationMs > 0 ? Math.min(1, Math.max(0, positionMs / this.durationMs)) : 1
-    this.callbacks.onState({ loaded, playing: this.playing, speed: this.speed, loop: this.loop, progress, elapsedMs: positionMs, durationMs: this.durationMs, loopCount: this.loopCount })
+    this.callbacks.onState({
+      loaded,
+      playing: this.playing,
+      analyzing: this.analyzing,
+      analysisProgress: this.analysisProgress,
+      speed: this.speed,
+      loop: this.loop,
+      progress,
+      elapsedMs: positionMs,
+      durationMs: this.durationMs,
+      loopCount: this.loopCount,
+    })
   }
 }

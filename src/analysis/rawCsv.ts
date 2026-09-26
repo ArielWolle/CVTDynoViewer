@@ -1,4 +1,5 @@
 import type { AnalysisPacket, AnalysisChannelId } from './types'
+import { RAW_LOG_HEADER, parseEmbeddedRawMetadata, type RawSessionMetadata } from '../session/rawFormat'
 
 function splitCsvLine(line: string): string[] {
   const cells: string[] = []
@@ -18,7 +19,12 @@ function splitCsvLine(line: string): string[] {
   return cells
 }
 
-export const RAW_LOG_HEADER = 'firmware_t_us,wall_time_s,channel,channel_name,seq,raw_value,edge_count'
+export { RAW_LOG_HEADER } from '../session/rawFormat'
+
+export type ParsedRawLog = {
+  packets: AnalysisPacket[]
+  metadata: RawSessionMetadata | null
+}
 
 export function isRawLogCsv(text: string): boolean {
   const first = text.split(/\r?\n/).find((line) => line.trim() && !line.trimStart().startsWith('#'))
@@ -26,17 +32,20 @@ export function isRawLogCsv(text: string): boolean {
   return first.split(',').map((cell) => cell.trim().toLowerCase()).join(',') === RAW_LOG_HEADER
 }
 
-export function parseRawLogCsv(text: string): AnalysisPacket[] {
-  if (!isRawLogCsv(text)) return []
+export function parseRawLog(text: string): ParsedRawLog {
+  const metadata = parseEmbeddedRawMetadata(text)
+  if (!isRawLogCsv(text)) return { packets: [], metadata }
+
   const lines = text.split(/\r?\n/).filter((line) => line.trim() && !line.trimStart().startsWith('#'))
-  if (lines.length < 2) return []
+  if (lines.length < 2) return { packets: [], metadata }
+
   const header = splitCsvLine(lines[0]).map((cell) => cell.trim().toLowerCase())
   const tIndex = header.indexOf('firmware_t_us')
   const channelIndex = header.indexOf('channel')
   const seqIndex = header.indexOf('seq')
   const valueIndex = header.indexOf('raw_value')
   const edgeIndex = header.indexOf('edge_count')
-  if ([tIndex, channelIndex, seqIndex, valueIndex, edgeIndex].some((index) => index < 0)) return []
+  if ([tIndex, channelIndex, seqIndex, valueIndex, edgeIndex].some((index) => index < 0)) return { packets: [], metadata }
 
   const packets: AnalysisPacket[] = []
   for (let lineIndex = 1; lineIndex < lines.length; lineIndex += 1) {
@@ -49,7 +58,10 @@ export function parseRawLogCsv(text: string): AnalysisPacket[] {
     if (!Number.isFinite(tUs) || !Number.isInteger(channel) || channel < 0 || channel > 5 || !Number.isFinite(seq) || !Number.isFinite(value) || !Number.isFinite(edgeCount)) continue
     packets.push({ channel: channel as AnalysisChannelId, value, tUs, seq, edgeCount })
   }
-  // Preserve the exact file/host arrival order. The analysis engine is deliberately channel-local
-  // and must not require a globally timestamp-sorted stream.
-  return packets
+
+  return { packets, metadata }
+}
+
+export function parseRawLogCsv(text: string): AnalysisPacket[] {
+  return parseRawLog(text).packets
 }

@@ -12,6 +12,7 @@ import type {
 export type AnalysisSeriesKey = keyof AnalysisSnapshot
 export type WithSeconds<T> = T & { seconds: number }
 export type PowerRow = { time: number; seconds: number; power1?: number; power2?: number }
+export type NearestOptions = { minTime?: number; maxTime?: number; maxDelta?: number }
 
 export type CurrentAnalysisMetrics = {
   rpm1: number
@@ -180,22 +181,29 @@ class ChunkedTimeSeries<T extends TimePoint> {
     return result
   }
 
-  nearest(target: number): T | undefined {
+  nearest(target: number, options: NearestOptions = {}): T | undefined {
     if (!this._length) return undefined
+    const minTime = options.minTime ?? -Infinity
+    const maxTime = options.maxTime ?? Infinity
+    const maxDelta = options.maxDelta ?? Infinity
+    if (maxTime < minTime || maxDelta < 0) return undefined
+
+    const searchTarget = Math.min(maxTime, Math.max(minTime, target))
     const chunkIndex = Math.min(
-      this.findFirstChunkWhoseLastIsAtLeast(target),
+      this.findFirstChunkWhoseLastIsAtLeast(searchTarget),
       this.chunks.length - 1,
     )
     let best: T | undefined
     let bestDelta = Infinity
     for (let candidateChunk = Math.max(0, chunkIndex - 1); candidateChunk <= Math.min(this.chunks.length - 1, chunkIndex + 1); candidateChunk += 1) {
       const chunk = this.chunks[candidateChunk]
-      const index = lowerBoundTime(chunk, target)
+      const index = lowerBoundTime(chunk, searchTarget)
       for (const candidateIndex of [index - 1, index]) {
         if (candidateIndex < 0 || candidateIndex >= chunk.length) continue
         const point = chunk[candidateIndex]
+        if (point.time < minTime || point.time > maxTime) continue
         const delta = Math.abs(point.time - target)
-        if (delta < bestDelta) {
+        if (delta <= maxDelta && delta < bestDelta) {
           best = point
           bestDelta = delta
         }
@@ -551,8 +559,8 @@ export class AnalysisStore {
     return this.status.firstTime
   }
 
-  nearest<K extends AnalysisSeriesKey>(key: K, time: number): AnalysisSnapshot[K][number] | undefined {
-    return this.series(key).nearest(time) as AnalysisSnapshot[K][number] | undefined
+  nearest<K extends AnalysisSeriesKey>(key: K, time: number, options: NearestOptions = {}): AnalysisSnapshot[K][number] | undefined {
+    return this.series(key).nearest(time, options) as AnalysisSnapshot[K][number] | undefined
   }
 
 
@@ -593,14 +601,23 @@ export class AnalysisStore {
       latestTime: latestCandidates.length ? Math.max(...latestCandidates) : 0,
       totalCount: Object.values(counts).reduce((sum, value) => sum + value, 0),
       counts,
-      current: {
-        rpm1: this.primaryRpm.last()?.rpm ?? Number.NaN,
-        rpm2: this.secondaryRpm.last()?.rpm ?? Number.NaN,
-        shift: this.shift.last()?.value ?? Number.NaN,
-        power1: this.primaryPower.last()?.powerKw ?? Number.NaN,
-        power2: this.secondaryPower.last()?.powerKw ?? Number.NaN,
-        efficiency: this.efficiency.last()?.efficiencyPct ?? Number.NaN,
-      },
+      current: (() => {
+        const primaryPower = this.primaryPower.last()
+        const secondaryPower = this.secondaryPower.last()
+        const efficiency = this.efficiency.last()
+        const efficiencyCurrent = efficiency && primaryPower && secondaryPower
+          && efficiency.time === primaryPower.time && efficiency.time === secondaryPower.time
+          ? efficiency.efficiencyPct
+          : Number.NaN
+        return {
+          rpm1: this.primaryRpm.last()?.rpm ?? Number.NaN,
+          rpm2: this.secondaryRpm.last()?.rpm ?? Number.NaN,
+          shift: this.shift.last()?.value ?? Number.NaN,
+          power1: primaryPower?.powerKw ?? Number.NaN,
+          power2: secondaryPower?.powerKw ?? Number.NaN,
+          efficiency: efficiencyCurrent,
+        }
+      })(),
     }
   }
 }

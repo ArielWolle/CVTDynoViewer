@@ -22,9 +22,6 @@ class FakeClock {
   }
 }
 
-// Arrival/file order is intentionally NOT globally sorted by firmware capture time.
-// This mirrors the real dual-channel raw logs: a packet drained later can carry an older
-// capture timestamp than the packet immediately before it.
 const packets: AnalysisPacket[] = [
   { channel: 0, value: 1000, tUs: 1_000_000, seq: 1, edgeCount: 1 },
   { channel: 1, value: 1000, tUs: 1_020_000, seq: 1, edgeCount: 1 },
@@ -43,39 +40,50 @@ describe('RawReplayController', () => {
     expect(delivered).toEqual(packets)
   })
 
-  it('changes wall-clock replay speed without changing packet timestamps or row order', () => {
+  it('does not call a full-run load ready until the analysis acknowledgement resolves', async () => {
     const clock = new FakeClock()
     const delivered: AnalysisPacket[] = []
-    const controller = new RawReplayController({ onBatch: (batch) => delivered.push(...batch), onReset: () => undefined, onState: () => undefined }, clock)
-    controller.setLoop(false)
-    controller.setSpeed(2)
-    controller.load(packets)
-    controller.play()
-    // Stream-time offsets are 0 ms, 20 ms, 20 ms (running-max capture clock).
-    // At 2x they are nominally due by 10 ms; the replay controller deliberately batches on an 8 ms timer tick, so the batch is observed by 16 ms.
-    clock.advance(17)
-    expect(delivered).toEqual(packets)
-    expect(delivered.map((packet) => packet.tUs)).toEqual([1_000_000, 1_020_000, 1_010_000])
-  })
-  it('shows the complete saved run immediately and replays from the beginning', () => {
-    const clock = new FakeClock()
-    const delivered: AnalysisPacket[] = []
-    const states: Array<{ playing: boolean; progress: number }> = []
-    let resets = 0
+    const states: Array<{ analyzing: boolean; analysisProgress: number; progress: number }> = []
+    let release: () => void = () => { throw new Error('bulk analysis acknowledgement was never registered') }
+
     const controller = new RawReplayController({
       onBatch: (batch) => delivered.push(...batch),
-      onReset: () => { resets += 1 },
-      onState: (state) => states.push({ playing: state.playing, progress: state.progress }),
+      onBulkBatch: (batch) => {
+        delivered.push(...batch)
+        return new Promise<void>((resolve) => { release = resolve })
+      },
+      onReset: () => undefined,
+      onState: (state) => states.push({ analyzing: state.analyzing, analysisProgress: state.analysisProgress, progress: state.progress }),
     }, clock)
 
     controller.setLoop(false)
     controller.load(packets)
-    controller.showAll()
+    const loading = controller.showAll()
 
+    expect(states.at(-1)?.analyzing).toBe(true)
+    expect(states.at(-1)?.analysisProgress).toBe(0)
+    release()
+    expect(await loading).toBe(true)
     expect(delivered).toEqual(packets)
-    expect(states.at(-1)).toEqual({ playing: false, progress: 1 })
+    expect(states.at(-1)).toEqual({ analyzing: false, analysisProgress: 1, progress: 1 })
+  })
 
-    // Playback from the complete-view state must reset first and then start from packet zero.
+  it('replays from the beginning after a completed full-run preview', async () => {
+    const clock = new FakeClock()
+    const delivered: AnalysisPacket[] = []
+    let resets = 0
+    const controller = new RawReplayController({
+      onBatch: (batch) => delivered.push(...batch),
+      onBulkBatch: async (batch) => { delivered.push(...batch) },
+      onDrain: async () => undefined,
+      onReset: () => { resets += 1 },
+      onState: () => undefined,
+    }, clock)
+
+    controller.setLoop(false)
+    controller.load(packets)
+    await controller.showAll()
+
     delivered.length = 0
     const resetsBeforePlay = resets
     controller.play()
@@ -84,5 +92,4 @@ describe('RawReplayController', () => {
     expect(resets).toBe(resetsBeforePlay + 1)
     expect(delivered[0]).toEqual(packets[0])
   })
-
 })

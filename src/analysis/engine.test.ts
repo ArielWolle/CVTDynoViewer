@@ -119,4 +119,39 @@ describe('AnalysisEngine independent streaming series', () => {
     expect(view.primary).toHaveLength(100)
     expect(engine.snapshot()).toEqual(before)
   })
+  it('preserves an explicit stopped RPM endpoint and restarts in a fresh epoch', () => {
+    const engine = new AnalysisEngine(config({ windowMs: 5 }))
+    const beforeStop = constantRpmPackets(0, 16, 3000, 0.6)
+    engine.ingestMany(beforeStop)
+
+    const last = beforeStop[beforeStop.length - 1]
+    engine.ingest({ channel: 0, value: 0, tUs: 1_100_000, seq: (last.seq + 1) & 0xff, edgeCount: last.edgeCount })
+
+    let snapshot = engine.snapshot()
+    expect(snapshot.primaryRpm.at(-1)?.rpm).toBe(0)
+    expect(snapshot.primaryPower.at(-1)?.powerKw).toBe(0)
+
+    const restarted = constantRpmPackets(0, 16, 2500, 0.6, 61_000_000).map((packet, index) => ({
+      ...packet,
+      seq: (last.seq + 2 + index) & 0xff,
+      edgeCount: last.edgeCount + 1 + index,
+    }))
+    engine.ingestMany(restarted)
+
+    snapshot = engine.snapshot()
+    const zeroIndex = snapshot.primaryRpm.findIndex((point) => point.rpm === 0)
+    const firstRestart = snapshot.primaryRpm.slice(zeroIndex + 1).find((point) => point.rpm > 0)
+    expect(firstRestart?.time).toBeGreaterThan(61_000)
+    expect(firstRestart?.epoch).not.toBe(snapshot.primaryRpm[zeroIndex].epoch)
+  })
+
+  it('starts a new shift segment when a shift telemetry packet is known to be missing', () => {
+    const engine = new AnalysisEngine(config())
+    engine.ingest({ channel: 2, value: 10, tUs: 100_000, seq: 1, edgeCount: 0 })
+    engine.ingest({ channel: 2, value: 20, tUs: 200_000, seq: 3, edgeCount: 0 })
+    const shift = engine.snapshot().shift
+    expect(shift).toHaveLength(2)
+    expect(shift[0].epoch).not.toBe(shift[1].epoch)
+  })
+
 })

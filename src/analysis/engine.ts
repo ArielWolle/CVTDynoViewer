@@ -244,6 +244,8 @@ export class AnalysisEngine {
   private toothObservations: [RpmSampleUs[], RpmSampleUs[]] = [[], []]
   private torqueSamples: [ScalarSample[], ScalarSample[]] = [[], []]
   private shiftPoints: ShiftPoint[] = []
+  private shiftEpoch = 0
+  private lastShiftSeq: number | null = null
   private rpmEpochBreakPending: [boolean, boolean] = [false, false]
   private nextGridUs: [number | null, number | null] = [null, null]
   private pendingTorquePower: [Set<number>, Set<number>] = [new Set(), new Set()]
@@ -329,7 +331,7 @@ export class AnalysisEngine {
 
   private process(packet: AnalysisPacket) {
     if (packet.channel === 0 || packet.channel === 1) this.ingestRpm(packet.channel, packet)
-    else if (packet.channel === 2) this.shiftPoints.push({ time: packet.tUs / 1000, value: packet.value })
+    else if (packet.channel === 2) this.ingestShift(packet)
     else if (packet.channel === 3) this.ingestTorque(0, packet)
     else if (packet.channel === 4) this.ingestTorque(1, packet)
     // Channel 5 is intentionally preserved in the raw stream but has no analysis role at present.
@@ -337,7 +339,10 @@ export class AnalysisEngine {
 
   private ingestRpm(channel: InternalShaft, packet: AnalysisPacket) {
     if (packet.value <= 0) {
+      // Protocol value === 0 is the firmware's explicit "shaft stopped" measurement.
+      if (packet.value === 0) this.storeStoppedRpm(channel, packet.tUs)
       this.rpmEpochBreakPending[channel] = true
+      this.nextGridUs[channel] = null
       return
     }
     const edges = this.edges[channel]
@@ -346,6 +351,7 @@ export class AnalysisEngine {
       && ((((packet.edgeCount >>> 0) - (previous.edgeCount >>> 0)) >>> 0) === 1)
       && packet.tUs > previous.tUs
     const epoch = previous ? (contiguous ? previous.epoch : previous.epoch + 1) : 0
+    if (previous && !contiguous) this.nextGridUs[channel] = null
     const edge: EdgeSample = { tUs: packet.tUs, edgeCount: packet.edgeCount >>> 0, periodUs: packet.value, epoch }
     this.rpmEpochBreakPending[channel] = false
     edges.push(edge)
@@ -358,6 +364,12 @@ export class AnalysisEngine {
       this.revolutionObservations[channel].push(revolution)
       this.advanceShaft(channel)
     }
+  }
+
+  private ingestShift(packet: AnalysisPacket) {
+    if (this.lastShiftSeq !== null && (((packet.seq - this.lastShiftSeq - 1) & 0xff) !== 0)) this.shiftEpoch += 1
+    this.lastShiftSeq = packet.seq
+    this.shiftPoints.push({ time: packet.tUs / 1000, value: packet.value, epoch: this.shiftEpoch })
   }
 
   private ingestTorque(channel: InternalShaft, packet: AnalysisPacket) {
@@ -373,7 +385,9 @@ export class AnalysisEngine {
     if (!(windowUs > 0)) return
 
     if (this.nextGridUs[channel] === null) {
-      this.nextGridUs[channel] = Math.ceil(observations[0].tUs / windowUs) * windowUs
+      // After a stop/epoch break, observations[0] may be minutes old. Seed from the newest valid
+      // observation so a 5 ms grid never walks the entire stopped interval just to reject it.
+      this.nextGridUs[channel] = Math.ceil(observations[observations.length - 1].tUs / windowUs) * windowUs
     }
     const latestUs = observations[observations.length - 1].tUs
     while (this.nextGridUs[channel] !== null && this.nextGridUs[channel]! <= latestUs) {
@@ -387,10 +401,27 @@ export class AnalysisEngine {
 
   private storeRpm(channel: InternalShaft, endUs: number, sample: RpmSampleUs) {
     if (this.maps.rpm[channel].has(endUs)) return
-    const point: RpmPoint = { time: endUs / 1000, rpm: sample.rpm, sigmaRpm: sample.sigmaRpm }
+    const point: RpmPoint = { time: endUs / 1000, rpm: sample.rpm, sigmaRpm: sample.sigmaRpm, epoch: sample.epoch }
     this.maps.rpm[channel].set(endUs, point)
     ;(channel === 0 ? this.primaryRpm : this.secondaryRpm).push(point)
     this.tryRatio(endUs)
+  }
+
+  private storeStoppedRpm(channel: InternalShaft, tUs: number) {
+    if (this.maps.rpm[channel].has(tUs)) return
+    const epoch = this.revolutionObservations[channel].at(-1)?.epoch ?? this.edges[channel].at(-1)?.epoch ?? 0
+    const point: RpmPoint = { time: tUs / 1000, rpm: 0, sigmaRpm: 0, epoch }
+    this.maps.rpm[channel].set(tUs, point)
+    ;(channel === 0 ? this.primaryRpm : this.secondaryRpm).push(point)
+    this.tryRatio(tUs)
+
+    // P = tau * omega is zero at an explicit stationary endpoint in either supported power mode.
+    if (!this.maps.power[channel].has(tUs)) {
+      const power: PowerPoint = { time: tUs / 1000, powerKw: 0 }
+      this.maps.power[channel].set(tUs, power)
+      ;(channel === 0 ? this.primaryPower : this.secondaryPower).push(power)
+      this.tryEfficiency(tUs)
+    }
   }
 
   private tryFinalizePower(channel: InternalShaft, endUs: number) {
@@ -498,6 +529,8 @@ export class AnalysisEngine {
     this.toothObservations = [[], []]
     this.torqueSamples = [[], []]
     this.shiftPoints = []
+    this.shiftEpoch = 0
+    this.lastShiftSeq = null
     this.rpmEpochBreakPending = [false, false]
     this.nextGridUs = [null, null]
     this.pendingTorquePower = [new Set(), new Set()]

@@ -1,13 +1,10 @@
-export const RAW_LOG_HEADER = 'firmware_t_us,wall_time_s,channel,channel_name,seq,raw_value,edge_count'
+import { RAW_LOG_HEADER, rawMetadataComment, type RawSessionMetadata } from './rawFormat'
+
 const RAW_LOG_FLUSH_BYTES = 65_536
 const RAW_LOG_FLUSH_DEBOUNCE_MS = 200
 const CHANNEL_NAMES = ['Primary RPM', 'Secondary RPM', 'Shift position', 'Primary torque', 'Secondary torque', 'Full throttle'] as const
 
-export type RawSessionMetadata = Record<string, unknown> & {
-  schemaVersion: 1
-  startedAt: string
-  stoppedAt?: string
-}
+export type { RawSessionMetadata } from './rawFormat'
 
 function csvEscape(value: string | number): string {
   const text = String(value)
@@ -47,7 +44,7 @@ export class RawSessionLogger {
 
     const file = await directory.getFileHandle(this.rawFileName, { create: true })
     const initial = await file.createWritable()
-    await initial.write(`${RAW_LOG_HEADER}\n`)
+    await initial.write(`${rawMetadataComment(metadata)}\n${RAW_LOG_HEADER}\n`)
     await initial.close()
     await this.openWriter()
     await this.writeMetadata(metadata)

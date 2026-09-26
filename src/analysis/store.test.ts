@@ -131,4 +131,12 @@ describe('AnalysisStore', () => {
     expect(view.primaryRpm.length).toBeLessThanOrEqual(100)
     expect(store.nearest('primaryRpm', 5_003)?.time).toBe(5_005)
   })
+  it('constrains nearest lookups to the visible range and rejects remote gap values', () => {
+    const store = new AnalysisStore()
+    store.apply(append({ primaryRpm: [rpm(100, 1000), rpm(200, 2000), rpm(1_000, 3000)] }))
+
+    expect(store.nearest('primaryRpm', 250, { minTime: 100, maxTime: 200 })?.time).toBe(200)
+    expect(store.nearest('primaryRpm', 600, { minTime: 100, maxTime: 1_000, maxDelta: 100 })).toBeUndefined()
+  })
+
 })
