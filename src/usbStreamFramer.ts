@@ -7,6 +7,7 @@ const MAX_UNFRAMED_BYTES = 8192
 export class UsbStreamFramer {
   private pending = new Uint8Array()
   private pendingText = ''
+  private discardUntilSync = false
   private decoder = new TextDecoder()
 
   constructor(
@@ -17,6 +18,7 @@ export class UsbStreamFramer {
   reset() {
     this.pending = new Uint8Array()
     this.pendingText = ''
+    this.discardUntilSync = false
     this.decoder = new TextDecoder()
   }
 
@@ -29,19 +31,31 @@ export class UsbStreamFramer {
     while (this.pending.length) {
       const header = this.findSync()
       if (header >= 0) {
-        if (header > 0) this.consumeTextBytes(header)
+        if (header > 0) {
+          // After a CRC failure, the remaining bytes are untrusted binary, not firmware text.
+          // Never allow them to prefix a subsequent config line and defeat version detection.
+          if (this.discardUntilSync) this.pending = this.pending.slice(header)
+          else this.consumeTextBytes(header)
+        }
         if (this.pending.length < TELEMETRY_PACKET_LEN) break
         const raw = this.pending.slice(0, TELEMETRY_PACKET_LEN)
         const decoded = decodePacket(raw)
         if (decoded) {
+          this.discardUntilSync = false
           this.onPacket(decoded, raw)
           this.pending = this.pending.slice(TELEMETRY_PACKET_LEN)
         } else {
           // CRC failure or false header: move one byte, not an entire candidate packet,
           // so the real frame following a corrupt prefix can still be recovered.
           this.pending = this.pending.slice(1)
+          this.discardUntilSync = true
         }
         continue
+      }
+      if (this.discardUntilSync) {
+        this.pending = this.pending[this.pending.length - 1] === TELEMETRY_SYNC0
+          ? new Uint8Array([TELEMETRY_SYNC0]) : new Uint8Array()
+        break
       }
       const lastNewline = this.pending.lastIndexOf(0x0a)
       if (lastNewline >= 0) {
