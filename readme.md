@@ -24,6 +24,45 @@ The scenario selector offers normal operation, **loss / fragmentation** (determi
 
 **Limitations:** The virtual USBDevice does not reproduce physical USB enumeration, browser hardware permissions, WinUSB driver binding, actual bus latency/power, cable faults or RP2040 electrical/hardware behaviour. Physical reconnection must still be validated with the board. It is significantly more faithful than feeding fake values straight into the plots.
 
+## Automated virtual-USB and browser tests
+
+The pull-request workflow runs **two independent jobs in parallel**:
+
+- **checks** — TypeScript, fast Vitest tests, and production build. The simulator
+  supports independent, exact injection of a CRC-corrupt frame, dropped
+  transmitted packet, lost firmware-ring edge, missed sensor tooth and stalled
+  USB OUT transfer; targeted tests assert expected counters and recovery.
+- **Chromium / virtual WebUSB** — five Playwright tests against the built viewer,
+  using its actual production USB and analysis workers. They verify drawn
+  canvas plots, hover, resize, freeze, settings and chart layout; loss warnings
+  and markers; claim errors/unplug/reconnection; live raw-file logging; and
+  clean/faulty CSV replay. Failures upload screenshots and browser traces.
+
+The browser job runs **only the Chromium headless shell** and is bounded by a
+five-minute job timeout. Normal tests run on every PR and `main` push, without
+hardware. We measured approximately one minute end to end on GitHub-hosted
+Ubuntu, with the five browser scenarios taking about 12 seconds.
+
+To run the browser tests locally (Node.js 22+):
+
+```bash
+npm ci
+npm install --no-save --no-package-lock --ignore-scripts @playwright/test@1.56.1
+npx playwright install --with-deps --only-shell chromium
+npm run build
+npx playwright test --config=tests/e2e/playwright.config.mjs
+```
+
+The Playwright runner is pinned and installed for the browser job, rather than
+changing the app's existing npm lockfile. `npm run test` runs the fast Vitest
+tests under `src` only.
+
+One **real recorded RP2040 run** remains to be supplied. The acceptance and
+provenance checklist is in
+`tests/fixtures/real/README.md`; we will not invent a "real-world golden"
+result before reviewing that file. Simulated browser tests are not a substitute
+for physical USB, sensor timing or electrical validation.
+
 ## Physical WebUSB connection
 
 The browser filters VID 0x1209 / PID 0xCD10. A dedicated worker opens/claims the vendor interface (class FF, subclass 00, protocol 00), enables the line state, and runs the bulk IN/OUT loops. Command writes now await transferOut completion/error rather than acknowledging mere postMessage delivery. Disconnect waits for interface release and device close before worker termination (bounded fallback). Unexpected disconnection closes open raw logs without a false clean-stop footer.
