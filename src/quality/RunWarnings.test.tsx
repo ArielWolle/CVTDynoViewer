@@ -4,7 +4,7 @@ import { parseRawLog } from '../analysis/rawCsv'
 import { RawReplayController } from '../replay/rawReplay'
 import { RAW_LOG_HEADER, RAW_METADATA_PREFIX } from '../session/rawFormat'
 import { DataQualityMonitor, EMPTY_QUALITY_SNAPSHOT } from './dataQuality'
-import { buildRunWarnings, RunWarnings } from './RunWarnings'
+import { buildRunWarnings, compactWarningSummary, hasNewWarningInformation, RunWarnings } from './RunWarnings'
 
 describe('visible run warnings', () => {
   it('shows independently keyed warnings alongside the three separate loss types', () => {
@@ -28,6 +28,35 @@ describe('visible run warnings', () => {
     expect(html).not.toContain('<details')
     expect(html).not.toContain('other warning(s)')
     expect(html).toContain('warning-issues')
+    expect(html).toContain('aria-expanded="true"')
+    expect(html).toContain('Minimize run warnings')
+    expect(html).toContain('5 issues')
+  })
+
+  it('keeps minimized warnings specific, even when there is only one issue', () => {
+    const usbWarning = buildRunWarnings({ usb: 'Virtual RP2040 disconnected as configured' }, EMPTY_QUALITY_SNAPSHOT)
+    expect(compactWarningSummary(usbWarning)).toBe(
+      'USB connection: Virtual RP2040 disconnected as configured',
+    )
+    const multiple = buildRunWarnings(
+      { 'replay-metadata': 'Missing file metadata' },
+      { ...EMPTY_QUALITY_SNAPSHOT, transmissionPacketsLost: 1, deviceEdgesLost: [2, 0], suspectedSensorPulses: [1, 0] },
+    )
+    expect(compactWarningSummary(multiple)).toBe(
+      'Replay setup · Telemetry loss · RPM edge loss · +1 more',
+    )
+    expect(compactWarningSummary([])).toBe('')
+  })
+
+  it('notices new warning categories and updated loss counts without requiring an automatic reopen', () => {
+    const first = buildRunWarnings({}, { ...EMPTY_QUALITY_SNAPSHOT, transmissionPacketsLost: 1 })
+    const updated = buildRunWarnings({}, { ...EMPTY_QUALITY_SNAPSHOT, transmissionPacketsLost: 2 })
+    const more = buildRunWarnings({ 'replay-metadata': 'No recorded setup' },
+      { ...EMPTY_QUALITY_SNAPSHOT, transmissionPacketsLost: 2 })
+    expect(hasNewWarningInformation(first, first)).toBe(false)
+    expect(hasNewWarningInformation(first, updated)).toBe(true)
+    expect(hasNewWarningInformation(updated, more)).toBe(true)
+    expect(hasNewWarningInformation(more, more)).toBe(false)
   })
 
   it('replays a metadata-free and a metadata-equipped raw run, identifying all three gap categories', async () => {
