@@ -31,6 +31,7 @@ export class VirtualUsbDevice implements USBDevice {
   private commandBytes: number[] = []
   private chunkIndex = 0
   private startedMs = 0
+  private intentionallyUnplugged = false
   private seq = [0, 0, 0, 0, 0, 0]
   private edgeCounts = [0, 0]
   private physicalToothCount = [0, 0]
@@ -69,6 +70,7 @@ export class VirtualUsbDevice implements USBDevice {
   async open(): Promise<void> {
     if (this.opened) throw new Error('Virtual USB device is already open')
     this.opened = true
+    this.intentionallyUnplugged = false
     this.startedMs = performance.now()
     this.timer = setInterval(() => this.tick(), 10)
   }
@@ -84,7 +86,9 @@ export class VirtualUsbDevice implements USBDevice {
     this.configuration = null
     this.output = []
     const reads = this.reads.splice(0)
-    for (const read of reads) read.reject(new Error('Virtual USB device closed'))
+    for (const read of reads) read.reject(new Error(this.intentionallyUnplugged
+      ? 'Simulated RP2040 unplugged after 5 seconds (intentional test)'
+      : 'Virtual USB device closed'))
   }
 
   async selectConfiguration(value: number): Promise<void> {
@@ -145,7 +149,9 @@ export class VirtualUsbDevice implements USBDevice {
 
   private assertClaimed(): void {
     if (!this.opened || !this.configuration?.interfaces[0]?.claimed) {
-      throw new Error('Virtual USB interface is not claimed')
+      throw new Error(this.intentionallyUnplugged
+        ? 'Simulated RP2040 unplugged after 5 seconds (intentional test)'
+        : 'Virtual USB interface is not claimed')
     }
   }
 
@@ -204,6 +210,7 @@ export class VirtualUsbDevice implements USBDevice {
     if (!this.opened || !this.lineState || !this.configuration?.interfaces[0]?.claimed) return
     const elapsedUs = Math.max(1, Math.floor((performance.now() - this.startedMs) * 1000))
     if (this.scenario === 'unplug' && elapsedUs > 5_000_000) {
+      this.intentionallyUnplugged = true
       void this.close()
       return
     }
