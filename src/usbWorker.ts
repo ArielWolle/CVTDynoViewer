@@ -18,7 +18,8 @@
 // per-origin, not per-context, so this worker's own getDevices() call (issued only after the main
 // thread's requestDevice()/getDevices() has already resolved) sees that same grant immediately and
 // does the actual open()/claimInterface()/read loop entirely on its own side.
-import { decodePacket, TELEMETRY_SYNC0, TELEMETRY_SYNC1, TELEMETRY_PACKET_LEN, type ChannelId } from './protocol'
+import type { ChannelId } from './protocol'
+import { UsbStreamFramer } from './usbStreamFramer'
 import { VirtualUsbDevice, type VirtualUsbScenario } from './testing/virtualUsbDevice'
 
 // See usbTransport.ts for the meaning of each of these -- copied here unchanged since this file
@@ -101,6 +102,11 @@ function bufferText(text: string) {
   bufferedTexts.push(text)
 }
 
+const framer = new UsbStreamFramer(
+  (packet, raw) => bufferPacket({ ...packet, raw }),
+  bufferText,
+)
+
 function checkFlushWaiters() {
   const ready = flushWaiters.filter((waiter) => lastAckedPacketOrdinal >= waiter.targetOrdinal)
   flushWaiters = flushWaiters.filter((waiter) => lastAckedPacketOrdinal < waiter.targetOrdinal)
@@ -142,9 +148,7 @@ let device: USBDevice | null = null
 let interfaceNumber = -1
 let endpointIn = -1
 let endpointOut = -1
-let buffer = new Uint8Array()
 let reading = false
-const textDecoder = new TextDecoder()
 
 function post(message: WorkerOutboundMessage) {
   postMessage(message)
@@ -186,7 +190,7 @@ async function connect(vendorId: number, productId: number, virtualScenario?: Vi
     interfaceNumber = vendorInterface.interfaceNumber
     endpointIn = vendorInterface.endpointIn
     endpointOut = vendorInterface.endpointOut
-    buffer = new Uint8Array()
+    framer.reset()
     reading = true
     bufferedPackets = []
     bufferedTexts = []
@@ -240,7 +244,8 @@ async function readLoop() {
   while (reading && device) {
     try {
       const result = await device.transferIn(endpointIn, READ_CHUNK_SIZE)
-      if (result.status === 'ok' && result.data && result.data.byteLength > 0) {
+      if (result.status !== 'ok') throw new Error('USB bulk IN transfer returned ' + result.status)
+      if (result.data && result.data.byteLength > 0) {
         consume(new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength))
       }
     } catch (error) {
@@ -260,52 +265,7 @@ async function readLoop() {
 // posted directly here. ---
 
 function consume(chunk: Uint8Array) {
-  const combined = new Uint8Array(buffer.length + chunk.length)
-  combined.set(buffer)
-  combined.set(chunk, buffer.length)
-  buffer = combined
-
-  const emitText = (bytes: Uint8Array) => {
-    const text = textDecoder.decode(bytes)
-    for (const line of text.split(/\r?\n/)) {
-      if (line.trim()) bufferText(line.trim())
-    }
-  }
-  const findPacketHeader = (): number | null => {
-    for (let index = 0; index < buffer.length - 1; index += 1) {
-      if (buffer[index] === TELEMETRY_SYNC0 && buffer[index + 1] === TELEMETRY_SYNC1) return index
-    }
-    return null
-  }
-
-  while (buffer.length > 0) {
-    const headerIndex = findPacketHeader()
-    if (headerIndex === null) {
-      const newline = buffer.lastIndexOf(0x0a)
-      if (newline < 0) break
-      emitText(buffer.slice(0, newline + 1))
-      buffer = buffer.slice(newline + 1)
-      continue
-    }
-    if (headerIndex > 0) {
-      emitText(buffer.slice(0, headerIndex))
-      buffer = buffer.slice(headerIndex)
-    }
-    if (buffer.length < TELEMETRY_PACKET_LEN) break
-    const raw = buffer.slice(0, TELEMETRY_PACKET_LEN)
-    const packet = decodePacket(raw)
-    if (packet) {
-      bufferPacket({ channel: packet.channel, value: packet.value, tUs: packet.tUs, seq: packet.seq, edgeCount: packet.edgeCount, raw })
-      buffer = buffer.slice(TELEMETRY_PACKET_LEN)
-    } else {
-      // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop one byte
-      // and keep scanning, instead of discarding the whole tentative packet length, so
-      // a false-positive sync match can't swallow real data that follows it.
-      emitText(buffer.slice(0, 1))
-      buffer = buffer.slice(1)
-    }
-  }
-
+  framer.push(chunk)
   tryDeliver()
 }
 
