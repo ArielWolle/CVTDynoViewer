@@ -40,11 +40,12 @@ function groupEvents(events: readonly QualityEvent[], startMs: number, endMs: nu
 }
 
 function markerTitle(group: Group, originMs: number): string {
-  return group.events.map((event) => (
+  const preview = group.events.slice(0, 6).map((event) => (
     ((event.startMs - originMs) / 1000).toFixed(3) + '–' +
     ((event.endMs - originMs) / 1000).toFixed(3) + ' s: ' +
     qualityEventLabel(event)
   )).join('\n')
+  return group.events.length > 6 ? preview + '\n+' + (group.events.length - 6) + ' more nearby events' : preview
 }
 
 /** A persistent overview of affected times, aligned to the full-run time range. */
@@ -64,6 +65,8 @@ export function QualityTimeline({ events, startMs, endMs, originMs }: {
           key={group.key}
           className={'quality-timeline-marker ' + group.kind}
           title={markerTitle(group, originMs)}
+          aria-label={markerTitle(group, originMs)}
+          tabIndex={0}
           style={{ left: group.left * 100 + '%', width: Math.max(0.5, (group.right - group.left) * 100) + '%' }}
         />
       ))}
