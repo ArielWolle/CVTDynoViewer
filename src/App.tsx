@@ -357,14 +357,19 @@ function App() {
       onError: (message) => setWarning('usb', message),
       onDisconnected: (reason) => {
         if (transport.current !== next) return
+        const expectedTestUnplug = virtualScenario === 'unplug' &&
+          reason.includes('Simulated RP2040 unplugged')
+        const description = expectedTestUnplug
+          ? 'Virtual unplug test completed: the simulated RP2040 disconnected after 5 seconds as configured.'
+          : reason
         transport.current = null
         setConnected(false)
         setConnectionMode(null)
         setFirmwareDemoMode(false)
         setFirmwareGitSha(null)
         setFirmwareProtocolVersion(null)
-        setWarning('usb', reason)
-        setNotice('USB connection lost: ' + reason)
+        setWarning('usb', description)
+        setNotice(expectedTestUnplug ? description : 'USB connection lost: ' + reason)
         // An unexpected disconnect is NOT a clean physical stop boundary.
         // Close whatever raw data we have, but leave off the clean-stop footer.
         if (rawLoggerRef.current?.isActive) {
