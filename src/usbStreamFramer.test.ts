@@ -48,9 +48,11 @@ describe('stream framer for actual bulk WebUSB reads', () => {
     const bad = packet(1, 4)
     bad[20] ^= 0xff
     const seen: number[] = []
-    const framer = new UsbStreamFramer((decoded) => seen.push(decoded.seq), () => undefined)
-    framer.push(join(bad, packet(1, 5)))
+    const text: string[] = []
+    const tested = new UsbStreamFramer((decoded) => seen.push(decoded.seq), (line) => text.push(line))
+    tested.push(join(bad, packet(1, 5), new TextEncoder().encode('Firmware git: simulator\r\n')))
     expect(seen).toEqual([5])
+    expect(text).toEqual(['Firmware git: simulator'])
   })
 
   it('reset removes leftovers from a disconnected device before reading new firmware', () => {
