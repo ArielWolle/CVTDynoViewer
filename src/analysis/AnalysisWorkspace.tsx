@@ -2,12 +2,14 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExterna
 import { GripVertical, Pause, Play, RotateCcw, X } from 'lucide-react'
 import { CartesianGrid, LineChart, ReferenceLine, ResponsiveContainer, XAxis, YAxis } from 'recharts'
 import { TimeRangeSlider } from '../TimeRangeSlider'
-import { ANALYSIS_WINDOWS_MS, type EfficiencyPoint, type RatioPoint, type RpmObservationMode, type RpmObservationView, type RpmPoint, type ShiftPoint } from './types'
+import { ANALYSIS_WINDOWS_MS, type AnalysisPowerMode, type EfficiencyPoint, type RatioPoint, type RpmObservationMode, type RpmObservationView, type RpmPoint, type ShiftPoint } from './types'
 import { findNearestTime } from './uiStore'
 import { AnalysisStore, type PowerRow, type WithSeconds } from './store'
 import { projectToPlot } from './relationshipHover'
 import { RelationshipSpatialIndex } from './relationshipIndex'
 import { TelemetryCanvas } from './TelemetryCanvas'
+import { affectsChart, qualityEventLabel, type QualityEvent } from '../quality/dataQuality'
+import { QualityChartOverlay, QualityTimeline } from '../quality/QualityMarkers'
 import { usePlotGeometry } from './usePlotGeometry'
 import type { NumericDomain, PlotGeometry } from './plotGeometry'
 import type { ChartConfig, ChartId } from './chartTypes'
@@ -168,7 +170,7 @@ function AnalysisPointCount({ store }: { store: AnalysisStore }) {
 function AnalysisWorkspaceComponent({
   store, chartPlaying, frozenDomainEnd, onToggleChartPlaying, analysisWindowMs, onAnalysisWindowChange,
   observationMode, onObservationModeChange, charts, setCharts, lowRatio, highRatio, onLowRatioChange,
-  onHighRatioChange, sourceLabel, requestObservations, analysisBusy = false, initialFullRange = false,
+  onHighRatioChange, sourceLabel, requestObservations, qualityEvents, powerMode, analysisBusy = false, initialFullRange = false,
 }: {
   store: AnalysisStore
   chartPlaying: boolean
@@ -185,6 +187,8 @@ function AnalysisWorkspaceComponent({
   onLowRatioChange: (value: number) => void
   onHighRatioChange: (value: number) => void
   sourceLabel: string
+  qualityEvents: readonly QualityEvent[]
+  powerMode: AnalysisPowerMode
   requestObservations: (mode: RpmObservationMode, startMs: number, endMs: number, maxPoints: number) => Promise<RpmObservationView>
   analysisBusy?: boolean
   initialFullRange?: boolean
@@ -295,11 +299,12 @@ function AnalysisWorkspaceComponent({
       </div>
     </section>
     {domainSpan > 0 && <section className="chart-range-bar"><TimeRangeSlider startFraction={rangeStart} endFraction={rangeEnd} onChange={(next: { start: number; end: number }) => setManualRange(next)} formatValue={(fraction: number) => `${formatTimeSeconds((domainStart + fraction * domainSpan - timeOrigin) / 1000, domainSpan)}s`} /><button className="button button-quiet chart-range-reset" onClick={() => setManualRange({ start: 0, end: 1 })}>Full range</button></section>}
+    <QualityTimeline events={qualityEvents} startMs={domainStart} endMs={domainEnd} originMs={timeOrigin} />
     <section className="chart-grid">{charts.filter((chart) => chart.visible).map((chart) => <AnalysisChartCard
       key={chart.id} config={chart} view={view} store={store} hoverBus={hoverBus} timeOrigin={timeOrigin} windowStart={windowStartMs} windowEnd={windowEndMs}
       lowRatio={lowRatio} highRatio={highRatio} onLowRatioChange={onLowRatioChange} onHighRatioChange={onHighRatioChange}
       analysisWindowMs={analysisWindowMs} scatterMax={scatterMax} efficiencyMax={efficiencyMax} powerDomain={powerDomain}
-      sourceLabel={sourceLabel} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)}
+      sourceLabel={sourceLabel} qualityEvents={qualityEvents} powerMode={powerMode} onDragStart={() => setDragged(chart.id)} onDrop={() => reorder(chart.id)}
       onHide={() => setCharts((items) => items.map((item) => item.id === chart.id ? { ...item, visible: false } : item))}
     />)}</section>
   </>
@@ -307,7 +312,7 @@ function AnalysisWorkspaceComponent({
 
 export const AnalysisWorkspace = memo(AnalysisWorkspaceComponent)
 
-function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowStart, windowEnd, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, analysisWindowMs, scatterMax, efficiencyMax, powerDomain, sourceLabel, onDragStart, onDrop, onHide }: {
+function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowStart, windowEnd, lowRatio, highRatio, onLowRatioChange, onHighRatioChange, analysisWindowMs, scatterMax, efficiencyMax, powerDomain, sourceLabel, qualityEvents, powerMode, onDragStart, onDrop, onHide }: {
   config: ChartConfig
   view: ViewData
   store: AnalysisStore
@@ -324,6 +329,8 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
   efficiencyMax: number
   powerDomain: [number, number]
   sourceLabel: string
+  qualityEvents: readonly QualityEvent[]
+  powerMode: AnalysisPowerMode
   onDragStart: () => void
   onDrop: () => void
   onHide: () => void
@@ -359,6 +366,10 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
   const plotPowerDomain = config.id === 'power' ? powerDomain : DEFAULT_POWER_DOMAIN
   const plotLowRatio = config.id === 'scatter' ? lowRatio : 0
   const plotHighRatio = config.id === 'scatter' ? highRatio : 0
+  const relevantQuality = useMemo(
+    () => qualityEvents.filter((event) => affectsChart(event, config.id, powerMode)),
+    [qualityEvents, config.id, powerMode],
+  )
 
   const relationshipDomains = useMemo<{ x: [number, number]; y: [number, number] }>(() => (
     config.id === 'scatter'
@@ -454,6 +465,16 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
     }
 
     if (!readout) return
+    if (!relationship) {
+      const hoverToleranceMs = Math.max(2, 5 * visibleSpanMs / Math.max(1, plotGeometry.width))
+      const hit = relevantQuality.find((event) =>
+        hoverTime >= event.startMs - hoverToleranceMs && hoverTime <= event.endMs + hoverToleranceMs)
+      if (hit) {
+        readout.textContent = qualityEventLabel(hit)
+        readout.style.display = ''
+        return
+      }
+    }
     if (relationshipSnap) {
       readout.textContent = relationshipSnap.readout
       readout.style.display = ''
@@ -477,7 +498,7 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
     }
     if (text) { readout.textContent = text; readout.style.display = '' }
     else readout.style.display = 'none'
-  }, [config.id, hideHover, plotGeometry, relationship, relationshipData, relationshipSnapForPoint, store, windowEnd, windowStart])
+  }, [config.id, hideHover, plotGeometry, relationship, relationshipData, relationshipSnapForPoint, store, windowEnd, windowStart, relevantQuality, visibleSpanMs])
 
   useEffect(() => hoverBus.subscribe(updateHover), [hoverBus, updateHover])
 
@@ -500,7 +521,8 @@ function AnalysisChartCard({ config, view, store, hoverBus, timeOrigin, windowSt
   return <article className="chart-card" onDragOver={(event: DragEvent<HTMLElement>) => event.preventDefault()} onDrop={onDrop}>
     <header className="chart-header"><div className="drag-handle" title="Drag to reorder" draggable onDragStart={onDragStart}><GripVertical size={16} /></div><div className="chart-title"><h3>{config.title}</h3><span>{config.subtitle}</span></div>{headerControls}<button className="chart-menu" onClick={onHide} title="Hide chart"><X size={15} /></button></header>
     <div className="chart-body" ref={chartBodyRef} onMouseMove={handleMouseMove} onMouseLeave={() => hoverBus.publish({ time: null, sourceChartId: null })}>
-      <AnalysisPlot config={config} timeData={timeData} relationshipData={relationshipRenderData} primaryObs={plotPrimaryObs} secondaryObs={plotSecondaryObs} plotGeometry={plotGeometry} xDomain={xDomain} visibleSpanMs={visibleSpanMs} scatterMax={plotScatterMax} efficiencyMax={plotEfficiencyMax} powerDomain={plotPowerDomain} lowRatio={plotLowRatio} highRatio={plotHighRatio} />
+      <AnalysisPlot config={config} timeData={timeData} relationshipData={relationshipRenderData} primaryObs={plotPrimaryObs} secondaryObs={plotSecondaryObs} plotGeometry={plotGeometry} xDomain={xDomain} visibleSpanMs={visibleSpanMs} scatterMax={plotScatterMax} efficiencyMax={plotEfficiencyMax} powerDomain={plotPowerDomain} lowRatio={plotLowRatio} highRatio={plotHighRatio} qualityEvents={relevantQuality} />
+      {!relationship && <QualityChartOverlay events={relevantQuality} plot={plotGeometry} startMs={windowStart} endMs={windowEnd} originMs={timeOrigin} />}
       <div ref={crosshairRef} className="chart-crosshair-line" style={{ display: 'none' }} />
       {relationship && <div ref={crosshairHRef} className="chart-crosshair-line-h" style={{ display: 'none' }} />}
     </div>
@@ -538,7 +560,7 @@ function timeSeriesYDomain(config: ChartConfig, timeData: readonly TimeChartDatu
   return [0, 1]
 }
 
-const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationshipData, primaryObs, secondaryObs, plotGeometry, xDomain, visibleSpanMs, scatterMax, efficiencyMax, powerDomain, lowRatio, highRatio }: {
+const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationshipData, primaryObs, secondaryObs, plotGeometry, xDomain, visibleSpanMs, scatterMax, efficiencyMax, powerDomain, lowRatio, highRatio, qualityEvents }: {
   config: ChartConfig
   timeData: readonly TimeChartDatum[]
   relationshipData: readonly RelationshipDatum[]
@@ -552,6 +574,7 @@ const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationship
   powerDomain: [number, number]
   lowRatio: number
   highRatio: number
+  qualityEvents: readonly QualityEvent[]
 }) {
   const rawYDomain = useMemo<[number, number]>(() => (
     config.id === 'scatter' ? [0, scatterMax]
@@ -564,7 +587,7 @@ const AnalysisPlot = memo(function AnalysisPlot({ config, timeData, relationship
 
   return <>
     <AxisScaffold chartId={config.id} xDomain={xDomain} yDomain={yDomain} visibleSpanMs={visibleSpanMs} scatterMax={scatterMax} efficiencyMax={efficiencyMax} powerDomain={powerDomain} />
-    <TelemetryCanvas chartId={config.id} color={config.color} plot={plotGeometry} xDomain={canvasXDomain} yDomain={yDomain} timeData={timeData} relationshipData={relationshipData} primaryObs={primaryObs} secondaryObs={secondaryObs} lowRatio={lowRatio} highRatio={highRatio} />
+    <TelemetryCanvas chartId={config.id} color={config.color} plot={plotGeometry} xDomain={canvasXDomain} yDomain={yDomain} timeData={timeData} relationshipData={relationshipData} primaryObs={primaryObs} secondaryObs={secondaryObs} lowRatio={lowRatio} highRatio={highRatio} qualityEvents={qualityEvents} />
   </>
 })
 
