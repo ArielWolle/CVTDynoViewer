@@ -33,6 +33,8 @@ export class VirtualUsbDevice implements USBDevice {
   private startedMs = 0
   private seq = [0, 0, 0, 0, 0, 0]
   private edgeCounts = [0, 0]
+  private physicalToothCount = [0, 0]
+  private lastAcceptedEdgeUs = [0, 0]
   private nextEdgeUs = [1_000_000, 1_000_000]
   private nextPollUs = [0, 0, 1_000_000, 1_000_000, 1_000_000]
   private channels = [true, true, true, true, true]
@@ -227,10 +229,21 @@ export class VirtualUsbDevice implements USBDevice {
       let emitted = 0
       while (this.nextEdgeUs[channel] <= timeUs && emitted < 80) {
         const captureTime = this.nextEdgeUs[channel]
-        this.edgeCounts[channel] += 1
-        // Simulate loss BEFORE the firmware assigns a TX sequence number.
-        const dropBeforeSend = this.scenario === 'fragmented' && this.edgeCounts[channel] % 191 === 0
-        if (this.channels[channel] && !dropBeforeSend) this.sendPacket(channel, period, captureTime, this.edgeCounts[channel])
+        this.physicalToothCount[channel] += 1
+        // In the fault scenario a primary sensor occasionally never sees a real tooth.
+        // Firmware cannot count that missing capture: the NEXT accepted edge simply
+        // carries a roughly doubled inter-edge period with uninterrupted seq/edgeCount.
+        const missedBySensor = this.scenario === 'fragmented' && channel === 0 &&
+          this.physicalToothCount[channel] % 257 === 0
+        if (!missedBySensor) {
+          const actualPeriod = this.lastAcceptedEdgeUs[channel] > 0
+            ? captureTime - this.lastAcceptedEdgeUs[channel] : period
+          this.lastAcceptedEdgeUs[channel] = captureTime
+          this.edgeCounts[channel] += 1
+          // Separately simulate an edge captured by firmware but lost in its ring.
+          const dropBeforeSend = this.scenario === 'fragmented' && this.edgeCounts[channel] % 191 === 0
+          if (this.channels[channel] && !dropBeforeSend) this.sendPacket(channel, actualPeriod, captureTime, this.edgeCounts[channel])
+        }
         this.nextEdgeUs[channel] += period
         emitted += 1
       }
@@ -267,7 +280,10 @@ export class VirtualUsbDevice implements USBDevice {
         const nowUs = 1_000_000 + Math.floor((performance.now() - this.startedMs) * 1000)
         this.stoppedSent = [false, false]
         this.benchDisabledAtUs = nowUs
-        if (enable) this.nextEdgeUs = [nowUs, nowUs]
+        if (enable) {
+          this.nextEdgeUs = [nowUs, nowUs]
+          this.lastAcceptedEdgeUs = [0, 0]
+        }
       }
       this.writeText(this.benchMode ? 'BENCH MODE ENABLED\r\n' : 'BENCH MODE DISABLED\r\n')
     } else if (command === 5) {
