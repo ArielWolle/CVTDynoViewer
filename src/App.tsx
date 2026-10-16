@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, TriangleAlert, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { channelNames, encodeCommand, EXPECTED_PROTOCOL_VERSION, periodUsToRpm, type ChannelId } from './protocol'
 import { UsbTransport } from './usbTransport'
+import type { VirtualUsbScenario } from './testing/virtualUsbDevice'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { AnalysisClient } from './analysis/client'
 import { defaultEngineTorqueCurve } from './analysis/engineCurve'
@@ -76,6 +77,10 @@ function AnalysisMetricGrid({ store }: { store: AnalysisStore }) {
 
 function App() {
   const [connected, setConnected] = useState(false)
+  const [connecting, setConnecting] = useState(false)
+  const connectingRef = useRef(false)
+  const [connectionMode, setConnectionMode] = useState<'hardware' | 'virtual' | null>(null)
+  const [simulatorScenario, setSimulatorScenario] = useState<VirtualUsbScenario>('normal')
   const [firmwareDemoMode, setFirmwareDemoMode] = useState(false)
   // Populated from the firmware's "Firmware git: <sha>" / "Protocol version: <n>" lines in its
   // command-0x03 config dump, sent automatically right after every connect (see connect() below).
@@ -327,13 +332,41 @@ function App() {
     analysisClientRef.current?.configure(saved)
   }
 
-  async function connect() {
+  async function connect(virtualScenario?: VirtualUsbScenario) {
+    // A ref closes the gap between clicks and React's next render.
+    if (connectingRef.current || transport.current?.connected) return
+    connectingRef.current = true
+    setConnecting(true)
+    setWarningNotice(null)
+    const next = new UsbTransport({
+      onValue: handleValue,
+      onPacket: handleUsbPacket,
+      onText: handleUsbText,
+      onError: (message) => setWarningNotice(message),
+      onDisconnected: (reason) => {
+        if (transport.current !== next) return
+        transport.current = null
+        setConnected(false)
+        setConnectionMode(null)
+        setFirmwareDemoMode(false)
+        setFirmwareGitSha(null)
+        setFirmwareProtocolVersion(null)
+        setWarningNotice(reason)
+        setNotice('USB connection lost: ' + reason)
+        // An unexpected disconnect is NOT a clean physical stop boundary.
+        // Close whatever raw data we have, but leave off the clean-stop footer.
+        if (rawLoggerRef.current?.isActive) {
+          void rawLoggerRef.current.stop()
+            .catch(() => setWarningNotice('USB link lost; raw log could not be closed cleanly'))
+            .finally(() => setLogging(false))
+        }
+      },
+    })
     try {
       rawReplayRef.current?.clear()
       restoreLiveAnalysisConfig()
       setRawPlaybackActive(false)
       setPlaybackFileName('')
-      const next = new UsbTransport({ onValue: handleValue, onPacket: handleUsbPacket, onText: handleUsbText, onError: (message) => setWarningNotice(message) })
       timeOffsetMsRef.current = null
       channelSeqRef.current = [-1, -1, -1, -1, -1, -1]
       droppedPacketsRef.current = 0
@@ -341,17 +374,44 @@ function App() {
       lostEdgesRef.current = [0, 0]
       pendingConsoleLinesRef.current = []
       analysisClientRef.current?.reset()
-      
-      
-      // Cleared on every fresh connect (not just at app startup) so stale info from a previously
-      // connected device -- or a firmware that hadn't been reflashed with this feature yet -- can
-      // never be mistaken for the currently connected device's actual identity.
       setFirmwareGitSha(null)
       setFirmwareProtocolVersion(null)
-      await next.connect(); transport.current = next; setConnected(true); setFirmwareDemoMode(false); analysisStore.reset(); setRawPlaybackActive(false); setPlaybackFileName(''); setNotice('Reading dyno configuration...'); await next.send(encodeCommand(3))
-    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not connect to USB device') }
+      await next.connect(virtualScenario)
+      transport.current = next
+      setConnectionMode(virtualScenario ? 'virtual' : 'hardware')
+      setConnected(true)
+      setFirmwareDemoMode(false)
+      analysisStore.reset()
+      setRawPlaybackActive(false)
+      setPlaybackFileName('')
+      setNotice(virtualScenario ? 'Reading simulated RP2040 configuration...' : 'Reading dyno configuration...')
+      await next.send(encodeCommand(3))
+    } catch (error) {
+      await next.disconnect()
+      if (transport.current === next) transport.current = null
+      setConnected(false)
+      setConnectionMode(null)
+      const message = error instanceof Error ? error.message : 'Could not connect to USB device'
+      setNotice(message)
+      setWarningNotice(message)
+    } finally {
+      connectingRef.current = false
+      setConnecting(false)
+    }
   }
-  async function disconnect() { if (logging) await stopLogging(); await transport.current?.disconnect(); transport.current = null; setConnected(false); setFirmwareDemoMode(false); setFirmwareGitSha(null); setFirmwareProtocolVersion(null); setNotice('Device disconnected') }
+
+  async function disconnect() {
+    if (logging) await stopLogging()
+    await transport.current?.disconnect()
+    transport.current = null
+    setConnected(false)
+    setConnectionMode(null)
+    setFirmwareDemoMode(false)
+    setFirmwareGitSha(null)
+    setFirmwareProtocolVersion(null)
+    setNotice('Device disconnected')
+  }
+
   function consoleTimestamp() {
     const now = new Date()
     return `${now.toLocaleTimeString([], { hour12: false })}.${String(now.getMilliseconds()).padStart(3, '0')}`
@@ -646,14 +706,14 @@ function App() {
     try { directoryHandle.current = await window.showDirectoryPicker(); setDirectoryName(directoryHandle.current.name); setNotice(`Folder access granted: ${directoryHandle.current.name}`); return directoryHandle.current } catch { setNotice('Folder selection cancelled'); return null }
   }
   function sessionMetadata(stoppedAt?: string): RawSessionMetadata {
-    return { schemaVersion: 1, startedAt: logStartedAtRef.current ?? new Date().toISOString(), ...(stoppedAt ? { stoppedAt } : {}), firmwareGitSha, firmwareProtocolVersion, primaryTeeth: primarySpokes, secondaryTeeth: secondarySpokes, secondaryInertiaKgM2: inertiaKgM2, analysisWindowMs, powerMode, torqueCurve, torqueScale, torqueOffset, channels, frequencies, captureStopBoundary: 'viewer-delivery-drain' }
+    return { schemaVersion: 1, startedAt: logStartedAtRef.current ?? new Date().toISOString(), ...(stoppedAt ? { stoppedAt } : {}), captureSource: connectionMode === 'virtual' ? 'virtual' : 'hardware', ...(connectionMode === 'virtual' ? { simulationScenario: simulatorScenario } : {}), firmwareGitSha, firmwareProtocolVersion, primaryTeeth: primarySpokes, secondaryTeeth: secondarySpokes, secondaryInertiaKgM2: inertiaKgM2, analysisWindowMs, powerMode, torqueCurve, torqueScale, torqueOffset, channels, frequencies, captureStopBoundary: 'viewer-delivery-drain' }
   }
   async function startLogging() {
     if (rawPlaybackActive) { setNotice('Raw logging is disabled during software replay; replay never writes into source-of-truth logs'); return }
     if (!connected) { setNotice('Connect the dyno before starting raw logging'); return }
     const directory = directoryHandle.current ?? await chooseDirectory()
     if (!directory) return
-    try { logStartedAtRef.current = new Date().toISOString(); await rawLoggerRef.current?.start(directory, sessionName, sessionMetadata()); setLogging(true); setNotice(`Writing ${rawLoggerRef.current?.fileName ?? 'raw log'}`) } catch { setNotice('Could not open the raw log file in that folder') }
+    try { logStartedAtRef.current = new Date().toISOString(); await rawLoggerRef.current?.start(directory, connectionMode === 'virtual' ? 'SIMULATED-' + sessionName : sessionName, sessionMetadata()); setLogging(true); setNotice(`Writing ${rawLoggerRef.current?.fileName ?? 'raw log'}`) } catch { setNotice('Could not open the raw log file in that folder') }
   }
   async function stopLogging() {
     try {
@@ -667,7 +727,7 @@ function App() {
   }
   async function loadPlaybackFile(file: File) {
     if (connected || logging) {
-      const message = connected ? 'Disconnect the real dyno before loading a saved run.' : 'Stop raw logging before loading a saved run.'
+      const message = connected ? 'Disconnect the dyno connection before loading a saved run.' : 'Stop raw logging before loading a saved run.'
       setWarningNotice(message)
       setNotice('Saved run not loaded')
       return
@@ -771,7 +831,18 @@ function App() {
     warnings.push(`${lostEdgeTotal.toLocaleString()} RPM edge${lostEdgeTotal === 1 ? '' : 's'} ${lostEdgeTotal === 1 ? 'was' : 'were'} lost on the device before transmission (${lostEdges[0].toLocaleString()} primary, ${lostEdges[1].toLocaleString()} secondary). RPM-derived intervals spanning detected edge gaps are omitted and processing resumes from contiguous data.`)
   }
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected || rawPlaybackActive ? 'is-live' : 'is-demo'}`} />{connected ? firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : rawPlaybackActive ? replayState.analyzing ? 'Analyzing saved run' : replayState.playing ? 'Replaying saved run' : replayState.progress >= 1 ? 'Saved run loaded' : 'Replay paused' : 'Offline'}<span className="status-divider" /><AnalysisPrimaryRpm store={analysisStore} />{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions">{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button> : <button className="button button-accent" onClick={() => void connect()}><Cable size={16} />Connect device</button>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected && connectionMode !== 'virtual' || rawPlaybackActive ? 'is-live' : 'is-demo'}`} />{connected ? connectionMode === 'virtual' ? 'SIMULATED RP2040 / WebUSB' : firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : connecting ? 'Connecting to dyno...' : rawPlaybackActive ? replayState.analyzing ? 'Analyzing saved run' : replayState.playing ? 'Replaying saved run' : replayState.progress >= 1 ? 'Saved run loaded' : 'Replay paused' : 'Offline'}<span className="status-divider" /><AnalysisPrimaryRpm store={analysisStore} />{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions">{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected
+        ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button>
+        : <>
+          <select className="simulator-scenario" aria-label="Virtual USB test scenario" disabled={connecting} value={simulatorScenario} onChange={(event) => setSimulatorScenario(event.target.value as VirtualUsbScenario)}>
+            <option value="normal">Virtual: normal</option>
+            <option value="fragmented">Virtual: loss / fragmentation</option>
+            <option value="unplug">Virtual: unplug after 5s</option>
+            <option value="claim-error">Virtual: claim failure</option>
+          </select>
+          <button className="button button-quiet" disabled={connecting} onClick={() => void connect(simulatorScenario)}><Gauge size={16} />Simulate RP2040</button>
+          <button className="button button-accent" disabled={connecting} onClick={() => void connect()}><Cable size={16} />{connecting ? 'Connecting...' : 'Connect device'}</button>
+        </>}</div></header>
     {protocolMismatch && <section className="protocol-mismatch-banner" role="alert">
       <strong>Firmware/viewer protocol mismatch.</strong> Connected device reports protocol v{firmwareProtocolVersion}{firmwareGitSha ? ` (build ${firmwareGitSha})` : ''}, this viewer expects v{EXPECTED_PROTOCOL_VERSION}.
       Data may be misinterpreted -- reflash the firmware from the latest build, or use a matching viewer version, before trusting anything shown below.
@@ -801,7 +872,7 @@ function App() {
       highRatio={highRatio}
       onLowRatioChange={setLowRatio}
       onHighRatioChange={setHighRatio}
-      sourceLabel={connected ? 'LIVE' : rawPlaybackActive ? 'REPLAY' : 'VIEW'}
+      sourceLabel={connected ? connectionMode === 'virtual' ? 'SIMULATED' : 'LIVE' : rawPlaybackActive ? 'REPLAY' : 'VIEW'}
       requestObservations={requestObservations}
       analysisBusy={replayState.analyzing}
       initialFullRange={rawPlaybackActive && !replayState.analyzing && !replayState.playing && replayState.progress >= 1}
