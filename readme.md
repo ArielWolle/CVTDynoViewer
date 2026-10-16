@@ -30,7 +30,7 @@ The browser filters VID 0x1209 / PID 0xCD10. A dedicated worker opens/claims the
 
 ## Data quality and suspected missed tooth pulses
 
-The **Run warnings** banner shows every independent issue immediately (no collapsed generic counter), and stays in view while you scroll through the charts. For example, a missing-metadata notice, a USB connection issue, and RPM edge/packet losses can coexist. The banner only caps its height when many issues accumulate. The small quality strip beneath the global time slider places each detected event in the complete run; time-series charts show the corresponding highlighted periods. Hover at a marker to identify the channel and issue. The plotted lines are visually broken across affected intervals.
+The **Run warnings** banner opens with all independent issues readable, and stays in view while you scroll through the charts. Click **Minimize** to shrink it to a thin sticky indicator showing the number and types of active issues; use **Show details** to reopen it. When a warning changes while minimized, an **Updated** hint appears without forcibly opening the panel. A new clean session starts expanded again. For example, a missing-metadata notice, a USB connection issue, and RPM edge/packet losses can coexist. The expanded banner caps its height when many issues accumulate. The small quality strip beneath the global time slider places each detected event in the complete run; time-series charts show the corresponding highlighted periods. Hover at a marker to identify the channel and issue. The plotted lines are visually broken across affected intervals.
 
 The monitor distinguishes three cases:
 - **Transmission gap (confirmed):** a jump in a channel's rolling 8-bit packet sequence number.
