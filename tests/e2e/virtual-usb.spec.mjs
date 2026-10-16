@@ -15,7 +15,11 @@ test('normal virtual WebUSB drives real RPM charts, hover, settings and reconnec
   const primary = chartCard(page, 'Primary RPM')
   await expect.poll(() => canvasHasInk(primary)).toBe(true)
   await expect(primary.locator('.chart-axis-layer svg')).toBeVisible()
-  await expect.poll(() => canvasHasInk(chartCard(page, 'Primary vs secondary RPM'))).toBe(true)
+  const relationship = chartCard(page, 'Primary vs secondary RPM')
+  await expect.poll(() => canvasHasInk(relationship)).toBe(true)
+  const lowRatio = relationship.locator('.ratio-input').filter({ hasText: 'Low ratio' }).locator('input')
+  await lowRatio.fill('2.75')
+  await expect(lowRatio).toHaveValue('2.75')
 
   const plot = primary.locator('.chart-body')
   await plot.scrollIntoViewIfNeeded()
@@ -23,6 +27,7 @@ test('normal virtual WebUSB drives real RPM charts, hover, settings and reconnec
   expect(rect).not.toBeNull()
   await page.mouse.move(rect.x + rect.width * .78, rect.y + rect.height * .52)
   await expect(primary.locator('.chart-crosshair-line')).toBeVisible()
+  await expect(primary.locator('.hover-readout')).toContainText('RPM')
 
   await page.locator('.analysis-select').filter({ hasText: 'Analysis interval' }).locator('select').selectOption('50')
   await expect(page.locator('.analysis-select').filter({ hasText: 'Analysis interval' }).locator('select')).toHaveValue('50')
@@ -126,6 +131,14 @@ test('headless raw capture round-trips from the production viewer into replay', 
   await expectRpmAbove(page, 'Primary RPM')
   await expect.poll(() => canvasHasInk(chartCard(page, 'Primary RPM'))).toBe(true)
   await expect(page.getByRole('region', { name: 'Run warnings' })).toHaveCount(0)
+  await page.locator('.playback-bar button[title="Export processed CSV"]').click()
+  await expect.poll(async () => {
+    const files = await page.evaluate(() =>
+      [...window.__e2eFiles.entries()].map(([name, data]) => ({ name, text: data.text })),
+    )
+    return files.some(({ name, text }) =>
+      name.includes('-processed-') && text.includes('schema_version,timestamp_s,primary_rpm,secondary_rpm'))
+  }).toBe(true)
   await page.locator('.playback-bar button[title="Play replay"]').click()
   await expect(page.locator('.playback-bar')).toContainText('x')
   await page.locator('.playback-bar button[title="Clear replay"]').click()
@@ -149,6 +162,17 @@ test('raw replay exposes missing sensor pulses and both loss counters on rendere
   await expect(page.locator('.chart-card .quality-chart-marker.suspected').first()).toBeVisible()
   await expect.poll(() => canvasHasInk(chartCard(page, 'Primary RPM'))).toBe(true)
   await expectRpmAbove(page, 'Secondary RPM')
+  const track = page.locator('.time-range-track')
+  await track.scrollIntoViewIfNeeded()
+  const trackBounds = await track.boundingBox()
+  expect(trackBounds).not.toBeNull()
+  const startThumb = page.getByRole('button', { name: 'Chart window start time' })
+  await startThumb.hover()
+  await page.mouse.down()
+  await page.mouse.move(trackBounds.x + trackBounds.width * 0.25, trackBounds.y + trackBounds.height / 2, { steps: 5 })
+  await page.mouse.up()
+  await expect.poll(() => startThumb.evaluate((element) => Number.parseFloat(element.style.left))).toBeGreaterThan(10)
+  await expect.poll(() => canvasHasInk(chartCard(page, 'Primary RPM'))).toBe(true)
   await page.getByRole('button', { name: 'Full range' }).click()
   await expect(page.locator('.chart-range-bar')).toBeVisible()
   await page.locator('.analysis-select').filter({ hasText: 'Analysis interval' }).locator('select').selectOption('20')
