@@ -36,7 +36,7 @@ describe('virtual RP2040 WebUSB interface', () => {
     expect(device.configuration!.interfaces[0].alternate.interfaceClass).toBe(0xff)
     expect(device.configuration!.interfaces[0].alternate.endpoints.map((endpoint) => endpoint.direction)).toEqual(['in', 'out'])
     await device.transferOut(2, encodeCommand(3))
-    const text = await readTextUntil(device, 'Channel [4] (TORQ2)')
+    const text = await readTextUntil(device, '------------------------------------')
     expect(text).toContain('Firmware git: simulator')
     expect(text).toContain('Protocol version: ' + EXPECTED_PROTOCOL_VERSION)
     expect(text).toContain('Bench mode: ENABLED')
@@ -53,7 +53,7 @@ describe('virtual RP2040 WebUSB interface', () => {
     const command = encodeCommand(3)
     await device.transferOut(2, command.subarray(0, 2))
     await device.transferOut(2, command.subarray(2))
-    const text = await readTextUntil(device, 'Channel [4] (TORQ2)')
+    const text = await readTextUntil(device, '------------------------------------')
     expect(text).toContain('Channel [2] (SHIFT): DISABLED')
     expect(text).toContain('Channel [4] (TORQ2): ENABLED | Target Tx Freq: 20 Hz')
     await device.close()
@@ -93,10 +93,8 @@ describe('virtual RP2040 WebUSB interface', () => {
 
   it('turns a deterministic synthetic cable removal into a rejected read', async () => {
     const device = await ready('unplug')
-    const pending = device.transferIn(1, 4096)
-    const rejection = expect(pending).rejects.toThrow('Virtual USB device closed')
     await vi.advanceTimersByTimeAsync(5100)
-    await rejection
     expect(device.opened).toBe(false)
+    await expect(device.transferIn(1, 4096)).rejects.toThrow('Virtual USB interface is not claimed')
   })
 })
