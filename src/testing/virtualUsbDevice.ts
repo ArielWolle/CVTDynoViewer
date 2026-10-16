@@ -38,6 +38,8 @@ export class VirtualUsbDevice implements USBDevice {
   private channels = [true, true, true, true, true]
   private frequencies = [0, 0, 10, 50, 50]
   private benchMode = true
+  private stoppedSent = [false, false]
+  private benchDisabledAtUs = 0
   private rpmPinTest = false
   private rpmInterruptTest = false
   private rpmCountTest = false
@@ -212,7 +214,15 @@ export class VirtualUsbDevice implements USBDevice {
     ]
     const teeth = [16, 12]
     for (let channel = 0; channel < 2; channel += 1) {
-      if (!this.benchMode) continue
+      if (!this.benchMode) {
+        // With no physical sensors attached, stopping bench mode produces the firmware's
+        // explicit period=0 stale event once after ~500ms, rather than freezing last RPM.
+        if (!this.stoppedSent[channel] && timeUs - this.benchDisabledAtUs >= 500_000) {
+          this.stoppedSent[channel] = true
+          if (this.channels[channel]) this.sendPacket(channel, 0, timeUs, this.edgeCounts[channel])
+        }
+        continue
+      }
       const period = Math.max(1, Math.floor(60_000_000 / (Math.max(1, rpm[channel]) * teeth[channel])))
       let emitted = 0
       while (this.nextEdgeUs[channel] <= timeUs && emitted < 80) {
@@ -251,7 +261,14 @@ export class VirtualUsbDevice implements USBDevice {
 
   private handleCommand(command: number, channel: number, value: number): void {
     if (command === 4) {
-      this.benchMode = value === 1
+      const enable = value === 1
+      if (enable !== this.benchMode) {
+        this.benchMode = enable
+        const nowUs = 1_000_000 + Math.floor((performance.now() - this.startedMs) * 1000)
+        this.stoppedSent = [false, false]
+        this.benchDisabledAtUs = nowUs
+        if (enable) this.nextEdgeUs = [nowUs, nowUs]
+      }
       this.writeText(this.benchMode ? 'BENCH MODE ENABLED\r\n' : 'BENCH MODE DISABLED\r\n')
     } else if (command === 5) {
       this.rpmPinTest = value === 1
