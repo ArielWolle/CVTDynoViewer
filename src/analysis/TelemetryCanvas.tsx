@@ -3,6 +3,7 @@ import type { EfficiencyPoint, RatioPoint, RpmPoint, ShiftPoint } from './types'
 import type { PowerRow, WithSeconds } from './store'
 import { projectX, projectY, type NumericDomain, type PlotGeometry } from './plotGeometry'
 import type { ChartId } from './chartTypes'
+import type { QualityEvent } from '../quality/dataQuality'
 
 type TimeDatum = WithSeconds<RpmPoint> | WithSeconds<ShiftPoint> | WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint> | PowerRow
 type RelationshipDatum = WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>
@@ -19,6 +20,7 @@ type Props = {
   secondaryObs: readonly WithSeconds<RpmPoint>[]
   lowRatio: number
   highRatio: number
+  qualityEvents: readonly QualityEvent[]
 }
 
 function drawLine<T>(
@@ -116,8 +118,22 @@ function drawRatioGuide(
   ctx.restore()
 }
 
+// Plot discontinuities should not be bridged across an observed or suspected
+// data-integrity interval. This affects only rendering, never raw packet values.
+export function canConnectAcrossQuality(firstMs: number, secondMs: number, events: readonly QualityEvent[]): boolean {
+  if (!Number.isFinite(firstMs) || !Number.isFinite(secondMs)) return false
+  const left = Math.min(firstMs, secondMs)
+  const right = Math.max(firstMs, secondMs)
+  for (const event of events) {
+    if (event.startMs > right) break
+    if (event.endMs >= left && event.startMs <= right) return false
+  }
+  return true
+}
+
 function drawTelemetry(ctx: CanvasRenderingContext2D, props: Props) {
-  const { chartId, color, plot, xDomain, yDomain, timeData, relationshipData, primaryObs, secondaryObs, lowRatio, highRatio } = props
+  const { chartId, color, plot, xDomain, yDomain, timeData, relationshipData, primaryObs, secondaryObs, lowRatio, highRatio, qualityEvents } = props
+  const connected = (a: { time: number }, b: { time: number }) => canConnectAcrossQuality(a.time, b.time, qualityEvents)
   if (!plot) return
 
   ctx.save()
@@ -135,24 +151,24 @@ function drawTelemetry(ctx: CanvasRenderingContext2D, props: Props) {
     const observations = chartId === 'rpm1' ? primaryObs : secondaryObs
     drawDots(ctx, observations, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 1.5, 0.24)
     const rpm = timeData as readonly WithSeconds<RpmPoint>[]
-    drawLine(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 2, (a, b) => a.epoch === undefined || b.epoch === undefined || a.epoch === b.epoch)
+    drawLine(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 2, (a, b) => (a.epoch === undefined || b.epoch === undefined || a.epoch === b.epoch) && connected(a, b))
     drawDots(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 1.8)
   } else if (chartId === 'shift') {
     const shift = timeData as readonly WithSeconds<ShiftPoint>[]
-    drawLine(ctx, shift, (p) => p.seconds, (p) => p.value, xDomain, yDomain, plot, color, 2, (a, b) => a.epoch === undefined || b.epoch === undefined || a.epoch === b.epoch)
+    drawLine(ctx, shift, (p) => p.seconds, (p) => p.value, xDomain, yDomain, plot, color, 2, (a, b) => (a.epoch === undefined || b.epoch === undefined || a.epoch === b.epoch) && connected(a, b))
   } else if (chartId === 'power') {
     const power = timeData as readonly PowerRow[]
-    drawLine(ctx, power, (p) => p.seconds, (p) => p.power1 ?? Number.NaN, xDomain, yDomain, plot, '#f05d3b')
+    drawLine(ctx, power, (p) => p.seconds, (p) => p.power1 ?? Number.NaN, xDomain, yDomain, plot, '#f05d3b', 2, connected)
     drawDots(ctx, power, (p) => p.seconds, (p) => p.power1 ?? Number.NaN, xDomain, yDomain, plot, '#f05d3b', 1.8)
-    drawLine(ctx, power, (p) => p.seconds, (p) => p.power2 ?? Number.NaN, xDomain, yDomain, plot, '#3c8f88')
+    drawLine(ctx, power, (p) => p.seconds, (p) => p.power2 ?? Number.NaN, xDomain, yDomain, plot, '#3c8f88', 2, connected)
     drawDots(ctx, power, (p) => p.seconds, (p) => p.power2 ?? Number.NaN, xDomain, yDomain, plot, '#3c8f88', 1.8)
   } else if (chartId === 'efficiency') {
     const efficiency = timeData as readonly WithSeconds<EfficiencyPoint>[]
-    drawLine(ctx, efficiency, (p) => p.seconds, (p) => p.efficiencyPct, xDomain, yDomain, plot, color)
+    drawLine(ctx, efficiency, (p) => p.seconds, (p) => p.efficiencyPct, xDomain, yDomain, plot, color, 2, connected)
     drawDots(ctx, efficiency, (p) => p.seconds, (p) => p.efficiencyPct, xDomain, yDomain, plot, color, 1.8)
   } else if (chartId === 'shiftRatio') {
     const ratio = timeData as readonly WithSeconds<RatioPoint>[]
-    drawLine(ctx, ratio, (p) => p.seconds, (p) => p.ratio, xDomain, yDomain, plot, color)
+    drawLine(ctx, ratio, (p) => p.seconds, (p) => p.ratio, xDomain, yDomain, plot, color, 2, connected)
     drawDots(ctx, ratio, (p) => p.seconds, (p) => p.ratio, xDomain, yDomain, plot, color, 1.8)
   }
 
