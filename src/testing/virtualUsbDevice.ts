@@ -5,6 +5,17 @@ import { COMMAND_PACKET_LEN, COMMAND_SYNC, EXPECTED_PROTOCOL_VERSION, TELEMETRY_
 // Wire semantics follow ArielWolle/CVTDynoFirmware src/main.cpp (protocol v2).
 export type VirtualUsbScenario = 'normal' | 'fragmented' | 'unplug' | 'claim-error'
 
+// Exact injection points for reproducible unit tests. The UI's combined fault
+// scenario remains unchanged; these overrides let each failure be isolated.
+export type VirtualUsbFaultPlan = Readonly<{
+  fragmentTransfers?: boolean
+  corruptPacketOrdinals?: readonly number[]
+  dropOutgoingPacketOrdinals?: readonly number[]
+  dropBufferedEdgeCounts?: Partial<Record<0 | 1, readonly number[]>>
+  missSensorToothOrdinals?: Partial<Record<0 | 1, readonly number[]>>
+  stallOutTransferOrdinal?: number
+}>
+
 type PendingRead = {
   length: number
   resolve: (value: USBInTransferResult) => void
@@ -23,6 +34,7 @@ export class VirtualUsbDevice implements USBDevice {
   readonly configurations: USBConfiguration[]
   configuration: USBConfiguration | null = null
   opened = false
+  get bufferedBytes(): number { return this.output.length }
 
   private lineState = false
   private timer: ReturnType<typeof setInterval> | null = null
@@ -49,8 +61,10 @@ export class VirtualUsbDevice implements USBDevice {
   private lastDiagnosticUs = 0
   private lastThrottle = -1
   private sentPackets = 0
+  private outTransfers = 0
 
-  constructor(readonly scenario: VirtualUsbScenario = 'normal') {
+  constructor(readonly scenario: VirtualUsbScenario = 'normal',
+    private readonly faultPlan: VirtualUsbFaultPlan = {}) {
     const alternate: USBAlternateInterface = {
       alternateSetting: 0,
       interfaceClass: 0xff,
@@ -124,6 +138,10 @@ export class VirtualUsbDevice implements USBDevice {
   async transferOut(endpoint: number, data: Uint8Array): Promise<USBOutTransferResult> {
     this.assertReady()
     if (endpoint !== ENDPOINT_OUT) throw new Error('Incorrect USB OUT endpoint')
+    this.outTransfers += 1
+    if (this.faultPlan.stallOutTransferOrdinal === this.outTransfers) {
+      throw new Error('Injected USB OUT transfer stall')
+    }
     for (const byte of data) this.commandBytes.push(byte)
     // Same sync-seeking, fixed-five-byte framing as handleIncomingCommands() in the firmware.
     while (this.commandBytes.length) {
@@ -178,7 +196,8 @@ export class VirtualUsbDevice implements USBDevice {
 
   private takeBytes(length: number): USBInTransferResult {
     // The browser's transfer boundaries do not coincide with telemetry frame boundaries.
-    const sizes = this.scenario === 'fragmented' ? [1, 3, 7, 2, 21, 5, 13, 64, 11, 37] : [64, 19, 127, 31, 7, 88]
+    const sizes = (this.scenario === 'fragmented' || this.faultPlan.fragmentTransfers)
+      ? [1, 3, 7, 2, 21, 5, 13, 64, 11, 37] : [64, 19, 127, 31, 7, 88]
     const count = Math.min(length, this.output.length, sizes[this.chunkIndex++ % sizes.length])
     const bytes = new Uint8Array(this.output.splice(0, count))
     return { status: 'ok', data: new DataView(bytes.buffer) }
@@ -198,12 +217,17 @@ export class VirtualUsbDevice implements USBDevice {
     packet[20] = crc8(packet.subarray(2, 20))
     this.sentPackets += 1
     // Corrupted packet -> downstream sequence gap. Omitted physical RPM edge -> edgeCount gap.
-    if (this.scenario === 'fragmented' && this.sentPackets % 173 === 0) packet[20] ^= 0xff
+    if ((this.scenario === 'fragmented' && this.sentPackets % 173 === 0) ||
+        this.faultPlan.corruptPacketOrdinals?.includes(this.sentPackets)) packet[20] ^= 0xff
     return packet
   }
 
   private sendPacket(channel: number, value: number, timeUs: number, edgeCount = 0): void {
-    this.append(this.makePacket(channel, value, timeUs, edgeCount))
+    const packet = this.makePacket(channel, value, timeUs, edgeCount)
+    // A packet may be assigned a transmit sequence number and then never
+    // arrive in the browser. This must not alter the firmware-side edge count.
+    if (this.faultPlan.dropOutgoingPacketOrdinals?.includes(this.sentPackets)) return
+    this.append(packet)
   }
 
   private tick(): void {
@@ -240,15 +264,17 @@ export class VirtualUsbDevice implements USBDevice {
         // In the fault scenario a primary sensor occasionally never sees a real tooth.
         // Firmware cannot count that missing capture: the NEXT accepted edge simply
         // carries a roughly doubled inter-edge period with uninterrupted seq/edgeCount.
-        const missedBySensor = this.scenario === 'fragmented' && channel === 0 &&
-          this.physicalToothCount[channel] % 257 === 0
+        const missedBySensor = (this.scenario === 'fragmented' && channel === 0 &&
+          this.physicalToothCount[channel] % 257 === 0) ||
+          this.faultPlan.missSensorToothOrdinals?.[channel as 0 | 1]?.includes(this.physicalToothCount[channel])
         if (!missedBySensor) {
           const actualPeriod = this.lastAcceptedEdgeUs[channel] > 0
             ? captureTime - this.lastAcceptedEdgeUs[channel] : period
           this.lastAcceptedEdgeUs[channel] = captureTime
           this.edgeCounts[channel] += 1
           // Separately simulate an edge captured by firmware but lost in its ring.
-          const dropBeforeSend = this.scenario === 'fragmented' && this.edgeCounts[channel] % 191 === 0
+          const dropBeforeSend = (this.scenario === 'fragmented' && this.edgeCounts[channel] % 191 === 0) ||
+            this.faultPlan.dropBufferedEdgeCounts?.[channel as 0 | 1]?.includes(this.edgeCounts[channel])
           if (this.channels[channel] && !dropBeforeSend) this.sendPacket(channel, actualPeriod, captureTime, this.edgeCounts[channel])
         }
         this.nextEdgeUs[channel] += period
