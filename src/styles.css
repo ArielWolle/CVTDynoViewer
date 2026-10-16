@@ -101,16 +101,63 @@ button { cursor: pointer; }
 .top-actions .button:disabled, .simulator-scenario:disabled { opacity: .5; cursor: not-allowed; }
 @media (max-width: 980px) { .topbar { flex-wrap: wrap; } .top-actions { flex-wrap: wrap; } }
 
-/* Non-modal, independently keyed issues. Collapsed summary remains visible at all times. */
-.warning-banner { display: block; padding: 0; }
-.warning-banner details { width: 100%; }
-.warning-banner summary { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; padding: 12px 16px; cursor: pointer; list-style: none; }
-.warning-banner summary::-webkit-details-marker { display: none; }
-.warning-banner summary > strong { font-size: 12px; }
-.warning-banner summary > span { font: 10px/1.5 'DM Mono', monospace; color: #6f4d00; }
-.warning-banner .warning-issues { padding: 0 16px 12px 44px; font-size: 12px; }
-.warning-banner .warning-issues p + p { margin-top: 6px; }
-.warning-banner .warning-issues p { margin: 0; }
+/* All run issues stay readable while scrolling, without covering the whole workspace. */
+.warning-banner {
+  position: sticky;
+  top: 8px;
+  z-index: 30;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  column-gap: 16px;
+  padding: 11px 14px;
+  max-height: min(34vh, 235px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 5px 20px rgba(75, 54, 14, .12);
+}
+.warning-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.warning-heading > svg { color: #a97000; flex-shrink: 0; }
+.warning-issues {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 16px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.warning-issues li {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex: 1 1 380px;
+  min-width: 0;
+  padding: 3px 0 3px 10px;
+  border-left: 2px solid #d1a34c;
+  line-height: 1.5;
+}
+.warning-issue-label {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+}
+.warning-issue-message { font-size: 11px; min-width: 0; }
+@media (max-width: 800px) {
+  .warning-banner {
+    grid-template-columns: 1fr;
+    gap: 5px;
+    max-height: 29vh;
+  }
+  .warning-issues li { flex-basis: 100%; }
+  .warning-issue-label { white-space: normal; }
+}
 
 .quality-timeline { display: flex; align-items: center; gap: 12px; margin: 1px 0 14px; padding: 4px 2px; }
 .quality-timeline-label, .quality-timeline-count { font: 10px 'DM Mono', monospace; color: var(--muted); white-space: nowrap; }
