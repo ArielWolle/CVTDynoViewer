@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { decodePacket, encodeCommand, EXPECTED_PROTOCOL_VERSION } from '../protocol'
 import { VirtualUsbDevice } from './virtualUsbDevice'
+import { UsbStreamFramer } from '../usbStreamFramer'
+import { DataQualityMonitor } from '../quality/dataQuality'
 
 function readBytes(result: USBInTransferResult): Uint8Array {
   const data = result.data!
@@ -79,6 +81,21 @@ describe('virtual RP2040 WebUSB interface', () => {
     expect(rpmPacket).not.toBeNull()
     expect(rpmPacket!.edgeCount).toBeGreaterThan(0)
     expect(rpmPacket!.value).toBeGreaterThan(0)
+    await device.close()
+  })
+
+  it('exercises inferred sensor misses separately from transmission and ring loss', async () => {
+    const device = await ready('fragmented')
+    await vi.advanceTimersByTimeAsync(650)
+    const monitor = new DataQualityMonitor()
+    const framer = new UsbStreamFramer((decoded) => monitor.ingest(decoded), () => undefined)
+    for (let read = 0; read < 4000; read += 1) {
+      framer.push(readBytes(await device.transferIn(1, 4096)))
+      if (monitor.snapshot().suspectedSensorPulses[0] > 0) break
+    }
+    const quality = monitor.snapshot()
+    expect(quality.suspectedSensorPulses[0]).toBeGreaterThan(0)
+    expect(quality.events.some((event) => event.kind === 'suspected-missed-pulse')).toBe(true)
     await device.close()
   })
 
