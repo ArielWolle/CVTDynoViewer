@@ -110,8 +110,13 @@ describe('virtual RP2040 WebUSB interface', () => {
 
   it('clearly identifies the deliberate unplug to a pending USB reader', async () => {
     const device = await ready('unplug')
-    const pendingRead = device.transferIn(1, 4096)
-    const rejection = expect(pendingRead).rejects.toThrow('Simulated RP2040 unplugged after 5 seconds')
+    // The device may already have buffered telemetry. Act like the actual worker:
+    // drain every available read until the scheduled cable unplug aborts the stream.
+    const readUntilUnplug = async () => {
+      for (let i = 0; i < 25000; i += 1) await device.transferIn(1, 4096)
+      throw new Error('Virtual USB failed to unplug')
+    }
+    const rejection = expect(readUntilUnplug()).rejects.toThrow('Simulated RP2040 unplugged after 5 seconds')
     await vi.advanceTimersByTimeAsync(5100)
     await rejection
     expect(device.opened).toBe(false)
