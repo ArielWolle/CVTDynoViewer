@@ -18,6 +18,7 @@ test('normal virtual WebUSB drives real RPM charts, hover, settings and reconnec
   await expect.poll(() => canvasHasInk(chartCard(page, 'Primary vs secondary RPM'))).toBe(true)
 
   const plot = primary.locator('.chart-body')
+  await plot.scrollIntoViewIfNeeded()
   const rect = await plot.boundingBox()
   expect(rect).not.toBeNull()
   await page.mouse.move(rect.x + rect.width * .78, rect.y + rect.height * .52)
