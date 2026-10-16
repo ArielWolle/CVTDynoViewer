@@ -57,11 +57,17 @@ The Playwright runner is pinned and installed for the browser job, rather than
 changing the app's existing npm lockfile. `npm run test` runs the fast Vitest
 tests under `src` only.
 
-One **real recorded RP2040 run** remains to be supplied. The acceptance and
-provenance checklist is in
-`tests/fixtures/real/README.md`; we will not invent a "real-world golden"
-result before reviewing that file. Simulated browser tests are not a substitute
-for physical USB, sensor timing or electrical validation.
+A **real RP2040 recording** has now been added as a small, contiguous
+six-second fixture: `tests/fixtures/real/reference-run-raw.csv`. It contains
+7,119 unmodified recorded RPM packets and 35 suspected primary missed-pulse
+events. We prepended the user's requested **reconstructed default metadata**:
+16/12 wheel teeth, 100 ms analysis window and default engine curve/inertia.
+These are reproducibility assumptions, **not verified historical settings**.
+The manifest documents the original recording's hash, the excerpt's hash and
+exact anomaly anchors. Both the fast quality regression and a full Chromium
+raw replay test run on PR CI. See `tests/fixtures/real/README.md` for the
+provenance and limitations. Browser simulation does not validate physical USB,
+sensor timing or electrical behavior.
 
 ## Physical WebUSB connection
 
