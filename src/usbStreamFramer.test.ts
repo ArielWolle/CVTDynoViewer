@@ -36,7 +36,7 @@ describe('stream framer for actual bulk WebUSB reads', () => {
     const framer = new UsbStreamFramer((p) => seen.push(p.seq), (s) => text.push(s))
     // Every transfer is 1-7 bytes; neither a packet nor a config line aligns to reads.
     for (let i = 0; i < source.length;) {
-      const count = 1 + ((i * 7) % 7)
+      const count = 1 + ((i * 5) % 7)
       framer.push(source.subarray(i, i + count))
       i += count
     }
