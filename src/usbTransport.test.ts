@@ -88,6 +88,29 @@ describe('UsbTransport lifecycle and command delivery', () => {
     await transport.disconnect()
   })
 
+  it('does not claim a command succeeded when the USB OUT transfer failed', async () => {
+    vi.stubGlobal('Worker', FakeWorker)
+    const sendErrors: string[] = []
+    const transport = new UsbTransport({
+      onValue: () => undefined,
+      onText: () => undefined,
+      onError: (message) => sendErrors.push(message),
+    })
+    await transport.connect('normal')
+    const worker = instance()
+    worker.deferredSend = true
+    const promise = transport.send(encodeCommand(4, 0, 1))
+    const sent = worker.sent.find((message) => message.type === 'send')
+    expect(sent?.type).toBe('send')
+    const failure = expect(promise).rejects.toThrow('Simulated USB OUT stall')
+    if (sent?.type === 'send') {
+      worker.emit({ type: 'send-error', requestId: sent.requestId, message: 'Simulated USB OUT stall' })
+    }
+    await failure
+    expect(sendErrors).toContain('USB send error: Simulated USB OUT stall')
+    await transport.disconnect()
+  })
+
   it('rejects outstanding commands on unexpected read failure and informs the UI', async () => {
     vi.stubGlobal('Worker', FakeWorker)
     const disconnected: string[] = []
