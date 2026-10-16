@@ -65,6 +65,19 @@ describe('UsbTransport lifecycle and command delivery', () => {
     expect(transport.connected).toBe(false)
   })
 
+  it('connects, commands and cleanly disconnects repeatedly without accumulating workers', async () => {
+    vi.stubGlobal('Worker', FakeWorker)
+    const transport = new UsbTransport({ onValue: () => undefined, onText: () => undefined })
+    for (let i = 0; i < 25; i += 1) {
+      await transport.connect('normal')
+      await transport.send(encodeCommand(3))
+      await transport.disconnect()
+      expect(transport.connected).toBe(false)
+    }
+    expect(FakeWorker.instances).toHaveLength(25)
+    expect(FakeWorker.instances.every((worker) => worker.cleanedUp && worker.terminated)).toBe(true)
+  })
+
   it('terminates a worker that fails connection setup and permits reconnect', async () => {
     vi.stubGlobal('Worker', FakeWorker)
     const transport = new UsbTransport({ onValue: () => undefined, onText: () => undefined })
