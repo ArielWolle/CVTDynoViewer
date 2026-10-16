@@ -8,6 +8,8 @@ export type RawSessionMetadata = {
   schemaVersion: 1
   startedAt: string
   stoppedAt?: string
+  captureSource?: 'hardware' | 'virtual'
+  simulationScenario?: 'normal' | 'fragmented' | 'unplug' | 'claim-error'
   firmwareGitSha?: string | null
   firmwareProtocolVersion?: number | null
   primaryTeeth?: number
