@@ -19,6 +19,7 @@
 // thread's requestDevice()/getDevices() has already resolved) sees that same grant immediately and
 // does the actual open()/claimInterface()/read loop entirely on its own side.
 import { decodePacket, TELEMETRY_SYNC0, TELEMETRY_SYNC1, TELEMETRY_PACKET_LEN, type ChannelId } from './protocol'
+import { VirtualUsbDevice, type VirtualUsbScenario } from './testing/virtualUsbDevice'
 
 // See usbTransport.ts for the meaning of each of these -- copied here unchanged since this file
 // now owns the device instead of usbTransport.ts.
@@ -40,11 +41,12 @@ export type WorkerOutboundMessage =
   // generous cap is sized to absorb).
   | { type: 'chunk'; packets: WorkerDecodedPacket[]; texts: string[]; overflowDropped: number; deliveryId: number; maxPacketOrdinal: number }
   | { type: 'flushed'; requestId: number }
-  | { type: 'send-error'; message: string }
+  | { type: 'sent'; requestId: number }
+  | { type: 'send-error'; requestId: number; message: string }
 
 export type WorkerInboundMessage =
-  | { type: 'connect'; vendorId: number; productId: number }
-  | { type: 'send'; bytes: Uint8Array }
+  | { type: 'connect'; vendorId: number; productId: number; virtualScenario?: VirtualUsbScenario }
+  | { type: 'send'; bytes: Uint8Array; requestId: number }
   | { type: 'disconnect' }
   | { type: 'ack'; deliveryId: number; maxPacketOrdinal: number }
   | { type: 'flush'; requestId: number }
@@ -148,25 +150,39 @@ function post(message: WorkerOutboundMessage) {
   postMessage(message)
 }
 
-async function connect(vendorId: number, productId: number) {
-  if (!('usb' in navigator)) { post({ type: 'connect-error', message: 'WebUSB is not supported in this browser.' }); return }
+async function connect(vendorId: number, productId: number, virtualScenario?: VirtualUsbScenario) {
+  let candidate: USBDevice | null = null
+  let opened = false
+  let claimedInterface = -1
+  let stage = 'permission lookup'
   try {
-    const authorized = await navigator.usb.getDevices()
-    const found = authorized.find((candidate) => matchesDevice(candidate, vendorId, productId))
-    if (!found) {
-      // The main thread already ran requestDevice() before sending us 'connect' -- if we still
-      // can't see it here, permission genuinely wasn't granted (user dismissed the chooser).
-      post({ type: 'connect-error', message: 'USB device permission was not granted.' })
-      return
+    if (virtualScenario) {
+      candidate = new VirtualUsbDevice(virtualScenario)
+    } else {
+      if (!('usb' in navigator)) throw new Error('WebUSB is not supported in this browser.')
+      const authorized = await navigator.usb.getDevices()
+      candidate = authorized.find((item) => matchesDevice(item, vendorId, productId)) ?? null
+      if (!candidate) throw new Error('USB device permission was not granted.')
     }
-    await found.open()
-    if (!found.configuration) await found.selectConfiguration(1)
-    const vendorInterface = findVendorInterface(found)
-    if (!vendorInterface) { post({ type: 'connect-error', message: 'Selected USB device has no matching vendor interface (wrong device, or firmware is not the WebUSB build).' }); return }
-    await found.claimInterface(vendorInterface.interfaceNumber)
-    await found.controlTransferOut({ requestType: 'class', recipient: 'interface', request: VENDOR_REQUEST_SET_LINE_STATE, value: 0x0001, index: vendorInterface.interfaceNumber })
 
-    device = found
+    stage = 'device open'
+    await candidate.open()
+    opened = true
+    stage = 'configuration select'
+    if (!candidate.configuration) await candidate.selectConfiguration(1)
+    const vendorInterface = findVendorInterface(candidate)
+    if (!vendorInterface) throw new Error('No matching vendor-class bulk IN/OUT interface (wrong firmware or USB descriptors)')
+    stage = 'interface claim'
+    await candidate.claimInterface(vendorInterface.interfaceNumber)
+    claimedInterface = vendorInterface.interfaceNumber
+    stage = 'line state'
+    const lineState = await candidate.controlTransferOut({
+      requestType: 'class', recipient: 'interface', request: VENDOR_REQUEST_SET_LINE_STATE,
+      value: 0x0001, index: vendorInterface.interfaceNumber,
+    })
+    if (lineState.status !== 'ok') throw new Error('Device rejected the line-state request')
+
+    device = candidate
     interfaceNumber = vendorInterface.interfaceNumber
     endpointIn = vendorInterface.endpointIn
     endpointOut = vendorInterface.endpointOut
@@ -181,9 +197,13 @@ async function connect(vendorId: number, productId: number) {
     nextDeliveryId = 1
     flushWaiters = []
     post({ type: 'connected' })
-    readLoop()
+    void readLoop()
   } catch (error) {
-    post({ type: 'connect-error', message: error instanceof Error ? error.message : 'Could not connect to USB device' })
+    // In particular, opening a device and then failing claimInterface must not leave it open.
+    if (claimedInterface >= 0) await candidate?.releaseInterface(claimedInterface).catch(() => undefined)
+    if (opened) await candidate?.close().catch(() => undefined)
+    post({ type: 'connect-error', message: 'USB connect (' + stage + '): ' +
+      (error instanceof Error ? error.message : String(error)) })
   }
 }
 
@@ -201,15 +221,17 @@ async function disconnect() {
   endpointOut = -1
 }
 
-async function send(bytes: Uint8Array) {
-  if (!device) { post({ type: 'send-error', message: 'USB device is not connected.' }); return }
+async function send(bytes: Uint8Array, requestId: number) {
+  if (!device) { post({ type: 'send-error', requestId, message: 'USB device is not connected.' }); return }
   try {
-    await device.transferOut(endpointOut, bytes)
+    const result = await device.transferOut(endpointOut, bytes)
+    if (result.status !== 'ok' || result.bytesWritten !== bytes.byteLength) {
+      throw new Error('Incomplete or stalled USB transfer')
+    }
+    // Acknowledges transferOut completion, not firmware application of the command.
+    post({ type: 'sent', requestId })
   } catch (error) {
-    // Deliberately not awaited by the main thread's send() (see usbTransport.ts) -- reported here
-    // asynchronously instead so a failed command is still visible without making every command
-    // send wait on this thread's transferOut() to fully resolve before the caller can continue.
-    post({ type: 'send-error', message: error instanceof Error ? error.message : 'USB send failed' })
+    post({ type: 'send-error', requestId, message: error instanceof Error ? error.message : 'USB send failed' })
   }
 }
 
@@ -223,8 +245,9 @@ async function readLoop() {
       }
     } catch (error) {
       if (!reading) break // disconnect() already tore this down; not a real failure
-      post({ type: 'disconnected', reason: error instanceof Error ? error.message : 'USB read failed' })
-      device = null
+      const reason = error instanceof Error ? error.message : 'USB read failed'
+      await disconnect()
+      post({ type: 'disconnected', reason: 'USB read: ' + reason })
       break
     }
   }
@@ -288,9 +311,12 @@ function consume(chunk: Uint8Array) {
 
 self.onmessage = (event: MessageEvent<WorkerInboundMessage>) => {
   const message = event.data
-  if (message.type === 'connect') void connect(message.vendorId, message.productId)
-  else if (message.type === 'send') void send(message.bytes)
-  else if (message.type === 'disconnect') void disconnect()
+  if (message.type === 'connect') void connect(message.vendorId, message.productId, message.virtualScenario)
+  else if (message.type === 'send') void send(message.bytes, message.requestId)
+  else if (message.type === 'disconnect') {
+    void disconnect().then(() => post({ type: 'disconnected' }))
+      .catch((error) => post({ type: 'disconnected', reason: 'USB cleanup: ' + String(error) }))
+  }
   else if (message.type === 'ack') { deliveryCredits += 1; lastAckedPacketOrdinal = Math.max(lastAckedPacketOrdinal, message.maxPacketOrdinal); checkFlushWaiters(); tryDeliver() }
   else if (message.type === 'flush') { flushWaiters.push({ requestId: message.requestId, targetOrdinal: nextPacketOrdinal }); tryDeliver(); checkFlushWaiters() }
 }
