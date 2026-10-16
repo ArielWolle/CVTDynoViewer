@@ -28,3 +28,43 @@ jobs:
         run: npm run test
       - name: Build
         run: npm run build
+
+  # Runs independently from the fast checks, so browser coverage adds little to
+  # overall PR wall time. No physical USB device, external API or secrets needed.
+  browser-e2e:
+    name: Chromium / virtual WebUSB
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install project dependencies
+        run: npm ci
+      - name: Install pinned Playwright test runner
+        # Keep PR #5's npm lockfile intact for now. The E2E runner is pinned and
+        # installed only for this job, not shipped in the production bundle.
+        run: npm install --no-save --no-package-lock --ignore-scripts @playwright/test@1.56.1
+      - name: Cache headless Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-headless-linux-playwright-1.56.1
+      - name: Install Chromium headless shell and OS libraries
+        run: npx playwright install --with-deps --only-shell chromium
+      - name: Build production viewer
+        run: npm run build
+      - name: Run browser E2E suite
+        run: npx playwright test --config=tests/e2e/playwright.config.mjs
+      - name: Upload failure traces and screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtual-webusb-playwright-${{ github.run_id }}
+          path: test-results/playwright/
+          if-no-files-found: ignore
+          retention-days: 5
