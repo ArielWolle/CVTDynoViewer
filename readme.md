@@ -28,6 +28,19 @@ The scenario selector offers normal operation, **loss / fragmentation** (determi
 
 The browser filters VID 0x1209 / PID 0xCD10. A dedicated worker opens/claims the vendor interface (class FF, subclass 00, protocol 00), enables the line state, and runs the bulk IN/OUT loops. Command writes now await transferOut completion/error rather than acknowledging mere postMessage delivery. Disconnect waits for interface release and device close before worker termination (bounded fallback). Unexpected disconnection closes open raw logs without a false clean-stop footer.
 
+## Data quality and suspected missed tooth pulses
+
+The **Data quality** banner groups independent warnings without overwriting one another. For example, a missing-metadata notice and RPM edge/packet losses can coexist during raw-file replay. Expand the summary for details. The small quality strip beneath the global time slider places each detected event in the complete run; time-series charts show the corresponding highlighted periods. Hover at a marker to identify the channel and issue. The plotted lines are visually broken across affected intervals.
+
+The monitor distinguishes three cases:
+- **Transmission gap (confirmed):** a jump in a channel's rolling 8-bit packet sequence number.
+- **Device buffering gap (confirmed):** a jump in the 32-bit physical-edge count beyond the loss accounted for by sequence gaps.
+- **Suspected missed sensor pulse (inferred):** an otherwise contiguous RPM stream has an inter-tooth period 1.7–2.3 times the median of the last 5–7 ordinary periods, followed by a period 0.75–1.25 times that baseline. The extra confirming period avoids treating a sustained abrupt deceleration as a missing tooth. This may reflect a sensor pulse missed by the RP2040 or an actual missing wheel tooth, but cannot distinguish the two reliably from this signal alone.
+
+The suspect detector runs only in the viewer and needs **no firmware change**. A sequence/edge gap, stop report, or deliberate channel toggle clears its local baseline. Raw telemetry and physical counters are preserved exactly; suspected pulses are **not silently reconstructed, replaced, or declared confirmed loss**. The shaded intervals on plots indicate measurement confidence, not independently verified tooth damage.
+
+To exercise all three categories without the RP2040, use **Virtual: loss / fragmentation**. Saved raw runs recreate the quality events when replayed because their source fields contain timestamps, packet sequences and physical-edge counts.
+
 ## Logging
 
 Choose a directory in Chromium to save CSV files directly through the File System Access API. Browsers without that API use a normal CSV download. Torque scale and zero are editable because the firmware exposes torque counts rather than a documented physical unit.
