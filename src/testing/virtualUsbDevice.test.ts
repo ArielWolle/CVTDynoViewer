@@ -108,10 +108,19 @@ describe('virtual RP2040 WebUSB interface', () => {
     expect(device.opened).toBe(false)
   })
 
+  it('clearly identifies the deliberate unplug to a pending USB reader', async () => {
+    const device = await ready('unplug')
+    const pendingRead = device.transferIn(1, 4096)
+    const rejection = expect(pendingRead).rejects.toThrow('Simulated RP2040 unplugged after 5 seconds')
+    await vi.advanceTimersByTimeAsync(5100)
+    await rejection
+    expect(device.opened).toBe(false)
+  })
+
   it('turns a deterministic synthetic cable removal into a rejected read', async () => {
     const device = await ready('unplug')
     await vi.advanceTimersByTimeAsync(5100)
     expect(device.opened).toBe(false)
-    await expect(device.transferIn(1, 4096)).rejects.toThrow('Virtual USB interface is not claimed')
+    await expect(device.transferIn(1, 4096)).rejects.toThrow('Simulated RP2040 unplugged after 5 seconds (intentional test)')
   })
 })
