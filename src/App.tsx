@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, TriangleAlert, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { channelNames, encodeCommand, EXPECTED_PROTOCOL_VERSION, periodUsToRpm, type ChannelId } from './protocol'
 import { UsbTransport } from './usbTransport'
+import { DataQualityMonitor, EMPTY_QUALITY_SNAPSHOT, type QualitySnapshot } from './quality/dataQuality'
 import type { VirtualUsbScenario } from './testing/virtualUsbDevice'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { AnalysisClient } from './analysis/client'
@@ -131,19 +132,19 @@ function App() {
   const [playbackFileName, setPlaybackFileName] = useState('')
   const [rawPlaybackActive, setRawPlaybackActive] = useState(false)
   const [replayState, setReplayState] = useState<RawReplayState>({ loaded: false, playing: false, analyzing: false, analysisProgress: 0, speed: 1, loop: false, progress: 0, elapsedMs: 0, durationMs: 0, loopCount: 0 })
-  // Mirrors droppedPacketsRef for display -- counted via the firmware's per-channel sequence
+  // Loss events are classified centrally from sequence/edge counts and RPM periods.
   // numbers (protocol v2+ only; always 0 against older firmware, which has no sequence number to
   // detect gaps with). This ONLY reveals loss AFTER a packet was already queued for transmission
   // (downstream/USB loss) -- it can NOT reveal an RPM edge that the firmware's own ring buffer
   // dropped before ever assigning it a sequence number, which is exactly why edgeCount/lostEdges
   // below exists as a separate metric (see protocol.ts's EXPECTED_PROTOCOL_VERSION comment for the
   // full reasoning; this used to be conflated as one thing here, which was incorrect).
-  const [droppedPackets, setDroppedPackets] = useState(0)
-  // Mirrors lostEdgesRef -- per-RPM-channel gaps in the firmware's physical edge counter (protocol
+  const [qualitySnapshot, setQualitySnapshot] = useState<QualitySnapshot>(EMPTY_QUALITY_SNAPSHOT)
+  // Raw telemetry stays unchanged: suspected anomalies do not fabricate/rewrite measurements. (protocol
   // v3+ only; always 0 against older firmware). A nonzero value here means an edge was lost BEFORE
   // it ever reached the ring/USB (e.g. RpmCounter's ring buffer overflowing during a transient host
   // stall), distinct from droppedPackets above.
-  const [lostEdges, setLostEdges] = useState<[number, number]>([0, 0])
+  // Snapshots refresh only when events or counters actually change.
   const [chartPlaying, setChartPlaying] = useState(true)
   const [frozenDomainEnd, setFrozenDomainEnd] = useState<number | null>(null)
   // Bumped whenever a new dataset (CSV) is loaded, so <ChartWorkspace key={chartResetKey}> remounts
@@ -179,12 +180,12 @@ function App() {
     return Number.isFinite(stored) && stored > 0 ? stored : 0.9
   })
   const [notice, setNotice] = useState('Ready to connect to the dyno or load a saved raw run')
-  const [warningNotice, setWarningNotice] = useState<string | null>(null)
+  const [warningIssues, setWarningIssues] = useState<Record<string, string>>({})
   const [directoryName, setDirectoryName] = useState('Browser download')
   const transport = useRef<UsbTransport | null>(null)
   const directoryHandle = useRef<FileSystemDirectoryHandle | null>(null)
   const rawLoggerRef = useRef<RawSessionLogger | null>(null)
-  if (!rawLoggerRef.current) rawLoggerRef.current = new RawSessionLogger((message) => { setWarningNotice(message); setNotice(message) })
+  if (!rawLoggerRef.current) rawLoggerRef.current = new RawSessionLogger((message) => { setWarning('raw-log', message); setNotice(message) })
   const logStartedAtRef = useRef<string | null>(null)
   const consoleOutputRef = useRef<HTMLDivElement | null>(null)
   const consoleMessageId = useRef(0)
@@ -196,10 +197,8 @@ function App() {
   // to RawSessionLogger before health accounting or analysis dispatch. The analysis worker can
   // therefore be slow, restarted, or absent without changing what is written to the raw CSV.
   const timeOffsetMsRef = useRef<number | null>(null)
-  const channelSeqRef = useRef<number[]>([-1, -1, -1, -1, -1, -1])
-  const droppedPacketsRef = useRef(0)
-  const lastEdgeCountRef = useRef<number[]>([-1, -1])
-  const lostEdgesRef = useRef<[number, number]>([0, 0])
+  const qualityMonitorRef = useRef<DataQualityMonitor | null>(null)
+  if (!qualityMonitorRef.current) qualityMonitorRef.current = new DataQualityMonitor()
   const pendingConsoleLinesRef = useRef<string[]>([])
   const primarySpokesRef = useRef(primarySpokes)
   const secondarySpokesRef = useRef(secondarySpokes)
@@ -245,7 +244,7 @@ function App() {
         // AnalysisStore owns chunked derived history outside React, so old arrays are not recopied.
         analysisStore.apply(update)
       },
-      (message) => setWarningNotice(`Analysis worker error: ${message}`),
+      (message) => setWarning('analysis-worker', 'Analysis worker error: ' + message),
     )
     analysisClientRef.current = client
     return () => { client.terminate(); if (analysisClientRef.current === client) analysisClientRef.current = null }
@@ -275,11 +274,7 @@ function App() {
         setReplayState(state)
         // Replay is downstream of the raw logger and has no connected-display timer, so refresh
         // its health counters on the controller's throttled (~20 Hz) state updates instead of per packet.
-        setDroppedPackets(droppedPacketsRef.current)
-        setLostEdges((previous) => {
-          const next = lostEdgesRef.current
-          return previous[0] === next[0] && previous[1] === next[1] ? previous : [next[0], next[1]]
-        })
+        refreshQuality()
       },
     })
     rawReplayRef.current = controller
@@ -297,11 +292,7 @@ function App() {
         pendingConsoleLinesRef.current = []
         appendConsoleLines(consoleLinesToFlush)
       }
-      setDroppedPackets(droppedPacketsRef.current)
-      setLostEdges((previous) => {
-          const next = lostEdgesRef.current
-          return previous[0] === next[0] && previous[1] === next[1] ? previous : [next[0], next[1]]
-        })
+      refreshQuality()
     }
     const timer = window.setInterval(flush, 33)
     return () => { window.clearInterval(timer); flush() }
@@ -332,17 +323,37 @@ function App() {
     analysisClientRef.current?.configure(saved)
   }
 
+  function setWarning(key: string, message: string | null) {
+    setWarningIssues((previous) => {
+      if (message === null) {
+        if (!(key in previous)) return previous
+        const next = { ...previous }
+        delete next[key]
+        return next
+      }
+      if (previous[key] === message) return previous
+      return { ...previous, [key]: message }
+    })
+  }
+
+  function clearWarnings() { setWarningIssues({}) }
+
+  function refreshQuality() {
+    const next = qualityMonitorRef.current?.snapshot() ?? EMPTY_QUALITY_SNAPSHOT
+    setQualitySnapshot((previous) => previous.revision === next.revision ? previous : next)
+  }
+
   async function connect(virtualScenario?: VirtualUsbScenario) {
     // A ref closes the gap between clicks and React's next render.
     if (connectingRef.current || transport.current?.connected) return
     connectingRef.current = true
     setConnecting(true)
-    setWarningNotice(null)
+    clearWarnings()
     const next = new UsbTransport({
       onValue: handleValue,
       onPacket: handleUsbPacket,
       onText: handleUsbText,
-      onError: (message) => setWarningNotice(message),
+      onError: (message) => setWarning('usb', message),
       onDisconnected: (reason) => {
         if (transport.current !== next) return
         transport.current = null
@@ -351,13 +362,13 @@ function App() {
         setFirmwareDemoMode(false)
         setFirmwareGitSha(null)
         setFirmwareProtocolVersion(null)
-        setWarningNotice(reason)
+        setWarning('usb', reason)
         setNotice('USB connection lost: ' + reason)
         // An unexpected disconnect is NOT a clean physical stop boundary.
         // Close whatever raw data we have, but leave off the clean-stop footer.
         if (rawLoggerRef.current?.isActive) {
           void rawLoggerRef.current.stop()
-            .catch(() => setWarningNotice('USB link lost; raw log could not be closed cleanly'))
+            .catch(() => setWarning('raw-log', 'USB link lost; raw log could not be closed cleanly'))
             .finally(() => setLogging(false))
         }
       },
@@ -368,10 +379,7 @@ function App() {
       setRawPlaybackActive(false)
       setPlaybackFileName('')
       timeOffsetMsRef.current = null
-      channelSeqRef.current = [-1, -1, -1, -1, -1, -1]
-      droppedPacketsRef.current = 0
-      lastEdgeCountRef.current = [-1, -1]
-      lostEdgesRef.current = [0, 0]
+      resetPacketHealth()
       pendingConsoleLinesRef.current = []
       analysisClientRef.current?.reset()
       setFirmwareGitSha(null)
@@ -393,7 +401,7 @@ function App() {
       setConnectionMode(null)
       const message = error instanceof Error ? error.message : 'Could not connect to USB device'
       setNotice(message)
-      setWarningNotice(message)
+      setWarning('usb', message)
     } finally {
       connectingRef.current = false
       setConnecting(false)
@@ -611,35 +619,12 @@ function App() {
     } catch { setNotice('Could not change RPM count test mode') }
   }
   function resetPacketHealth() {
-    channelSeqRef.current = [-1, -1, -1, -1, -1, -1]
-    droppedPacketsRef.current = 0
-    lastEdgeCountRef.current = [-1, -1]
-    lostEdgesRef.current = [0, 0]
-    setDroppedPackets(0)
-    setLostEdges([0, 0])
+    qualityMonitorRef.current?.reset()
+    refreshQuality()
   }
 
   function accountPacketHealth(channel: ChannelId, value: number, tUs: number, seq: number, edgeCount: number) {
-    const expectedSeq = channelSeqRef.current[channel]
-    let seqGap = 0
-    if (tUs > 0 && expectedSeq !== -1) {
-      seqGap = (seq - expectedSeq - 1) & 0xff
-      if (seqGap > 0) droppedPacketsRef.current += seqGap
-    }
-    channelSeqRef.current[channel] = seq
-
-    if (channel === 0 || channel === 1) {
-      if (value === 0) lastEdgeCountRef.current[channel] = -1
-      else {
-        const lastEdgeCount = lastEdgeCountRef.current[channel]
-        if (lastEdgeCount !== -1) {
-          const edgeGap = (edgeCount - lastEdgeCount - 1) >>> 0
-          const deviceOnlyLoss = Math.max(0, edgeGap - seqGap)
-          if (deviceOnlyLoss > 0) lostEdgesRef.current[channel] += deviceOnlyLoss
-        }
-        lastEdgeCountRef.current[channel] = edgeCount
-      }
-    }
+    qualityMonitorRef.current?.ingest({ channel, value, tUs, seq, edgeCount })
   }
 
   // Real USB capture remains raw-first: the exact packet is queued for durable disk logging before
@@ -678,7 +663,7 @@ function App() {
     // never intended to transmit in the first place, not a real loss. Resetting on EITHER
     // direction of the toggle (not just re-enabling) keeps this simple and correct regardless of
     // how long the channel stays disabled.
-    if (channel === 0 || channel === 1) lastEdgeCountRef.current[channel] = -1
+    qualityMonitorRef.current?.resetChannel(channel as ChannelId)
     void sendConfig(channel, enabled, frequencies[channel]).catch(() => setNotice('Could not send channel configuration'))
   }
   function updateFrequency(channel: number, frequency: number) { setFrequencies((previous) => previous.map((value, index) => index === channel ? frequency : value)); void sendConfig(channel, channels[channel], frequency).catch(() => setNotice('Could not send frequency configuration')) }
@@ -728,16 +713,16 @@ function App() {
   async function loadPlaybackFile(file: File) {
     if (connected || logging) {
       const message = connected ? 'Disconnect the dyno connection before loading a saved run.' : 'Stop raw logging before loading a saved run.'
-      setWarningNotice(message)
+      setWarning('replay-file', message)
       setNotice('Saved run not loaded')
       return
     }
 
-    setWarningNotice(null)
+    clearWarnings()
     try {
       const parsed = parseRawLog(await file.text())
       if (!parsed.packets.length) {
-        setWarningNotice('That file is not a valid raw dyno run. Choose the *-raw.csv file with firmware_t_us / seq / raw_value / edge_count columns.')
+        setWarning('replay-file', 'That file is not a valid raw dyno run. Choose the *-raw.csv file with firmware_t_us / seq / raw_value / edge_count columns.')
         setNotice('Saved run not loaded')
         return
       }
@@ -759,7 +744,7 @@ function App() {
       if (parsed.metadata) {
         setNotice(`Applying the recorded setup and analyzing ${parsed.packets.length.toLocaleString()} raw packets from ${file.name}...`)
       } else {
-        setWarningNotice('This older raw run has no embedded setup metadata, so replay is using your current viewer settings.')
+        setWarning('replay-metadata', 'This older raw run has no embedded setup metadata, so replay is using your current viewer settings.')
         setNotice(`Analyzing ${parsed.packets.length.toLocaleString()} raw packets from ${file.name} with current viewer settings...`)
       }
 
@@ -783,7 +768,7 @@ function App() {
       restoreLiveAnalysisConfig()
       setRawPlaybackActive(false)
       setPlaybackFileName('')
-      setWarningNotice(error instanceof Error ? `Could not finish loading that raw run: ${error.message}` : 'Could not finish loading that raw run.')
+      setWarning('replay-file', error instanceof Error ? 'Could not finish loading that raw run: ' + error.message : 'Could not finish loading that raw run.')
       setNotice('Saved run not loaded')
     }
   }
@@ -812,7 +797,7 @@ function App() {
     resetPacketHealth()
     analysisClientRef.current?.reset()
     analysisStore.reset()
-    setWarningNotice(null)
+    clearWarnings()
     setNotice('Saved run cleared; live analysis settings restored')
   }
   const toggleChartPlaying = useCallback(() => {
@@ -821,15 +806,27 @@ function App() {
       return !playing
     })
   }, [analysisStore])
-  const warnings: string[] = []
-  if (warningNotice) warnings.push(warningNotice)
+  const warnings: string[] = Object.values(warningIssues)
+  const droppedPackets = qualitySnapshot.transmissionPacketsLost
   if (droppedPackets > 0) {
-    warnings.push(`${droppedPackets.toLocaleString()} telemetry packet${droppedPackets === 1 ? '' : 's'} did not reach the viewer after transmission. Capture and analysis continue with the data that arrived; review the affected run before treating those intervals as complete.`)
+    warnings.push(droppedPackets.toLocaleString() + ' telemetry packet(s) missing after transmit sequencing. The affected measurements may be incomplete.')
   }
+  const lostEdges = qualitySnapshot.deviceEdgesLost
   const lostEdgeTotal = lostEdges[0] + lostEdges[1]
   if (lostEdgeTotal > 0) {
-    warnings.push(`${lostEdgeTotal.toLocaleString()} RPM edge${lostEdgeTotal === 1 ? '' : 's'} ${lostEdgeTotal === 1 ? 'was' : 'were'} lost on the device before transmission (${lostEdges[0].toLocaleString()} primary, ${lostEdges[1].toLocaleString()} secondary). RPM-derived intervals spanning detected edge gaps are omitted and processing resumes from contiguous data.`)
+    warnings.push(lostEdgeTotal.toLocaleString() + ' RPM edge(s) lost in device buffering (' + lostEdges[0] + ' primary, ' + lostEdges[1] + ' secondary). Affected RPM-derived intervals are excluded by the analysis engine.')
   }
+  const suspectPulses = qualitySnapshot.suspectedSensorPulses
+  const suspectTotal = suspectPulses[0] + suspectPulses[1]
+  if (suspectTotal > 0) {
+    warnings.push(suspectTotal.toLocaleString() + ' suspected missed sensor pulse(s) from isolated ~2× tooth periods (' + suspectPulses[0] + ' primary, ' + suspectPulses[1] + ' secondary). Not confirmed packet/edge loss; derived measurements near these periods should be reviewed.')
+  }
+  const qualitySummary = [
+    droppedPackets > 0 ? droppedPackets.toLocaleString() + ' packets lost' : '',
+    lostEdgeTotal > 0 ? lostEdgeTotal.toLocaleString() + ' device edges lost' : '',
+    suspectTotal > 0 ? suspectTotal.toLocaleString() + ' suspect tooth periods' : '',
+    Object.keys(warningIssues).length > 0 ? Object.keys(warningIssues).length + ' other warning(s)' : '',
+  ].filter(Boolean).join(' · ')
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected && connectionMode !== 'virtual' || rawPlaybackActive ? 'is-live' : 'is-demo'}`} />{connected ? connectionMode === 'virtual' ? 'SIMULATED RP2040 / WebUSB' : firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : connecting ? 'Connecting to dyno...' : rawPlaybackActive ? replayState.analyzing ? 'Analyzing saved run' : replayState.playing ? 'Replaying saved run' : replayState.progress >= 1 ? 'Saved run loaded' : 'Replay paused' : 'Offline'}<span className="status-divider" /><AnalysisPrimaryRpm store={analysisStore} />{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions">{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected
         ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button>
@@ -847,7 +844,12 @@ function App() {
       <strong>Firmware/viewer protocol mismatch.</strong> Connected device reports protocol v{firmwareProtocolVersion}{firmwareGitSha ? ` (build ${firmwareGitSha})` : ''}, this viewer expects v{EXPECTED_PROTOCOL_VERSION}.
       Data may be misinterpreted -- reflash the firmware from the latest build, or use a matching viewer version, before trusting anything shown below.
     </section>}
-    {warnings.length > 0 && <section className="warning-banner" role="alert"><TriangleAlert size={18} /><div>{warnings.map((message, index) => <p key={`${index}-${message}`}>{message}</p>)}</div></section>}
+    {warnings.length > 0 && <section className="warning-banner" role="alert">
+      <details>
+        <summary><TriangleAlert size={18} /><strong>Data quality</strong><span>{qualitySummary}</span></summary>
+        <div className="warning-issues">{warnings.map((message, index) => <p key={index}>{message}</p>)}</div>
+      </details>
+    </section>}
     {consoleOpen && <UsbConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
     <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" disabled={replayState.analyzing} type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" disabled={replayState.analyzing} type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 4)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" disabled={replayState.analyzing} type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
         <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${rawLoggerRef.current?.fileName ?? 'raw'}` : 'Start raw log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" disabled={replayState.analyzing} title={replayState.analyzing ? 'Processed export is available when analysis is complete' : 'Export processed CSV'} onClick={() => void downloadProcessedCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { analysisClientRef.current?.reset(); analysisStore.reset(); setNotice('Analysis view cleared') }}><Trash2 size={17} /></button></div></section>
@@ -873,6 +875,8 @@ function App() {
       onLowRatioChange={setLowRatio}
       onHighRatioChange={setHighRatio}
       sourceLabel={connected ? connectionMode === 'virtual' ? 'SIMULATED' : 'LIVE' : rawPlaybackActive ? 'REPLAY' : 'VIEW'}
+      qualityEvents={qualitySnapshot.events}
+      powerMode={powerMode}
       requestObservations={requestObservations}
       analysisBusy={replayState.analyzing}
       initialFullRange={rawPlaybackActive && !replayState.analyzing && !replayState.playing && replayState.progress >= 1}
