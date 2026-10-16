@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, TriangleAlert, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
+import { Activity, Cable, ChevronDown, CircleHelp, Download, Gauge, Pause, Play, Send, Settings2, SlidersHorizontal, Square, Terminal, Trash2, Upload, Usb, Wifi, X, RotateCcw } from 'lucide-react'
 import { channelNames, encodeCommand, EXPECTED_PROTOCOL_VERSION, periodUsToRpm, type ChannelId } from './protocol'
 import { UsbTransport } from './usbTransport'
 import { DataQualityMonitor, EMPTY_QUALITY_SNAPSHOT, type QualitySnapshot } from './quality/dataQuality'
+import { buildRunWarnings, RunWarnings } from './quality/RunWarnings'
 import type { VirtualUsbScenario } from './testing/virtualUsbDevice'
 import { TorqueCurveEditor } from './TorqueCurveEditor'
 import { AnalysisClient } from './analysis/client'
@@ -806,27 +807,7 @@ function App() {
       return !playing
     })
   }, [analysisStore])
-  const warnings: string[] = Object.values(warningIssues)
-  const droppedPackets = qualitySnapshot.transmissionPacketsLost
-  if (droppedPackets > 0) {
-    warnings.push(droppedPackets.toLocaleString() + ' telemetry packet(s) missing after transmit sequencing. The affected measurements may be incomplete.')
-  }
-  const lostEdges = qualitySnapshot.deviceEdgesLost
-  const lostEdgeTotal = lostEdges[0] + lostEdges[1]
-  if (lostEdgeTotal > 0) {
-    warnings.push(lostEdgeTotal.toLocaleString() + ' RPM edge(s) lost in device buffering (' + lostEdges[0] + ' primary, ' + lostEdges[1] + ' secondary). Affected RPM-derived intervals are excluded by the analysis engine.')
-  }
-  const suspectPulses = qualitySnapshot.suspectedSensorPulses
-  const suspectTotal = suspectPulses[0] + suspectPulses[1]
-  if (suspectTotal > 0) {
-    warnings.push(suspectTotal.toLocaleString() + ' suspected missed sensor pulse(s) from isolated ~2× tooth periods (' + suspectPulses[0] + ' primary, ' + suspectPulses[1] + ' secondary). Not confirmed packet/edge loss; derived measurements near these periods should be reviewed.')
-  }
-  const qualitySummary = [
-    droppedPackets > 0 ? droppedPackets.toLocaleString() + ' packets lost' : '',
-    lostEdgeTotal > 0 ? lostEdgeTotal.toLocaleString() + ' device edges lost' : '',
-    suspectTotal > 0 ? suspectTotal.toLocaleString() + ' suspect tooth periods' : '',
-    Object.keys(warningIssues).length > 0 ? Object.keys(warningIssues).length + ' other warning(s)' : '',
-  ].filter(Boolean).join(' · ')
+  const warnings = buildRunWarnings(warningIssues, qualitySnapshot)
   return <main className="app-shell">
     <header className="topbar"><div className="brand"><div className="brand-mark"><Activity size={20} /></div><div><span className="eyebrow">CVT DYNAMOMETER</span><h1>Live instrument</h1></div></div><div className="topbar-status"><span className={`status-dot ${connected && connectionMode !== 'virtual' || rawPlaybackActive ? 'is-live' : 'is-demo'}`} />{connected ? connectionMode === 'virtual' ? 'SIMULATED RP2040 / WebUSB' : firmwareDemoMode ? 'Firmware bench mode' : 'USB link active' : connecting ? 'Connecting to dyno...' : rawPlaybackActive ? replayState.analyzing ? 'Analyzing saved run' : replayState.playing ? 'Replaying saved run' : replayState.progress >= 1 ? 'Saved run loaded' : 'Replay paused' : 'Offline'}<span className="status-divider" /><AnalysisPrimaryRpm store={analysisStore} />{connected && firmwareGitSha && <><span className="status-divider" /><span className="mono" title="Firmware build identifier (git commit), reported on connect">fw {firmwareGitSha}</span></>}</div><div className="top-actions">{connected && <button className={`button ${firmwareDemoMode ? 'button-accent' : 'button-quiet'}`} onClick={() => void toggleFirmwareDemo()} title="Toggle synthetic data on the connected firmware"><Gauge size={16} />{firmwareDemoMode ? 'Bench on' : 'Bench mode'}</button>}<button className={`button ${consoleOpen ? 'button-dark' : 'button-quiet'}`} onClick={() => setConsoleOpen((value) => !value)}><Terminal size={16} />Console<ChevronDown size={14} className={consoleOpen ? 'icon-rotate' : ''} /></button>{connected
         ? <button className="button button-dark" onClick={() => void disconnect()}><Usb size={16} />Disconnect</button>
@@ -844,12 +825,7 @@ function App() {
       <strong>Firmware/viewer protocol mismatch.</strong> Connected device reports protocol v{firmwareProtocolVersion}{firmwareGitSha ? ` (build ${firmwareGitSha})` : ''}, this viewer expects v{EXPECTED_PROTOCOL_VERSION}.
       Data may be misinterpreted -- reflash the firmware from the latest build, or use a matching viewer version, before trusting anything shown below.
     </section>}
-    {warnings.length > 0 && <section className="warning-banner" role="alert">
-      <details>
-        <summary><TriangleAlert size={18} /><strong>Data quality</strong><span>{qualitySummary}</span></summary>
-        <div className="warning-issues">{warnings.map((message, index) => <p key={index}>{message}</p>)}</div>
-      </details>
-    </section>}
+    <RunWarnings warnings={warnings} />
     {consoleOpen && <UsbConsolePanel messages={consoleMessages} showSensorData={showSensorConsole} autoScroll={autoScrollConsole} customCommand={customCommand} setCustomCommand={setCustomCommand} onToggleSensorData={() => setShowSensorConsole((value) => !value)} onToggleAutoScroll={() => setAutoScrollConsole((value) => !value)} onClear={() => { setConsoleLines([]); setConsoleMessages([]) }} onSendCommand={sendRawCommand} onSendCustom={sendCustomCommand} rpmPinTest={rpmPinTest} rpmInterruptTest={rpmInterruptTest} rpmCountTest={rpmCountTest} rpmPinStates={rpmPinStates} rpmCountStates={rpmCountStates} onToggleRpmPinTest={toggleRpmPinTest} onToggleRpmInterruptTest={toggleRpmInterruptTest} onToggleRpmCountTest={toggleRpmCountTest} />}
     <section className="command-deck"><div className="deck-heading"><span className="section-kicker">01 / CONTROL ROOM</span><h2>Run configuration</h2><p>{notice}</p></div><div className="control-group"><label htmlFor="session">Session name</label><input id="session" value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></div>{powerMode === 'torque' && <><div className="control-group compact"><label htmlFor="scale">Torque scale</label><div className="input-with-unit"><input id="scale" disabled={replayState.analyzing} type="number" step="0.001" value={torqueScale} onChange={(event) => setTorqueScale(Number(event.target.value))} /><span>N m/count</span></div></div><div className="control-group compact"><label htmlFor="offset">Torque zero</label><div className="input-with-unit"><input id="offset" disabled={replayState.analyzing} type="number" value={torqueOffset} onChange={(event) => setTorqueOffset(Number(event.target.value))} /><span>count</span></div></div></>}{powerMode === 'inertia' && <div className="control-group compact"><label htmlFor="inertia-settings">Inertia settings</label><button id="inertia-settings" className={`button ${inertiaSettingsOpen ? 'button-dark' : 'button-quiet'}`} type="button" onClick={() => setInertiaSettingsOpen((value) => !value)}><Settings2 size={14} />{formatNumber(inertiaKgM2, 4)} kg·m²<ChevronDown size={14} className={inertiaSettingsOpen ? 'icon-rotate' : ''} /></button></div>}<div className="control-group compact"><label htmlFor="power-mode">Power mode</label><button id="power-mode" className="button button-quiet" disabled={replayState.analyzing} type="button" onClick={() => setPowerMode((mode) => mode === 'torque' ? 'inertia' : 'torque')}>{powerMode === 'torque' ? 'Torque conversion' : 'Inertia mode'}</button></div>
         <div className="deck-actions"><button className={`button button-log ${logging ? 'is-recording' : ''}`} onClick={() => void (logging ? stopLogging() : startLogging())}>{logging ? <Square size={14} fill="currentColor" /> : <CircleHelp size={14} />}{logging ? `Logging ${rawLoggerRef.current?.fileName ?? 'raw'}` : 'Start raw log'}</button><button className="button button-quiet" onClick={() => void chooseDirectory()} title="Grant Chrome permission to write logs directly">{directoryName === 'Browser download' ? 'Grant folder access' : directoryName}</button><button className="icon-button" disabled={replayState.analyzing} title={replayState.analyzing ? 'Processed export is available when analysis is complete' : 'Export processed CSV'} onClick={() => void downloadProcessedCsv()}><Download size={17} /></button><button className="icon-button" title="Clear session" onClick={() => { analysisClientRef.current?.reset(); analysisStore.reset(); setNotice('Analysis view cleared') }}><Trash2 size={17} /></button></div></section>
