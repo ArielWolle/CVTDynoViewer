@@ -1,4 +1,6 @@
 import { test, expect } from '@playwright/test'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import {
   canvasHasInk, chartCard, connectVirtual, expectRpmAbove, installInMemoryDirectory,
   makeFaultyRawCsv,
@@ -177,4 +179,54 @@ test('raw replay exposes missing sensor pulses and both loss counters on rendere
   await expect(page.locator('.chart-range-bar')).toBeVisible()
   await page.locator('.analysis-select').filter({ hasText: 'Analysis interval' }).locator('select').selectOption('20')
   await expect(page.locator('.analysis-select').filter({ hasText: 'Analysis interval' }).locator('select')).toHaveValue('20')
+})
+
+
+test('real 23CVT recording restores declared defaults and reproduces observed sensor anomalies in the plots', async ({ page }) => {
+  // The real source file had no embedded setup; the promoted excerpt explicitly
+  // carries contemporary viewer defaults, documented as assumptions in its manifest.
+  const fixture = fileURLToPath(new URL('../fixtures/real/reference-run-raw.csv', import.meta.url))
+  const manifestPath = fileURLToPath(new URL('../fixtures/real/reference-run.manifest.json', import.meta.url))
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+  await page.addInitScript(() => {
+    localStorage.setItem('cvt-dyno-primary-teeth', '23')
+    localStorage.setItem('cvt-dyno-secondary-teeth', '19')
+    localStorage.setItem('cvt-dyno-analysis-window-ms', '20')
+  })
+  await page.goto('/')
+  const wheelSection = page.locator('.channel-strip').filter({ hasText: 'RPM wheel teeth / spokes' })
+  await expect(wheelSection.locator('input').nth(0)).toHaveValue('23')
+  await expect(wheelSection.locator('input').nth(1)).toHaveValue('19')
+
+  // Load the actual committed hardware-derived CSV, not a generated test packet sequence.
+  await page.locator('input[type=file]').setInputFiles(fixture)
+  await expect(page.locator('.deck-heading')).toContainText('Loaded and analyzed', { timeout: 25_000 })
+  await expect(page.locator('.playback-filename')).toContainText(manifest.fixture.file)
+  await expect(wheelSection.locator('input').nth(0)).toHaveValue('16')
+  await expect(wheelSection.locator('input').nth(1)).toHaveValue('12')
+  await expect(page.locator('.analysis-select').filter({ hasText: 'Analysis interval' }).locator('select')).toHaveValue('100')
+
+  const warnings = page.getByRole('region', { name: 'Run warnings' })
+  await expect(warnings).toContainText('Suspected sensor misses')
+  await expect(warnings).toContainText(manifest.expectedObservedDataQuality.suspectedSensorPulses[0] + ' primary')
+  await expect(warnings).not.toContainText('Telemetry loss')
+  await expect(warnings).not.toContainText('RPM edge loss')
+  await expect(warnings).not.toContainText('Replay setup')
+
+  await expect(page.locator('.quality-timeline-count')).toContainText('35 events')
+  await expect(page.locator('.quality-timeline-marker.suspected').first()).toBeVisible()
+  await expect(page.locator('.quality-timeline-marker.confirmed')).toHaveCount(0)
+  await expect(page.locator('.chart-card .quality-chart-marker.suspected').first()).toBeVisible()
+
+  await expectRpmAbove(page, 'Primary RPM')
+  await expectRpmAbove(page, 'Secondary RPM')
+  await expect.poll(() => canvasHasInk(chartCard(page, 'Primary RPM'))).toBe(true)
+  await expect.poll(() => canvasHasInk(chartCard(page, 'Secondary RPM'))).toBe(true)
+  await expect.poll(() => canvasHasInk(chartCard(page, 'Primary vs secondary RPM'))).toBe(true)
+
+  // Confirm detailed warnings remain accessible after minimization on this real run.
+  await warnings.getByRole('button', { name: 'Minimize run warnings' }).click()
+  await expect(warnings.getByRole('button', { name: 'Show all run warnings' })).toBeVisible()
+  await warnings.getByRole('button', { name: 'Show all run warnings' }).click()
+  await expect(warnings).toContainText('Suspected sensor misses')
 })
