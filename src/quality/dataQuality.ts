@@ -79,7 +79,7 @@ export class DataQualityMonitor {
   resetChannel(channel: AnalysisChannelId): void {
     this.lastSeq[channel] = null
     this.lastTimeMs[channel] = null
-    if (channel < 2) this.clearRpmBaseline(channel)
+    if (channel === 0 || channel === 1) this.clearRpmBaseline(channel)
   }
 
   ingest(packet: AnalysisPacket): void {
