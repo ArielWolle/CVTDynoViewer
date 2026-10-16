@@ -1,4 +1,5 @@
-import { TriangleAlert } from 'lucide-react'
+import { useEffect, useId, useRef, useState } from 'react'
+import { ChevronDown, ChevronUp, TriangleAlert } from 'lucide-react'
 import type { QualitySnapshot } from './dataQuality'
 
 export type RunWarning = {
@@ -62,18 +63,74 @@ export function buildRunWarnings(
 }
 
 /**
- * Important faults are shown immediately and stay visible during scrolling. No closed
- * disclosure that only says "1 other warning". The page-scoped sticky region caps its
- * height only when there are many issues, keeping the charts usable.
+ * A minimized warning must say something useful, not merely "1 other warning".
+ * The first single issue is shown verbatim; multiple issues expose their actual categories.
+ */
+export function compactWarningSummary(warnings: readonly RunWarning[]): string {
+  if (warnings.length === 0) return ''
+  if (warnings.length === 1) return warnings[0].label + ': ' + warnings[0].message
+  const visible = warnings.slice(0, 3).map((warning) => warning.label).join(' · ')
+  return warnings.length > 3 ? visible + ' · +' + (warnings.length - 3) + ' more' : visible
+}
+
+/** A new category or a changed count/message should be noticeable even while minimized. */
+export function hasNewWarningInformation(
+  previous: readonly RunWarning[],
+  current: readonly RunWarning[],
+): boolean {
+  const previousById = new Map(previous.map((warning) => [warning.id, warning.message]))
+  return current.some((warning) => previousById.get(warning.id) !== warning.message)
+}
+
+/**
+ * Expanded by default, then user-controlled. Minimize never removes the warning indicator.
+ * New issues update its count and "Updated" hint but do not forcibly reopen a panel
+ * that the operator has deliberately minimized while watching live dyno measurements.
  */
 export function RunWarnings({ warnings }: { warnings: readonly RunWarning[] }) {
+  const [expanded, setExpanded] = useState(true)
+  const [hasUpdates, setHasUpdates] = useState(false)
+  const previousWarningsRef = useRef<readonly RunWarning[]>([])
+  const detailsId = useId()
+
+  useEffect(() => {
+    const previous = previousWarningsRef.current
+    if (warnings.length === 0) {
+      // A cleared session starts with the next warning fully visible again.
+      previousWarningsRef.current = []
+      setExpanded(true)
+      setHasUpdates(false)
+      return
+    }
+    if (!expanded && hasNewWarningInformation(previous, warnings)) setHasUpdates(true)
+    previousWarningsRef.current = warnings
+  }, [warnings, expanded])
+
   if (warnings.length === 0) return null
-  return <section className="warning-banner" role="region" aria-label="Run warnings">
-    <div className="warning-heading">
+
+  const toggle = () => {
+    setExpanded((currentlyExpanded) => !currentlyExpanded)
+    setHasUpdates(false)
+  }
+
+  return <section className={'warning-banner ' + (expanded ? 'is-expanded' : 'is-collapsed')}
+    role="region" aria-label="Run warnings">
+    <button type="button" className="warning-toggle" onClick={toggle}
+      aria-expanded={expanded} aria-controls={detailsId}
+      aria-label={expanded ? 'Minimize run warnings' : 'Show all run warnings'}>
       <TriangleAlert size={17} aria-hidden="true" />
       <strong>Run warnings</strong>
-    </div>
-    <ul className="warning-issues">
+      <span className="warning-count">
+        {warnings.length} {warnings.length === 1 ? 'issue' : 'issues'}
+      </span>
+      {!expanded && <span className="warning-compact-summary">{compactWarningSummary(warnings)}</span>}
+      {!expanded && hasUpdates && <span className="warning-updated">Updated</span>}
+      <span className="warning-toggle-label">{expanded ? 'Minimize' : 'Show details'}</span>
+      {expanded
+        ? <ChevronUp size={16} aria-hidden="true" />
+        : <ChevronDown size={16} aria-hidden="true" />}
+    </button>
+    <ul id={detailsId} className="warning-issues" hidden={!expanded}>
       {warnings.map((warning) => (
         <li key={warning.id}>
           <span className="warning-issue-label">{warning.label}</span>
