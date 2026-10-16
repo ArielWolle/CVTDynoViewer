@@ -1,33 +1,32 @@
 # CVT Dyno Viewer
 
-Browser-based live viewer for the CVT dyno firmware. The app uses React, TypeScript, Vite, and Recharts, and deploys to GitHub Pages.
+Browser-based React / TypeScript / Vite viewer for the CVT dynamometer, deployed to GitHub Pages.
 
 ## Run locally
 
-Requires Node.js 22 or newer and a Chromium-based browser for Web Serial.
+Requires Node.js 22+ and a Chromium browser for real hardware WebUSB (HTTPS or localhost). The RP2040 exposes a vendor-class USB interface, **not a virtual COM port**.
 
 ```bash
-npm install
+npm ci
 npm run dev
-```
-
-The app starts with synthetic telemetry so the workspace can be inspected without hardware. Use **Connect device** to request the firmware's USB serial port.
-
-## Build and test
-
-```bash
 npm run typecheck
 npm run test
 npm run build
 ```
 
-## Firmware protocol
+## Hardware-free WebUSB integration tests
 
-Telemetry packets are 8 bytes: little-endian header `0xAABB`, channel id, padding, and a little-endian signed 32-bit value. Channels `0..4` are primary RPM, secondary RPM, shift position, primary torque, and secondary torque.
+Click **Simulate RP2040** instead of Connect device. No board, driver, USB permission, or cable is required. The virtual USBDevice goes through the **same** worker code: open, selectConfiguration, find and claim vendor interface, controlTransferOut, transferIn, transferOut, byte framing/CRC decoding, packet delivery/credits, live analysis, graphs and raw logging.
 
-Commands are 4 bytes: command id, channel id, and a big-endian 16-bit value. Command `0x01` toggles a channel, `0x02` sets its frequency, and `0x03` requests the text configuration report.
+The simulated protocol matches protocol v2 from ArielWolle/CVTDynoFirmware/src/main.cpp: 21-byte AA 55 telemetry packets, per-channel sequence, uint64 timestamp, uint32 RPM physical-edge count, CRC-8; C0-prefixed five-byte commands; per-tooth RPM periods on channels 0 and 1; independent polled shift/torque channels 2-4; change-driven throttle channel 5; configuration and diagnostics replies.
 
-Command `0x04` controls firmware bench mode. Send `[0x04, 0x00, 0x00, 0x01]` to generate synthetic RPM, shift, and torque values on the firmware without reading attached sensors. Send `[0x04, 0x00, 0x00, 0x00]` to restore the real sensor path. The website's **Bench mode** button sends these packets after a serial connection is established.
+The scenario selector offers normal operation, **loss / fragmentation** (deterministic damaged CRC and pre-transmit missed RPM edges), **unplug after 5s** (read error and UI recovery), and **claim failure** (startup cleanup). Real and virtual connections remain visibly distinct; synthetic CSV files start with SIMULATED- and contain captureSource=virtual metadata. Press Read configuration, toggle channels/bench mode, record a raw log and try reconnecting repeatedly.
+
+**Limitations:** The virtual USBDevice does not reproduce physical USB enumeration, browser hardware permissions, WinUSB driver binding, actual bus latency/power, cable faults or RP2040 electrical/hardware behaviour. Physical reconnection must still be validated with the board. It is significantly more faithful than feeding fake values straight into the plots.
+
+## Physical WebUSB connection
+
+The browser filters VID 0x1209 / PID 0xCD10. A dedicated worker opens/claims the vendor interface (class FF, subclass 00, protocol 00), enables the line state, and runs the bulk IN/OUT loops. Command writes now await transferOut completion/error rather than acknowledging mere postMessage delivery. Disconnect waits for interface release and device close before worker termination (bounded fallback). Unexpected disconnection closes open raw logs without a false clean-stop footer.
 
 ## Logging
 
