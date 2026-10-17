@@ -91,6 +91,16 @@ describe('real recorded RPM anomaly regression', () => {
     expect(snapshot.secondaryRpm.every((p) => Number.isFinite(p.rpm) && p.rpm > 0)).toBe(true)
     expect(snapshot.shift).toHaveLength(0)
 
+    // Per-tooth observations used for analysis must not retain the suspect
+    // period itself: its reciprocal RPM is not a defensible shaft-speed estimate.
+    const monitor = new DataQualityMonitor()
+    for (const packet of parsed.packets) monitor.ingest(packet)
+    const suspectEvents = monitor.snapshot().events
+    const allToothTimes = new Set(engine.observationView('tooth', 0, 1_000_000, 10_000).primary.map((p) => p.time))
+    for (const event of suspectEvents) {
+      expect(allToothTimes.has(event.endMs)).toBe(false)
+    }
+
     const firstPrimary = parsed.packets.find((packet) => packet.channel === 0)!
     const firstMs = firstPrimary.tUs / 1000
     const tooth = engine.observationView('tooth', firstMs, firstMs + 20, 100).primary[0]
@@ -103,4 +113,31 @@ describe('real recorded RPM anomaly regression', () => {
     engine.setConfig(config)
     expect(engine.snapshot()).toEqual(before)
   })
+  it('does not compute 250 ms power across a detected bad-sensor interval', () => {
+    const m = parsed.metadata!
+    const engine = new AnalysisEngine({
+      windowMs: 250,
+      primaryTeeth: m.primaryTeeth!, secondaryTeeth: m.secondaryTeeth!,
+      secondaryInertiaKgM2: m.secondaryInertiaKgM2!,
+      powerMode: m.powerMode!, torqueCurve: m.torqueCurve!,
+      torqueScale: m.torqueScale!, torqueOffset: m.torqueOffset!,
+    })
+    const quality = new DataQualityMonitor()
+    for (const packet of parsed.packets) {
+      quality.ingest(packet)
+      engine.ingest(packet)
+    }
+    const suspectIntervals = quality.snapshot().events
+    const computed = engine.snapshot().primaryPower
+    expect(suspectIntervals).toHaveLength(89)
+    expect(computed.length).toBeGreaterThan(0)
+    for (const point of computed) {
+      // Every genuine numerical power window must have valid RPM information
+      // for its FULL 250 ms support, not just plausible-looking endpoints.
+      const crossesSuspect = suspectIntervals.some((event) =>
+        event.endMs >= point.time - 250 && event.startMs <= point.time)
+      expect(crossesSuspect).toBe(false)
+    }
+  })
+
 })
