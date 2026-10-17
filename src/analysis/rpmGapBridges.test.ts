@@ -36,6 +36,16 @@ describe('display-only RPM gap bridging', () => {
     ]
     expect(selectShortRpmQualityBridges(points, [edgeEvent], 250)).toHaveLength(1)
     expect(selectShortRpmQualityBridges(points, [edgeEvent], 5)).toHaveLength(0)
+    expect(selectShortRpmQualityBridges(
+      points,
+      [edgeEvent, { ...edgeEvent, id: 3, startMs: 2200, endMs: 2204 }],
+      250,
+    )).toHaveLength(0)
+    expect(selectShortRpmQualityBridges(
+      [points[0], { ...points[1], rpm: 0 }],
+      [edgeEvent],
+      250,
+    )).toHaveLength(0)
     expect(points[0].rpm).toBe(3500)
     expect(points[1].rpm).toBe(3450)
   })
