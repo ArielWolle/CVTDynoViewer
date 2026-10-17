@@ -4,6 +4,7 @@ import type { PowerRow, WithSeconds } from './store'
 import { projectX, projectY, type NumericDomain, type PlotGeometry } from './plotGeometry'
 import type { ChartId } from './chartTypes'
 import type { QualityEvent } from '../quality/dataQuality'
+import { selectShortRpmQualityBridges } from './rpmGapBridges'
 
 type TimeDatum = WithSeconds<RpmPoint> | WithSeconds<ShiftPoint> | WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint> | PowerRow
 type RelationshipDatum = WithSeconds<RatioPoint> | WithSeconds<EfficiencyPoint>
@@ -21,6 +22,8 @@ type Props = {
   lowRatio: number
   highRatio: number
   qualityEvents: readonly QualityEvent[]
+  bridgeRpmGaps: boolean
+  analysisWindowMs: number
 }
 
 function drawLine<T>(
@@ -131,8 +134,40 @@ export function canConnectAcrossQuality(firstMs: number, secondMs: number, event
   return true
 }
 
+function drawDashedRpmBridges(
+  ctx: CanvasRenderingContext2D,
+  rpm: readonly WithSeconds<RpmPoint>[],
+  events: readonly QualityEvent[],
+  windowMs: number,
+  xDomain: NumericDomain,
+  yDomain: NumericDomain,
+  plot: PlotGeometry,
+  color: string,
+) {
+  const bridges = selectShortRpmQualityBridges(rpm, events, windowMs)
+  if (!bridges.length) return
+  ctx.save()
+  ctx.strokeStyle = color
+  ctx.globalAlpha = 0.65
+  ctx.lineWidth = 1.5
+  ctx.setLineDash([5, 5])
+  ctx.beginPath()
+  for (const { before, after } of bridges) {
+    const ax = projectX(before.seconds, xDomain, plot)
+    const ay = projectY(before.rpm, yDomain, plot)
+    const bx = projectX(after.seconds, xDomain, plot)
+    const by = projectY(after.rpm, yDomain, plot)
+    if (ax === null || ay === null || bx === null || by === null) continue
+    // A dashed straight line is interpolation of DISPLAY coordinates only.
+    ctx.moveTo(ax, ay)
+    ctx.lineTo(bx, by)
+  }
+  ctx.stroke()
+  ctx.restore()
+}
+
 function drawTelemetry(ctx: CanvasRenderingContext2D, props: Props) {
-  const { chartId, color, plot, xDomain, yDomain, timeData, relationshipData, primaryObs, secondaryObs, lowRatio, highRatio, qualityEvents } = props
+  const { chartId, color, plot, xDomain, yDomain, timeData, relationshipData, primaryObs, secondaryObs, lowRatio, highRatio, qualityEvents, bridgeRpmGaps, analysisWindowMs } = props
   const connected = (a: { time: number }, b: { time: number }) => canConnectAcrossQuality(a.time, b.time, qualityEvents)
   if (!plot) return
 
@@ -152,6 +187,7 @@ function drawTelemetry(ctx: CanvasRenderingContext2D, props: Props) {
     drawDots(ctx, observations, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 1.5, 0.24)
     const rpm = timeData as readonly WithSeconds<RpmPoint>[]
     drawLine(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 2, (a, b) => (a.epoch === undefined || b.epoch === undefined || a.epoch === b.epoch) && connected(a, b))
+    if (bridgeRpmGaps) drawDashedRpmBridges(ctx, rpm, qualityEvents, analysisWindowMs, xDomain, yDomain, plot, color)
     drawDots(ctx, rpm, (p) => p.seconds, (p) => p.rpm, xDomain, yDomain, plot, color, 1.8)
   } else if (chartId === 'shift') {
     const shift = timeData as readonly WithSeconds<ShiftPoint>[]
