@@ -35,6 +35,23 @@ describe('data quality event detection', () => {
     expect(qualityEventLabel(snapshot.events[0])).toContain('suspected missed sensor pulse')
   })
 
+  it('recognizes recovered 3x, 4x and 5x periods without inventing a confirmed tooth count', () => {
+    for (const multiple of [3, 4, 5]) {
+      const monitor = new DataQualityMonitor()
+      regular(monitor)
+      const suspect = edge(0, 9, 9, 1_008_000 + multiple * 1_000, multiple * 1_000)
+      const next = edge(0, 10, 10, suspect.tUs + 1_000, 1_000)
+      expect(monitor.ingest(suspect)).toBe(false)
+      expect(monitor.snapshot().events).toHaveLength(0)
+      expect(monitor.ingest(next)).toBe(true)
+      expect(monitor.snapshot().suspectedSensorPulses).toEqual([1, 0])
+      expect(monitor.snapshot().events[0]).toMatchObject({
+        kind: 'suspected-missed-pulse', count: 1,
+        startMs: 1008, endMs: 1008 + multiple,
+      })
+    }
+  })
+
   it('does not mistake a sustained halving of RPM for a missing tooth', () => {
     const monitor = new DataQualityMonitor()
     regular(monitor)
