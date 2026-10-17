@@ -101,10 +101,10 @@
       0
     ],
     "suspectedSensorPulses": [
-      35,
+      89,
       0
     ],
-    "eventCount": 35,
+    "eventCount": 89,
     "firstEvent": {
       "kind": "suspected-missed-pulse",
       "channel": 0,
@@ -162,11 +162,17 @@
         "endMs": 166451.684,
         "count": 1
       }
-    ]
+    ],
+    "eventMultiplesApprox": {
+      "2": 35,
+      "3": 31,
+      "4": 20,
+      "5": 3
+    }
   },
   "referenceInterpretation": {
     "rawPacketProvenance": "Real supplied recording",
-    "timingAnomalyClassification": "Regression reference for current detector, not independent confirmation of missing wheel teeth",
+    "timingAnomalyClassification": "Regression reference for the current near-integer 2–5× sensor-period detector with a recovery check; 89 anomalous intervals (35 near2×, 31 near3×, 20 near4×, 3 near5×), not proof of any exact number of missing physical teeth.",
     "primaryTeethSecondaryTeeth": "Assumed viewer defaults 16/12; original setup not recorded",
     "inertiaTorqueCurve": "Assumed viewer defaults; not independent physical calibration",
     "shiftAndTorqueChannels": "Absent in original source",
