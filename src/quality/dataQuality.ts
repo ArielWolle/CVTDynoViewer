@@ -20,8 +20,22 @@ export type QualitySnapshot = {
 
 const BASELINE_SIZE = 7
 const MIN_BASELINE_SAMPLES = 5
-const NEAR_DOUBLE_MIN = 1.7
-const NEAR_DOUBLE_MAX = 2.3
+// Isolated periods near an integer multiple of normal tooth spacing are
+// consistent with one or more undetected pulses. The integer match avoids
+// treating arbitrary RPM changes as missing teeth; next-period recovery is
+// still required before confirmation.
+const MIN_MISSED_PERIOD_MULTIPLE = 2
+const MAX_MISSED_PERIOD_MULTIPLE = 5
+const MULTIPLE_ABS_TOLERANCE = 0.35
+const MULTIPLE_REL_TOLERANCE = 0.10
+
+function plausibleMissingToothMultiple(ratio: number): boolean {
+  if (!Number.isFinite(ratio)) return false
+  const multiple = Math.round(ratio)
+  return multiple >= MIN_MISSED_PERIOD_MULTIPLE &&
+    multiple <= MAX_MISSED_PERIOD_MULTIPLE &&
+    Math.abs(ratio - multiple) <= Math.max(MULTIPLE_ABS_TOLERANCE, multiple * MULTIPLE_REL_TOLERANCE)
+}
 const RETURN_TO_BASELINE_MIN = 0.75
 const RETURN_TO_BASELINE_MAX = 1.25
 
@@ -41,7 +55,7 @@ function median(samples: readonly number[]): number {
 // Tracks what is OBSERVABLE at the receiver, preserving distinctions between:
 // - missing transmitted packets (per-channel sequence jump)
 // - accepted RP2040 edges lost before USB (physical edge-count jump beyond sequence loss)
-// - a plausible *unobserved* sensor pulse (isolated ~2x inter-edge period and recovery)
+// - plausible *unobserved* sensor pulses (isolated ~2–5x periods and recovery)
 //
 // The final category is deliberately 'suspected'. It is NOT proof that a physical tooth is
 // missing, and neither firmware nor viewer silently inserts synthetic pulses or changes RPM.
@@ -83,7 +97,7 @@ export class DataQualityMonitor {
   }
 
   // True only when this packet confirms that the preceding RPM packet was
-  // an isolated near-double tooth period (one-edge lookahead for safe analysis).
+  // an isolated near-multiple tooth period (one-edge lookahead for safe analysis).
   ingest(packet: AnalysisPacket): boolean {
     if (!(packet.tUs > 0) || !Number.isFinite(packet.tUs)) return false
     const ch = packet.channel
@@ -153,9 +167,10 @@ export class DataQualityMonitor {
     if (history.length >= MIN_BASELINE_SAMPLES && previousTime !== null) {
       const typicalUs = median(history)
       const ratio = packet.value / typicalUs
-      if (ratio >= NEAR_DOUBLE_MIN && ratio <= NEAR_DOUBLE_MAX) {
-        // One further pulse must recover toward the preceding local cadence. This
-        // avoids falsely identifying ordinary step-like deceleration as a missing tooth.
+      if (plausibleMissingToothMultiple(ratio)) {
+        // One further pulse must recover toward the preceding local cadence.
+        // Near-multiples from ~2x to ~5x can indicate several unobserved pulses,
+        // but we count ONE suspect interval, not an invented exact tooth count.
         this.pendingLongPeriod[ch] = {
           startMs: previousTime,
           endMs: nowMs,
@@ -218,7 +233,7 @@ export function qualityEventLabel(event: QualityEvent): string {
   const name = ['Primary RPM', 'Secondary RPM', 'Shift position', 'Primary torque', 'Secondary torque', 'Full throttle'][event.channel]
   if (event.kind === 'transmission-loss') return name + ': ' + event.count + ' missing transmitted packet(s)'
   if (event.kind === 'device-edge-loss') return name + ': ' + event.count + ' edge(s) lost in device buffering'
-  return name + ': suspected missed sensor pulse (isolated ~2× tooth period)'
+  return name + ': suspected missed sensor pulses (isolated ~2–5× tooth period)'
 }
 
 // Only annotate charts that actually depend on the affected channel. No x-axis on the
