@@ -154,4 +154,73 @@ describe('AnalysisEngine independent streaming series', () => {
     expect(shift[0].epoch).not.toBe(shift[1].epoch)
   })
 
+  it('rejects an isolated undetected tooth BEFORE it poisons sliding revolutions', () => {
+    const periodUs = 1_250
+    const all = Array.from({ length: 1_800 }, (_, index) => ({
+      channel: 0 as const,
+      tUs: 1_000_000 + (index + 1) * periodUs,
+      value: periodUs,
+      seq: (index + 1) & 0xff,
+      edgeCount: index + 1,
+    }))
+    // A sensor missed tooth 201: timestamp of tooth 202 shows the 2x period,
+    // but neither physical accepted-edge nor USB seq counters have a gap.
+    const lostIndex = 200
+    const gapPacketTime = all[lostIndex + 1].tUs
+    const packets = all.filter((_, index) => index !== lostIndex).map((packet, index) => ({
+      ...packet, seq: (index + 1) & 0xff, edgeCount: index + 1,
+      value: packet.tUs === gapPacketTime ? 2 * periodUs : packet.value,
+    }))
+
+    const engine = new AnalysisEngine(config({ windowMs: 250 }))
+    engine.ingestMany(packets)
+    const snapshot = engine.snapshot()
+    const tooth = engine.observationView('tooth', 0, 4_000, 5_000).primary
+    const revolution = engine.observationView('revolution', 0, 4_000, 5_000).primary
+    expect(tooth.some((item) => Math.abs(item.rpm - 1_500) < 0.01)).toBe(false)
+    expect(revolution.length).toBeGreaterThan(500)
+    expect(revolution.every((item) => Math.abs(item.rpm - 3_000) < 0.001)).toBe(true)
+    expect(snapshot.primaryRpm.length).toBeGreaterThan(5)
+    expect(snapshot.primaryRpm.every((item) => Math.abs(item.rpm - 3_000) < 0.001)).toBe(true)
+
+    // The 250 ms window spanning the invalid epoch is OMITTED, not filled with
+    // an artificial numerical value. Later valid windows resume.
+    const invalidWindowEndMs = Math.ceil(gapPacketTime / 250_000) * 250
+    expect(snapshot.primaryPower.some((point) => point.time === invalidWindowEndMs)).toBe(false)
+    expect(snapshot.primaryPower.some((point) => point.time === invalidWindowEndMs + 250)).toBe(true)
+    expect(snapshot.primaryPower.some((point) => point.time === invalidWindowEndMs - 250)).toBe(true)
+
+    // Recomputing from source packets must preserve the same exclusions.
+    const frozen = engine.snapshot()
+    engine.setConfig(config({ windowMs: 250 }))
+    expect(engine.snapshot()).toEqual(frozen)
+  })
+
+  it('keeps a genuine sustained 2x tooth period transition, rather than hiding valid deceleration', () => {
+    const packets: AnalysisPacket[] = []
+    let tUs = 1_000_000
+    for (let index = 1; index <= 240; index += 1) {
+      const periodUs = index <= 80 ? 1_250 : 2_500
+      tUs += periodUs
+      packets.push({ channel: 0, tUs, value: periodUs, seq: index & 0xff, edgeCount: index })
+    }
+    const engine = new AnalysisEngine(config({ windowMs: 20 }))
+    engine.ingestMany(packets)
+    const observations = engine.observationView('revolution', 0, 2_000, 1_000).primary
+    expect(observations.some((point) => point.rpm > 2_900)).toBe(true)
+    expect(observations.some((point) => point.rpm < 1_600 && point.rpm > 1_400)).toBe(true)
+    expect(observations.some((point) => point.rpm > 1_600 && point.rpm < 2_900)).toBe(true)
+  })
+
+  it('still publishes a true terminal stop event without waiting for another tooth', () => {
+    const packets = constantRpmPackets(0, 16, 3_000, 0.5, 1_000_000)
+    const engine = new AnalysisEngine(config())
+    engine.ingestMany(packets)
+    const last = packets.at(-1)!
+    const stopUs = last.tUs + 500_001
+    engine.ingest({ channel: 0, tUs: stopUs, value: 0, seq: (last.seq + 1) & 0xff, edgeCount: last.edgeCount })
+    expect(engine.snapshot().primaryRpm.at(-1)?.time).toBe(stopUs / 1_000)
+    expect(engine.snapshot().primaryRpm.at(-1)?.rpm).toBe(0)
+  })
+
 })
