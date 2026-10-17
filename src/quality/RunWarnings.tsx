@@ -53,7 +53,7 @@ export function buildRunWarnings(
     warnings.push({
       id: 'sensor',
       label: 'Suspected sensor misses',
-      message: totalSuspected.toLocaleString() + ' isolated near-double tooth interval' +
+      message: totalSuspected.toLocaleString() + ' isolated recovered ~2–5× tooth interval' +
         (totalSuspected === 1 ? '' : 's') + ' (' + primarySuspected.toLocaleString() +
         ' primary, ' + secondarySuspected.toLocaleString() +
         ' secondary). These indicate possible missed sensor pulses or missing teeth, not confirmed packet loss.',
