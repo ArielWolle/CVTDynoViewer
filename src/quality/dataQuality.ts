@@ -82,8 +82,10 @@ export class DataQualityMonitor {
     if (channel === 0 || channel === 1) this.clearRpmBaseline(channel)
   }
 
-  ingest(packet: AnalysisPacket): void {
-    if (!(packet.tUs > 0) || !Number.isFinite(packet.tUs)) return
+  // True only when this packet confirms that the preceding RPM packet was
+  // an isolated near-double tooth period (one-edge lookahead for safe analysis).
+  ingest(packet: AnalysisPacket): boolean {
+    if (!(packet.tUs > 0) || !Number.isFinite(packet.tUs)) return false
     const ch = packet.channel
     const nowMs = packet.tUs / 1000
     const previousSeq = this.lastSeq[ch]
@@ -97,17 +99,17 @@ export class DataQualityMonitor {
       this.addEvent('transmission-loss', ch, previousTime ?? nowMs, nowMs, seqGap)
     }
 
-    if (ch !== 0 && ch !== 1) return
+    if (ch !== 0 && ch !== 1) return false
 
     if (packet.value === 0) {
       // A firmware 'stopped' frame is not a tooth and does not advance edgeCount.
       // Fresh RPM after the stop has a new measurement epoch.
       this.clearRpmBaseline(ch)
-      return
+      return false
     }
     if (!(packet.value > 0)) {
       this.clearRpmBaseline(ch)
-      return
+      return false
     }
 
     const previousEdge = this.lastEdgeCount[ch]
@@ -127,7 +129,7 @@ export class DataQualityMonitor {
     if (seqGap > 0 || edgeGap > 0 || (previousTime !== null && nowMs <= previousTime)) {
       this.periodHistory[ch] = []
       this.pendingLongPeriod[ch] = null
-      return
+      return false
     }
 
     const candidate = this.pendingLongPeriod[ch]
@@ -138,13 +140,13 @@ export class DataQualityMonitor {
         this.suspectPulses[ch]++
         this.addEvent('suspected-missed-pulse', ch, candidate.startMs, candidate.endMs, 1)
         this.rememberPeriod(ch, packet.value)
-        return
+        return true
       }
       // A sustained RPM transition is NOT an isolated missing tooth. Relearn the
       // baseline instead of repeatedly comparing against the old speed.
       this.periodHistory[ch] = [candidate.periodUs]
       this.rememberPeriod(ch, packet.value)
-      return
+      return false
     }
 
     const history = this.periodHistory[ch]
@@ -160,10 +162,11 @@ export class DataQualityMonitor {
           baselineUs: typicalUs,
           periodUs: packet.value,
         }
-        return
+        return false
       }
     }
     this.rememberPeriod(ch, packet.value)
+    return false
   }
 
   snapshot(): QualitySnapshot {
