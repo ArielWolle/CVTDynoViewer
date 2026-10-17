@@ -348,7 +348,7 @@ export class AnalysisEngine {
   private processRpmWithLookahead(channel: InternalShaft, packet: AnalysisPacket) {
     // Both UI alerts and derived calculations use the same detection thresholds.
     // A true return says the PRECEDING packet (not this one) contained an
-    // isolated ~2x tooth period and must be excluded, not 'corrected' numerically.
+    // isolated ~2–5x tooth period and must be excluded, not 'corrected' numerically.
     const confirmedMiss = this.rpmQuality.ingest(packet)
     const pending = this.pendingRpmPacket[channel]
 
