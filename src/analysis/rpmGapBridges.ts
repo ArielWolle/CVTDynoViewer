@@ -22,10 +22,17 @@ export function selectShortRpmQualityBridges<T extends RpmBridgePoint>(
     if (!(span > 0) || span > maxBridgeMs ||
       before.epoch === undefined || after.epoch === undefined ||
       before.epoch === after.epoch ||
-      !Number.isFinite(before.rpm) || !Number.isFinite(after.rpm)) continue
-    // It must be a KNOWN quality discontinuity. Epoch changes caused by stops,
-    // a channel disable, or a data reset are not invitations to invent motion.
-    if (!events.some((event) => event.endMs >= before.time && event.startMs <= after.time)) continue
+      !(before.rpm > 0) || !(after.rpm > 0)) continue
+    // Only bridge ONE locally isolated, known data-quality incident. A dense
+    // cluster of missing pulses is not a trustworthy interval to interpolate.
+    // The explicit stopped-zero endpoint must never be visually interpolated.
+    let affectedIntervals = 0
+    for (const event of events) {
+      if (event.endMs < before.time || event.startMs > after.time) continue
+      affectedIntervals += 1
+      if (affectedIntervals > 1) break
+    }
+    if (affectedIntervals !== 1) continue
     result.push({ before, after })
   }
   return result
