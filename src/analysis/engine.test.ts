@@ -163,9 +163,9 @@ describe('AnalysisEngine independent streaming series', () => {
       seq: (index + 1) & 0xff,
       edgeCount: index + 1,
     }))
-    // A sensor missed tooth 201: timestamp of tooth 202 shows the 2x period,
+    // A sensor missed tooth 501: timestamp of tooth 502 shows the 2x period,
     // but neither physical accepted-edge nor USB seq counters have a gap.
-    const lostIndex = 200
+    const lostIndex = 500
     const gapPacketTime = all[lostIndex + 1].tUs
     const packets = all.filter((_, index) => index !== lostIndex).map((packet, index) => ({
       ...packet, seq: (index + 1) & 0xff, edgeCount: index + 1,
