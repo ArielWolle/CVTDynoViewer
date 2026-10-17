@@ -213,7 +213,7 @@ test('real 23CVT recording restores declared defaults and reproduces observed se
   await expect(warnings).not.toContainText('RPM edge loss')
   await expect(warnings).not.toContainText('Replay setup')
 
-  await expect(page.locator('.quality-timeline-count')).toContainText('35 events')
+  await expect(page.locator('.quality-timeline-count')).toContainText('89 events')
   await expect(page.locator('.quality-timeline-marker.suspected').first()).toBeVisible()
   await expect(page.locator('.quality-timeline-marker.confirmed')).toHaveCount(0)
   await expect(page.locator('.chart-card .quality-chart-marker.suspected').first()).toBeVisible()
@@ -223,6 +223,17 @@ test('real 23CVT recording restores declared defaults and reproduces observed se
   await expect.poll(() => canvasHasInk(chartCard(page, 'Primary RPM'))).toBe(true)
   await expect.poll(() => canvasHasInk(chartCard(page, 'Secondary RPM'))).toBe(true)
   await expect.poll(() => canvasHasInk(chartCard(page, 'Primary vs secondary RPM'))).toBe(true)
+
+  // The RPM gap bridge is only a visual overlay. Changing it must not alter
+  // measured/derived numeric values, data-quality events or replay metadata.
+  const metricsBeforeBridge = await page.locator('.metric strong').allTextContents()
+  const bridgeSelect = page.getByRole('combobox', { name: 'RPM gap display' })
+  await bridgeSelect.selectOption('bridge')
+  await expect(bridgeSelect).toHaveValue('bridge')
+  await expect(page.locator('.metric strong')).toHaveText(metricsBeforeBridge)
+  await expect(page.locator('.quality-timeline-count')).toContainText('89 events')
+  await bridgeSelect.selectOption('gap')
+  await expect(bridgeSelect).toHaveValue('gap')
 
   // Confirm detailed warnings remain accessible after minimization on this real run.
   await warnings.getByRole('button', { name: 'Minimize run warnings' }).click()
