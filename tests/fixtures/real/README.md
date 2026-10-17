@@ -37,10 +37,14 @@ are absent from the source and are not invented in the fixture.
 ## Observed anomalies
 
 The original run has continuous per-channel packet and physical-edge counters.
-The selected interval contains 35 isolated near-double-period anomalies on
-**primary RPM**, zero on secondary, and zero confirmed transmission or firmware
-buffering losses. The manifest contains exact event-time anchors. These are
-**suspected missed sensor pulses**, not independently proven missing wheel teeth.
+The selected interval contains 89 isolated near-integer-multiple tooth periods
+on **primary RPM**: 35 near 2×, 31 near 3×, 20 near 4×, and 3 near 5×
+the local median. Each required the following tooth period to return near the
+preceding baseline. Zero suspect intervals occur on secondary; both channels
+have zero confirmed transmission or firmware buffering losses. The manifest contains exact event-time anchors. These are **89 suspect intervals**, not a measured count of physically missing teeth or pulses.
+The original CSV is not altered: the viewer's numerical analysis now rejects
+confirmed suspect periods and waits for one uncontaminated revolution before
+resuming affected RPM and power windows.
 
 ## Tests
 
