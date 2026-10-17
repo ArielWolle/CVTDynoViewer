@@ -1,4 +1,5 @@
 import { enginePowerKwFromRpm } from './engineCurve'
+import { DataQualityMonitor } from '../quality/dataQuality'
 import type {
   AnalysisConfig,
   AnalysisCounts,
@@ -247,6 +248,13 @@ export class AnalysisEngine {
   private shiftEpoch = 0
   private lastShiftSeq: number | null = null
   private rpmEpochBreakPending: [boolean, boolean] = [false, false]
+  // Defer each RPM edge until the NEXT edge on the same shaft arrives. This
+  // one-edge lookahead lets the shared quality detector confirm an isolated
+  // near-double-period event before that questionable edge can affect ANY
+  // revolution observation, 250 ms power window, ratio, or efficiency point.
+  // Raw packets remain in packetHistory, untouched and replayable.
+  private pendingRpmPacket: [AnalysisPacket | null, AnalysisPacket | null] = [null, null]
+  private rpmQuality = new DataQualityMonitor()
   private nextGridUs: [number | null, number | null] = [null, null]
   private pendingTorquePower: [Set<number>, Set<number>] = [new Set(), new Set()]
 
@@ -330,11 +338,43 @@ export class AnalysisEngine {
   }
 
   private process(packet: AnalysisPacket) {
-    if (packet.channel === 0 || packet.channel === 1) this.ingestRpm(packet.channel, packet)
+    if (packet.channel === 0 || packet.channel === 1) this.processRpmWithLookahead(packet.channel, packet)
     else if (packet.channel === 2) this.ingestShift(packet)
     else if (packet.channel === 3) this.ingestTorque(0, packet)
     else if (packet.channel === 4) this.ingestTorque(1, packet)
     // Channel 5 is intentionally preserved in the raw stream but has no analysis role at present.
+  }
+
+  private processRpmWithLookahead(channel: InternalShaft, packet: AnalysisPacket) {
+    // Both UI alerts and derived calculations use the same detection thresholds.
+    // A true return says the PRECEDING packet (not this one) contained an
+    // isolated ~2x tooth period and must be excluded, not 'corrected' numerically.
+    const confirmedMiss = this.rpmQuality.ingest(packet)
+    const pending = this.pendingRpmPacket[channel]
+
+    if (packet.value <= 0) {
+      // Firmware stop/idle reports may be the LAST packet for this channel.
+      // Publish their true zero-RPM endpoint immediately, not one edge late.
+      // A preceding unconfirmed long period is not proof of a missing tooth.
+      if (pending) this.ingestRpm(channel, pending)
+      this.pendingRpmPacket[channel] = null
+      this.ingestRpm(channel, packet)
+      return
+    }
+
+    if (pending) {
+      if (confirmedMiss) {
+        // Never feed the suspicious packet into either the raw-tooth view or
+        // the sliding one-revolution estimator. An entire observation touching
+        // the omitted interval is invalid; a new revolution's worth of clean
+        // edges is required before the derived series resumes.
+        this.rpmEpochBreakPending[channel] = true
+        this.nextGridUs[channel] = null
+      } else {
+        this.ingestRpm(channel, pending)
+      }
+    }
+    this.pendingRpmPacket[channel] = packet
   }
 
   private ingestRpm(channel: InternalShaft, packet: AnalysisPacket) {
@@ -532,6 +572,8 @@ export class AnalysisEngine {
     this.shiftEpoch = 0
     this.lastShiftSeq = null
     this.rpmEpochBreakPending = [false, false]
+    this.pendingRpmPacket = [null, null]
+    this.rpmQuality.reset()
     this.nextGridUs = [null, null]
     this.pendingTorquePower = [new Set(), new Set()]
     this.primaryRpm = []
