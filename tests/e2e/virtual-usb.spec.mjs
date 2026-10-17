@@ -47,6 +47,9 @@ test('normal virtual WebUSB drives real RPM charts, hover, settings and reconnec
 
   await page.getByRole('button', { name: 'Console' }).click()
   await expect(page.getByRole('heading', { name: 'Command link' })).toBeVisible()
+  // A high-rate RPM stream constantly replaces the console's latest rows.
+  // Hide sensor telemetry so the command response is not buried by scrolling.
+  await page.getByRole('button', { name: 'Hide sensor data' }).click()
   await page.locator('.console-command').filter({ hasText: 'Read configuration' }).click()
   await expect(page.locator('.console-table')).toContainText('READ CONFIG')
 
