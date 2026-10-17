@@ -20,6 +20,8 @@ export function selectShortRpmQualityBridges<T extends RpmBridgePoint>(
     const after = points[i]
     const span = after.time - before.time
     if (!(span > 0) || span > maxBridgeMs ||
+      before.epoch === undefined || after.epoch === undefined ||
+      before.epoch === after.epoch ||
       !Number.isFinite(before.rpm) || !Number.isFinite(after.rpm)) continue
     // It must be a KNOWN quality discontinuity. Epoch changes caused by stops,
     // a channel disable, or a data reset are not invitations to invent motion.
