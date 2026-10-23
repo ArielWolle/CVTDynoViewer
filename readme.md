@@ -1,33 +1,96 @@
 # CVT Dyno Viewer
 
-Browser-based live viewer for the CVT dyno firmware. The app uses React, TypeScript, Vite, and Recharts, and deploys to GitHub Pages.
+Browser-based React / TypeScript / Vite viewer for the CVT dynamometer, deployed to GitHub Pages.
 
 ## Run locally
 
-Requires Node.js 22 or newer and a Chromium-based browser for Web Serial.
+Requires Node.js 22+ and a Chromium browser for real hardware WebUSB (HTTPS or localhost). The RP2040 exposes a vendor-class USB interface, **not a virtual COM port**.
 
 ```bash
-npm install
+npm ci
 npm run dev
-```
-
-The app starts with synthetic telemetry so the workspace can be inspected without hardware. Use **Connect device** to request the firmware's USB serial port.
-
-## Build and test
-
-```bash
 npm run typecheck
 npm run test
 npm run build
 ```
 
-## Firmware protocol
+## Hardware-free WebUSB integration tests
 
-Telemetry packets are 8 bytes: little-endian header `0xAABB`, channel id, padding, and a little-endian signed 32-bit value. Channels `0..4` are primary RPM, secondary RPM, shift position, primary torque, and secondary torque.
+Click **Simulate RP2040** instead of Connect device. No board, driver, USB permission, or cable is required. The virtual USBDevice goes through the **same** worker code: open, selectConfiguration, find and claim vendor interface, controlTransferOut, transferIn, transferOut, byte framing/CRC decoding, packet delivery/credits, live analysis, graphs and raw logging.
 
-Commands are 4 bytes: command id, channel id, and a big-endian 16-bit value. Command `0x01` toggles a channel, `0x02` sets its frequency, and `0x03` requests the text configuration report.
+The simulated protocol matches protocol v2 from ArielWolle/CVTDynoFirmware/src/main.cpp: 21-byte AA 55 telemetry packets, per-channel sequence, uint64 timestamp, uint32 RPM physical-edge count, CRC-8; C0-prefixed five-byte commands; per-tooth RPM periods on channels 0 and 1; independent polled shift/torque channels 2-4; change-driven throttle channel 5; configuration and diagnostics replies.
 
-Command `0x04` controls firmware bench mode. Send `[0x04, 0x00, 0x00, 0x01]` to generate synthetic RPM, shift, and torque values on the firmware without reading attached sensors. Send `[0x04, 0x00, 0x00, 0x00]` to restore the real sensor path. The website's **Bench mode** button sends these packets after a serial connection is established.
+The scenario selector offers normal operation, **loss / fragmentation** (deterministic damaged CRC and pre-transmit missed RPM edges), **unplug after 5s** (read error and UI recovery), and **claim failure** (startup cleanup). Real and virtual connections remain visibly distinct; synthetic CSV files start with SIMULATED- and contain captureSource=virtual metadata. Press Read configuration, toggle channels/bench mode, record a raw log and try reconnecting repeatedly.
+
+**Limitations:** The virtual USBDevice does not reproduce physical USB enumeration, browser hardware permissions, WinUSB driver binding, actual bus latency/power, cable faults or RP2040 electrical/hardware behaviour. Physical reconnection must still be validated with the board. It is significantly more faithful than feeding fake values straight into the plots.
+
+## Automated virtual-USB and browser tests
+
+The pull-request workflow runs **two independent jobs in parallel**:
+
+- **checks** — TypeScript, fast Vitest tests, and production build. The simulator
+  supports independent, exact injection of a CRC-corrupt frame, dropped
+  transmitted packet, lost firmware-ring edge, missed sensor tooth and stalled
+  USB OUT transfer; targeted tests assert expected counters and recovery.
+- **Chromium / virtual WebUSB** — five Playwright tests against the built viewer,
+  using its actual production USB and analysis workers. They verify drawn
+  canvas plots, hover, resize, freeze, settings and chart layout; loss warnings
+  and markers; claim errors/unplug/reconnection; live raw-file logging; and
+  clean/faulty CSV replay. Failures upload screenshots and browser traces.
+
+The browser job runs **only the Chromium headless shell** and is bounded by a
+five-minute job timeout. Normal tests run on every PR and `main` push, without
+hardware. We measured approximately one minute end to end on GitHub-hosted
+Ubuntu, with the five browser scenarios taking about 12 seconds.
+
+To run the browser tests locally (Node.js 22+):
+
+```bash
+npm ci
+npm install --no-save --no-package-lock --ignore-scripts @playwright/test@1.56.1
+npx playwright install --with-deps --only-shell chromium
+npm run build
+npx playwright test --config=tests/e2e/playwright.config.mjs
+```
+
+The Playwright runner is pinned and installed for the browser job, rather than
+changing the app's existing npm lockfile. `npm run test` runs the fast Vitest
+tests under `src` only.
+
+A **real RP2040 recording** has now been added as a small, contiguous
+six-second fixture: `tests/fixtures/real/reference-run-raw.csv`. It contains
+7,119 unmodified recorded RPM packets and 35 suspected primary missed-pulse
+events. We prepended the user's requested **reconstructed default metadata**:
+16/12 wheel teeth, 100 ms analysis window and default engine curve/inertia.
+These are reproducibility assumptions, **not verified historical settings**.
+The manifest documents the original recording's hash, the excerpt's hash and
+exact anomaly anchors. Both the fast quality regression and a full Chromium
+raw replay test run on PR CI. See `tests/fixtures/real/README.md` for the
+provenance and limitations. Browser simulation does not validate physical USB,
+sensor timing or electrical behavior.
+
+## Physical WebUSB connection
+
+The browser filters VID 0x1209 / PID 0xCD10. A dedicated worker opens/claims the vendor interface (class FF, subclass 00, protocol 00), enables the line state, and runs the bulk IN/OUT loops. Command writes now await transferOut completion/error rather than acknowledging mere postMessage delivery. Disconnect waits for interface release and device close before worker termination (bounded fallback). Unexpected disconnection closes open raw logs without a false clean-stop footer.
+
+## Data quality and suspected missed tooth pulses
+
+The **Run warnings** banner opens with all independent issues readable, and stays in view while you scroll through the charts. Click **Minimize** to shrink it to a thin sticky indicator showing the number and types of active issues; use **Show details** to reopen it. When a warning changes while minimized, an **Updated** hint appears without forcibly opening the panel. A new clean session starts expanded again. For example, a missing-metadata notice, a USB connection issue, and RPM edge/packet losses can coexist. The expanded banner caps its height when many issues accumulate. The small quality strip beneath the global time slider places each detected event in the complete run; time-series charts show the corresponding highlighted periods. Hover at a marker to identify the channel and issue. The plotted lines are visually broken across affected intervals.
+
+The monitor distinguishes three cases:
+- **Transmission gap (confirmed):** a jump in a channel's rolling 8-bit packet sequence number.
+- **Device buffering gap (confirmed):** a jump in the 32-bit physical-edge count beyond the loss accounted for by sequence gaps.
+- **Suspected missed sensor pulses (inferred):** an otherwise contiguous RPM stream has an inter-tooth period near **2×–5×** the median of the last 5–7 ordinary periods, followed by a period 0.75–1.25 times that baseline. The multiple must be near an integer (with bounded tolerance), and the confirming period avoids mistaking a sustained abrupt deceleration for a missing tooth. One detection means one suspect time interval; it does not establish exactly how many physical sensor pulses or wheel teeth were missed.
+
+The suspect detector runs only in the viewer and needs **no firmware change**. A sequence/edge gap, stop report, or deliberate channel toggle clears its local baseline. Raw telemetry and physical counters are preserved exactly; suspected pulses are **not silently reconstructed, replaced, or declared confirmed loss**. The shaded intervals on plots indicate measurement confidence, not independently verified tooth damage.
+
+**Derived-data handling:** RPM processing holds one tooth packet for a single-pulse lookahead, using the same quality detector as the warnings. A confirmed recovered multi-tooth period is excluded **before** it can influence sliding one-revolution RPM estimates. The next valid revolution begins a new analysis epoch. Power, ratio and efficiency calculations never interpolate across that epoch; e.g., if a suspect interval lies within a 250 ms power integration window, that window's derived power is omitted. This affects only the involved shaft and relevant joined quantities, not an entire session. Raw captures are never modified.
+
+**RPM gaps display:** The analysis workspace has an **RPM gaps** selector. The default is **Show gaps**, retaining visible discontinuities. **Dashed interpolation (visual only)** draws a short, dashed straight-line bridge between existing trustworthy RPM endpoints around a detected quality interval. It is never treated as a measured point and is **not** used by the engine, power, ratio, efficiency or CSV exports. Gaps from stops and extended outages are not bridged. The *Per tooth* observation view is also filtered to omit confirmed suspect periods; their locations remain visible in the quality timeline and the unmodified raw CSV retains the actual timing measurements for diagnosis.
+
+The real 23CVT regression fixture includes **89** recovered anomalous tooth intervals (35 near 2×, 31 near 3×, 20 near 4×, 3 near 5×), all on the primary shaft; these are not verified tooth-damage counts.
+
+To exercise all three categories without the RP2040, use **Virtual: loss / fragmentation**. Saved raw runs recreate the quality events when replayed because their source fields contain timestamps, packet sequences and physical-edge counts.
 
 ## Logging
 

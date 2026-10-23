@@ -1,0 +1,183 @@
+{
+  "schemaVersion": 1,
+  "fixtureName": "2026-10-16_23cvt_rpm_anomalies_excerpt",
+  "description": "Original contiguous 6-second packet excerpt of a real 23CVT dyno capture, with explicitly reconstructed viewer-default setup metadata. All original packet fields and arrival order retained.",
+  "source": {
+    "name": "23CVT_Run-3-raw.csv",
+    "sha256": "05e66c5ef0a51d90f867f8d7df0be03841ac36f586c3a352411a29cbea896b99",
+    "packetCount": 25202,
+    "containedChannels": [
+      0,
+      1
+    ],
+    "hasEmbeddedMetadata": false,
+    "capturedAtUtc": "2026-10-16T18:23:28.803280Z",
+    "providedBy": "User upload to CVT Simulator project; user approved promoting a representative excerpt as a test fixture."
+  },
+  "selection": {
+    "policy": "Contiguous 17.0s–23.0s from initial source firmware timestamp; no synthetic packets, renumbering or sorting",
+    "firmwareUsStart": 161704299,
+    "firmwareUsEnd": 167702825,
+    "originalSourceOffsetUs": 144703132,
+    "selectedOriginalRowsSha256": "f87e713b09a408d43dfaa04e00de0d0db4b90e349af5bed814c1bb1e812087a4",
+    "packetCount": 7119,
+    "channelPacketCounts": {
+      "0": 4289,
+      "1": 2830
+    },
+    "rawHeader": "firmware_t_us,wall_time_s,channel,channel_name,seq,raw_value,edge_count"
+  },
+  "fixture": {
+    "file": "reference-run-raw.csv",
+    "sha256": "c6de3637852cb75cc0501a3e1dadb10d5103ff01852b736ad36ab98ebf9e44db",
+    "metadataAdded": true,
+    "reconstructedMetadata": {
+      "schemaVersion": 1,
+      "startedAt": "2026-10-16T18:23:45.804447Z",
+      "captureSource": "hardware",
+      "firmwareGitSha": null,
+      "firmwareProtocolVersion": null,
+      "primaryTeeth": 16,
+      "secondaryTeeth": 12,
+      "secondaryInertiaKgM2": 0.3134,
+      "analysisWindowMs": 100,
+      "powerMode": "inertia",
+      "torqueCurve": [
+        {
+          "rpm": 1000,
+          "torque": 0
+        },
+        {
+          "rpm": 1800,
+          "torque": 18
+        },
+        {
+          "rpm": 2400,
+          "torque": 18.5
+        },
+        {
+          "rpm": 2600,
+          "torque": 18.1
+        },
+        {
+          "rpm": 2800,
+          "torque": 17.4
+        },
+        {
+          "rpm": 3000,
+          "torque": 16.6
+        },
+        {
+          "rpm": 3200,
+          "torque": 15.4
+        },
+        {
+          "rpm": 3400,
+          "torque": 14.5
+        },
+        {
+          "rpm": 3600,
+          "torque": 13.5
+        },
+        {
+          "rpm": 3950,
+          "torque": 10
+        },
+        {
+          "rpm": 4000,
+          "torque": 0
+        }
+      ],
+      "torqueScale": 0.01,
+      "torqueOffset": 0
+    },
+    "originalFieldsPreserved": true,
+    "noCleanStopFooterBecauseExcerpt": true
+  },
+  "expectedObservedDataQuality": {
+    "transmissionPacketsLost": 0,
+    "deviceEdgesLost": [
+      0,
+      0
+    ],
+    "suspectedSensorPulses": [
+      89,
+      0
+    ],
+    "eventCount": 89,
+    "firstEvent": {
+      "kind": "suspected-missed-pulse",
+      "channel": 0,
+      "startMs": 163300.3,
+      "endMs": 163303.048,
+      "count": 1
+    },
+    "lastEvent": {
+      "kind": "suspected-missed-pulse",
+      "channel": 0,
+      "startMs": 166449.267,
+      "endMs": 166451.684,
+      "count": 1
+    },
+    "sampleEventAnchors": [
+      {
+        "kind": "suspected-missed-pulse",
+        "channel": 0,
+        "startMs": 163300.3,
+        "endMs": 163303.048,
+        "count": 1
+      },
+      {
+        "kind": "suspected-missed-pulse",
+        "channel": 0,
+        "startMs": 163427.166,
+        "endMs": 163429.712,
+        "count": 1
+      },
+      {
+        "kind": "suspected-missed-pulse",
+        "channel": 0,
+        "startMs": 164274.212,
+        "endMs": 164276.663,
+        "count": 1
+      },
+      {
+        "kind": "suspected-missed-pulse",
+        "channel": 0,
+        "startMs": 165448.679,
+        "endMs": 165451.032,
+        "count": 1
+      },
+      {
+        "kind": "suspected-missed-pulse",
+        "channel": 0,
+        "startMs": 166083.312,
+        "endMs": 166085.878,
+        "count": 1
+      },
+      {
+        "kind": "suspected-missed-pulse",
+        "channel": 0,
+        "startMs": 166449.267,
+        "endMs": 166451.684,
+        "count": 1
+      }
+    ],
+    "eventMultiplesApprox": {
+      "2": 35,
+      "3": 31,
+      "4": 20,
+      "5": 3
+    }
+  },
+  "referenceInterpretation": {
+    "rawPacketProvenance": "Real supplied recording",
+    "timingAnomalyClassification": "Regression reference for the current near-integer 2–5× sensor-period detector with a recovery check; 89 anomalous intervals (35 near2×, 31 near3×, 20 near4×, 3 near5×), not proof of any exact number of missing physical teeth.",
+    "primaryTeethSecondaryTeeth": "Assumed viewer defaults 16/12; original setup not recorded",
+    "inertiaTorqueCurve": "Assumed viewer defaults; not independent physical calibration",
+    "shiftAndTorqueChannels": "Absent in original source",
+    "recordingFirmwareVersion": "Unknown: no embedded firmware version or Git SHA",
+    "physicalAccuracy": "Not validated by this fixture; test packet preservation and deterministic viewer analysis"
+  },
+  "licenseAndDistribution": "User granted permission to use and promote this submitted recording as a PR fixture."
+}

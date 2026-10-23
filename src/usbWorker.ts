@@ -18,7 +18,9 @@
 // per-origin, not per-context, so this worker's own getDevices() call (issued only after the main
 // thread's requestDevice()/getDevices() has already resolved) sees that same grant immediately and
 // does the actual open()/claimInterface()/read loop entirely on its own side.
-import { decodePacket, TELEMETRY_SYNC0, TELEMETRY_SYNC1, TELEMETRY_PACKET_LEN, type ChannelId } from './protocol'
+import type { ChannelId } from './protocol'
+import { UsbStreamFramer } from './usbStreamFramer'
+import { VirtualUsbDevice, type VirtualUsbScenario } from './testing/virtualUsbDevice'
 
 // See usbTransport.ts for the meaning of each of these -- copied here unchanged since this file
 // now owns the device instead of usbTransport.ts.
@@ -38,14 +40,17 @@ export type WorkerOutboundMessage =
   // when this specific delivery includes a report of packets dropped from the internal buffer
   // since the last delivery (an extreme, sustained main-thread stall well beyond what the buffer's
   // generous cap is sized to absorb).
-  | { type: 'chunk'; packets: WorkerDecodedPacket[]; texts: string[]; overflowDropped: number }
-  | { type: 'send-error'; message: string }
+  | { type: 'chunk'; packets: WorkerDecodedPacket[]; texts: string[]; overflowDropped: number; deliveryId: number; maxPacketOrdinal: number }
+  | { type: 'flushed'; requestId: number }
+  | { type: 'sent'; requestId: number }
+  | { type: 'send-error'; requestId: number; message: string }
 
 export type WorkerInboundMessage =
-  | { type: 'connect'; vendorId: number; productId: number }
-  | { type: 'send'; bytes: Uint8Array }
+  | { type: 'connect'; vendorId: number; productId: number; virtualScenario?: VirtualUsbScenario }
+  | { type: 'send'; bytes: Uint8Array; requestId: number }
   | { type: 'disconnect' }
-  | { type: 'ack' }
+  | { type: 'ack'; deliveryId: number; maxPacketOrdinal: number }
+  | { type: 'flush'; requestId: number }
 
 // --- Two decoupled stages: an unthrottled read loop, and a paced delivery loop ------------------
 // Earlier this file had ONE combined loop: transferIn() -> decode -> postMessage(), gated by a
@@ -75,31 +80,50 @@ const MAX_BUFFERED_PACKETS = 50_000 // a few MB worst case -- comfortably absorb
 const DELIVERY_BATCH_SIZE = 500 // caps how much a single delivered message asks the main thread to process at once
 const DELIVERY_CREDIT_WINDOW = 2
 
-let bufferedPackets: WorkerDecodedPacket[] = []
+type BufferedPacket = WorkerDecodedPacket & { ordinal: number }
+let bufferedPackets: BufferedPacket[] = []
 let bufferedTexts: string[] = []
 let bufferOverflowDropped = 0
 let deliveryCredits = DELIVERY_CREDIT_WINDOW
+let nextPacketOrdinal = 0
+let lastAckedPacketOrdinal = 0
+let nextDeliveryId = 1
+let flushWaiters: { requestId: number; targetOrdinal: number }[] = []
 
 // Drop-newest on overflow, matching the same policy the firmware's own ring buffer uses (see
 // RpmCounter.cpp's pushEdge()) -- and count it instead of growing without bound or silently
 // discarding without any visibility.
 function bufferPacket(packet: WorkerDecodedPacket) {
   if (bufferedPackets.length >= MAX_BUFFERED_PACKETS) { bufferOverflowDropped++; return }
-  bufferedPackets.push(packet)
+  bufferedPackets.push({ ...packet, ordinal: ++nextPacketOrdinal })
 }
 function bufferText(text: string) {
   if (bufferedTexts.length >= MAX_BUFFERED_PACKETS) { bufferOverflowDropped++; return }
   bufferedTexts.push(text)
 }
 
+const framer = new UsbStreamFramer(
+  (packet, raw) => bufferPacket({ ...packet, raw }),
+  bufferText,
+)
+
+function checkFlushWaiters() {
+  const ready = flushWaiters.filter((waiter) => lastAckedPacketOrdinal >= waiter.targetOrdinal)
+  flushWaiters = flushWaiters.filter((waiter) => lastAckedPacketOrdinal < waiter.targetOrdinal)
+  ready.forEach((waiter) => post({ type: 'flushed', requestId: waiter.requestId }))
+}
+
 function tryDeliver() {
   while (deliveryCredits > 0 && (bufferedPackets.length > 0 || bufferedTexts.length > 0)) {
-    const packets = bufferedPackets.splice(0, DELIVERY_BATCH_SIZE)
+    const buffered = bufferedPackets.splice(0, DELIVERY_BATCH_SIZE)
+    const packets = buffered.map(({ ordinal: _ordinal, ...packet }) => packet)
     const texts = bufferedTexts.splice(0, DELIVERY_BATCH_SIZE)
+    const maxPacketOrdinal = buffered.length ? buffered[buffered.length - 1].ordinal : lastAckedPacketOrdinal
+    const deliveryId = nextDeliveryId++
     deliveryCredits -= 1
     const overflowDropped = bufferOverflowDropped
     bufferOverflowDropped = 0
-    post({ type: 'chunk', packets, texts, overflowDropped })
+    post({ type: 'chunk', packets, texts, overflowDropped, deliveryId, maxPacketOrdinal })
   }
 }
 
@@ -124,46 +148,66 @@ let device: USBDevice | null = null
 let interfaceNumber = -1
 let endpointIn = -1
 let endpointOut = -1
-let buffer = new Uint8Array()
 let reading = false
-const textDecoder = new TextDecoder()
 
 function post(message: WorkerOutboundMessage) {
   postMessage(message)
 }
 
-async function connect(vendorId: number, productId: number) {
-  if (!('usb' in navigator)) { post({ type: 'connect-error', message: 'WebUSB is not supported in this browser.' }); return }
+async function connect(vendorId: number, productId: number, virtualScenario?: VirtualUsbScenario) {
+  let candidate: USBDevice | null = null
+  let opened = false
+  let claimedInterface = -1
+  let stage = 'permission lookup'
   try {
-    const authorized = await navigator.usb.getDevices()
-    const found = authorized.find((candidate) => matchesDevice(candidate, vendorId, productId))
-    if (!found) {
-      // The main thread already ran requestDevice() before sending us 'connect' -- if we still
-      // can't see it here, permission genuinely wasn't granted (user dismissed the chooser).
-      post({ type: 'connect-error', message: 'USB device permission was not granted.' })
-      return
+    if (virtualScenario) {
+      candidate = new VirtualUsbDevice(virtualScenario)
+    } else {
+      if (!('usb' in navigator)) throw new Error('WebUSB is not supported in this browser.')
+      const authorized = await navigator.usb.getDevices()
+      candidate = authorized.find((item) => matchesDevice(item, vendorId, productId)) ?? null
+      if (!candidate) throw new Error('USB device permission was not granted.')
     }
-    await found.open()
-    if (!found.configuration) await found.selectConfiguration(1)
-    const vendorInterface = findVendorInterface(found)
-    if (!vendorInterface) { post({ type: 'connect-error', message: 'Selected USB device has no matching vendor interface (wrong device, or firmware is not the WebUSB build).' }); return }
-    await found.claimInterface(vendorInterface.interfaceNumber)
-    await found.controlTransferOut({ requestType: 'class', recipient: 'interface', request: VENDOR_REQUEST_SET_LINE_STATE, value: 0x0001, index: vendorInterface.interfaceNumber })
 
-    device = found
+    stage = 'device open'
+    await candidate.open()
+    opened = true
+    stage = 'configuration select'
+    if (!candidate.configuration) await candidate.selectConfiguration(1)
+    const vendorInterface = findVendorInterface(candidate)
+    if (!vendorInterface) throw new Error('No matching vendor-class bulk IN/OUT interface (wrong firmware or USB descriptors)')
+    stage = 'interface claim'
+    await candidate.claimInterface(vendorInterface.interfaceNumber)
+    claimedInterface = vendorInterface.interfaceNumber
+    stage = 'line state'
+    const lineState = await candidate.controlTransferOut({
+      requestType: 'class', recipient: 'interface', request: VENDOR_REQUEST_SET_LINE_STATE,
+      value: 0x0001, index: vendorInterface.interfaceNumber,
+    })
+    if (lineState.status !== 'ok') throw new Error('Device rejected the line-state request')
+
+    device = candidate
     interfaceNumber = vendorInterface.interfaceNumber
     endpointIn = vendorInterface.endpointIn
     endpointOut = vendorInterface.endpointOut
-    buffer = new Uint8Array()
+    framer.reset()
     reading = true
     bufferedPackets = []
     bufferedTexts = []
     bufferOverflowDropped = 0
     deliveryCredits = DELIVERY_CREDIT_WINDOW
+    nextPacketOrdinal = 0
+    lastAckedPacketOrdinal = 0
+    nextDeliveryId = 1
+    flushWaiters = []
     post({ type: 'connected' })
-    readLoop()
+    void readLoop()
   } catch (error) {
-    post({ type: 'connect-error', message: error instanceof Error ? error.message : 'Could not connect to USB device' })
+    // In particular, opening a device and then failing claimInterface must not leave it open.
+    if (claimedInterface >= 0) await candidate?.releaseInterface(claimedInterface).catch(() => undefined)
+    if (opened) await candidate?.close().catch(() => undefined)
+    post({ type: 'connect-error', message: 'USB connect (' + stage + '): ' +
+      (error instanceof Error ? error.message : String(error)) })
   }
 }
 
@@ -181,15 +225,17 @@ async function disconnect() {
   endpointOut = -1
 }
 
-async function send(bytes: Uint8Array) {
-  if (!device) { post({ type: 'send-error', message: 'USB device is not connected.' }); return }
+async function send(bytes: Uint8Array, requestId: number) {
+  if (!device) { post({ type: 'send-error', requestId, message: 'USB device is not connected.' }); return }
   try {
-    await device.transferOut(endpointOut, bytes)
+    const result = await device.transferOut(endpointOut, bytes)
+    if (result.status !== 'ok' || result.bytesWritten !== bytes.byteLength) {
+      throw new Error('Incomplete or stalled USB transfer')
+    }
+    // Acknowledges transferOut completion, not firmware application of the command.
+    post({ type: 'sent', requestId })
   } catch (error) {
-    // Deliberately not awaited by the main thread's send() (see usbTransport.ts) -- reported here
-    // asynchronously instead so a failed command is still visible without making every command
-    // send wait on this thread's transferOut() to fully resolve before the caller can continue.
-    post({ type: 'send-error', message: error instanceof Error ? error.message : 'USB send failed' })
+    post({ type: 'send-error', requestId, message: error instanceof Error ? error.message : 'USB send failed' })
   }
 }
 
@@ -198,13 +244,15 @@ async function readLoop() {
   while (reading && device) {
     try {
       const result = await device.transferIn(endpointIn, READ_CHUNK_SIZE)
-      if (result.status === 'ok' && result.data && result.data.byteLength > 0) {
+      if (result.status !== 'ok') throw new Error('USB bulk IN transfer returned ' + result.status)
+      if (result.data && result.data.byteLength > 0) {
         consume(new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength))
       }
     } catch (error) {
       if (!reading) break // disconnect() already tore this down; not a real failure
-      post({ type: 'disconnected', reason: error instanceof Error ? error.message : 'USB read failed' })
-      device = null
+      const reason = error instanceof Error ? error.message : 'USB read failed'
+      await disconnect()
+      post({ type: 'disconnected', reason: 'USB read: ' + reason })
       break
     }
   }
@@ -217,62 +265,18 @@ async function readLoop() {
 // posted directly here. ---
 
 function consume(chunk: Uint8Array) {
-  const combined = new Uint8Array(buffer.length + chunk.length)
-  combined.set(buffer)
-  combined.set(chunk, buffer.length)
-  buffer = combined
-
-  const emitText = (bytes: Uint8Array) => {
-    const text = textDecoder.decode(bytes)
-    for (const line of text.split(/\r?\n/)) {
-      if (line.trim()) bufferText(line.trim())
-    }
-  }
-  const findPacketHeader = (): { index: number; length: number } | null => {
-    for (let index = 0; index < buffer.length - 1; index += 1) {
-      const first = buffer[index]
-      const second = buffer[index + 1]
-      if (first === TELEMETRY_SYNC0 && second === TELEMETRY_SYNC1) return { index, length: TELEMETRY_PACKET_LEN }
-      if ((first === 0xbb && second === 0xaa) || (first === 0xaa && second === 0xbb)) return { index, length: 8 }
-    }
-    return null
-  }
-
-  while (buffer.length > 0) {
-    const header = findPacketHeader()
-    if (!header) {
-      const newline = buffer.lastIndexOf(0x0a)
-      if (newline < 0) break
-      emitText(buffer.slice(0, newline + 1))
-      buffer = buffer.slice(newline + 1)
-      continue
-    }
-    if (header.index > 0) {
-      emitText(buffer.slice(0, header.index))
-      buffer = buffer.slice(header.index)
-    }
-    if (buffer.length < header.length) break
-    const raw = buffer.slice(0, header.length)
-    const packet = decodePacket(raw)
-    if (packet) {
-      bufferPacket({ channel: packet.channel, value: packet.value, tUs: packet.tUs, seq: packet.seq, edgeCount: packet.edgeCount, raw })
-      buffer = buffer.slice(header.length)
-    } else {
-      // Sync bytes matched but the rest failed to validate (bad CRC/channel) -- drop only the
-      // sync bytes and keep scanning, instead of discarding the whole tentative packet length, so
-      // a false-positive sync match can't swallow real data that follows it.
-      emitText(buffer.slice(0, 1))
-      buffer = buffer.slice(1)
-    }
-  }
-
+  framer.push(chunk)
   tryDeliver()
 }
 
 self.onmessage = (event: MessageEvent<WorkerInboundMessage>) => {
   const message = event.data
-  if (message.type === 'connect') void connect(message.vendorId, message.productId)
-  else if (message.type === 'send') void send(message.bytes)
-  else if (message.type === 'disconnect') void disconnect()
-  else if (message.type === 'ack') { deliveryCredits += 1; tryDeliver() }
+  if (message.type === 'connect') void connect(message.vendorId, message.productId, message.virtualScenario)
+  else if (message.type === 'send') void send(message.bytes, message.requestId)
+  else if (message.type === 'disconnect') {
+    void disconnect().then(() => post({ type: 'disconnected' }))
+      .catch((error) => post({ type: 'disconnected', reason: 'USB cleanup: ' + String(error) }))
+  }
+  else if (message.type === 'ack') { deliveryCredits += 1; lastAckedPacketOrdinal = Math.max(lastAckedPacketOrdinal, message.maxPacketOrdinal); checkFlushWaiters(); tryDeliver() }
+  else if (message.type === 'flush') { flushWaiters.push({ requestId: message.requestId, targetOrdinal: nextPacketOrdinal }); tryDeliver(); checkFlushWaiters() }
 }

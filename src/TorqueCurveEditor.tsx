@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { EngineTorquePoint } from './protocol'
+import type { EngineTorquePoint } from './analysis/types'
 
 const WIDTH = 560
 const HEIGHT = 220
